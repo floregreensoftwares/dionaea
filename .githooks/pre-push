@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+zero=0000000000000000000000000000000000000000
+
+echo "checking outgoing commit messages"
+while read -r _ local_sha _ remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "$remote_sha" = "$zero" ]; then
+        range="$local_sha --not --remotes"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+    # shellcheck disable=SC2086
+    for sha in $(git rev-list $range); do
+        if ! git log -1 --format=%B "$sha" | sh .githooks/check-message; then
+            echo "offending commit: $sha" >&2
+            exit 1
+        fi
+    done
+done
+
+echo "running workspace check"
+cargo check --workspace --all-targets --locked
+
+echo "running workspace clippy"
+cargo clippy --workspace --all-targets --locked -- -D warnings
+
+echo "running workspace tests"
+cargo test --workspace --locked

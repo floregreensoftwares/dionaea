@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+echo "checking rustfmt"
+cargo fmt --all -- --check
+
+echo "checking staged diff whitespace"
+git diff --cached --check

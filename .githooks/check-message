@@ -1,0 +1,15 @@
+#!/bin/sh
+# Rejects commit messages (read from stdin) that carry attribution trailers or
+# internal planning vocabulary. Comment lines are ignored, as git adds them.
+set -eu
+export LC_ALL=C
+
+pattern='co-authored-by|generated (with|by)|signed-off-by: *claude|noreply@anthropic|anthropic|claude|(^|[^[:alnum:]_])(mvp|slices?|phases?|stages?|fases?|etapas?|milestones?|roadmap)([^[:alnum:]_]|$)|exit criteria|vertical slice|docs/implementation|brief'
+
+hits=$(grep -v '^[[:space:]]*#' | grep -inE "$pattern" || true)
+if [ -n "$hits" ]; then
+    echo "commit message contains forbidden terms:" >&2
+    echo "$hits" >&2
+    echo "no attribution lines and no internal planning vocabulary; describe what the change does" >&2
+    exit 1
+fi
