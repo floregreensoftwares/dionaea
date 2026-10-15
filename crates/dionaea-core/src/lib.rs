@@ -6,10 +6,12 @@
 mod builtin;
 mod guard;
 mod name;
+mod parse;
 mod schema;
 
 pub use guard::{DropReason, FieldValue, Guarded};
 pub use name::{EnumValue, InvalidEnumValue, InvalidName, MAX_NAME_LEN, Name};
+pub use parse::{Diagnostic, MAX_SOURCE_LEN, parse_schema};
 pub use schema::{
     EventDef, FieldDef, FieldKind, MAX_ENUM_VALUES, MAX_INTEGER_CEILING, MAX_PROPERTIES,
     MAX_TEXT_CEILING, Schema, SchemaError,
