@@ -18,6 +18,7 @@ pub const MAX_ENUM_VALUES: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaError {
     ReservedEventName(Name),
+    RequiredTrait(Name),
     TooManyFields,
     TextMaxOutOfRange,
     IntegerMaxOutOfRange,
@@ -28,6 +29,7 @@ impl fmt::Display for SchemaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReservedEventName(name) => write!(f, "event name `{name}` is reserved"),
+            Self::RequiredTrait(name) => write!(f, "identity trait `{name}` cannot be required"),
             Self::TooManyFields => write!(f, "at most {MAX_PROPERTIES} fields may be declared"),
             Self::TextMaxOutOfRange => {
                 write!(f, "text max must be between 1 and {MAX_TEXT_CEILING}")
@@ -162,6 +164,9 @@ impl Schema {
         if traits.len() > MAX_PROPERTIES {
             return Err(SchemaError::TooManyFields);
         }
+        if let Some((name, _)) = traits.iter().find(|(_, def)| def.required) {
+            return Err(SchemaError::RequiredTrait(name.clone()));
+        }
         Ok(Self { events, traits })
     }
 
@@ -175,8 +180,7 @@ impl Schema {
 
     /// Built-in events first, then the site's own.
     pub(crate) fn event(&self, name: &str) -> Option<&EventDef> {
-        builtin::event(name)
-            .or_else(|| Name::new(name).ok().and_then(|name| self.events.get(&name)))
+        builtin::event(name).or_else(|| self.events.get(name))
     }
 }
 
@@ -258,6 +262,15 @@ mod tests {
     fn site_may_declare_its_own_event_names() {
         let events = BTreeMap::from([(name("checkout"), EventDef::new(BTreeMap::new()).unwrap())]);
         assert!(Schema::new(events, BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn identity_traits_cannot_be_required() {
+        let traits = BTreeMap::from([(name("plan"), FieldDef::required(FieldKind::Id))]);
+        assert_eq!(
+            Schema::new(BTreeMap::new(), traits),
+            Err(SchemaError::RequiredTrait(name("plan")))
+        );
     }
 
     #[test]

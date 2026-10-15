@@ -1,11 +1,13 @@
+use std::borrow::Borrow;
 use std::fmt;
+use std::sync::Arc;
 
 /// Longest event, field and enum-value name, in characters.
 pub const MAX_NAME_LEN: usize = 64;
 
 /// A lowercase identifier: `[a-z][a-z0-9_]*`, at most [`MAX_NAME_LEN`] long.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Name(String);
+pub struct Name(Arc<str>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidName;
@@ -23,17 +25,29 @@ impl std::error::Error for InvalidName {}
 
 impl Name {
     pub fn new(value: &str) -> Result<Self, InvalidName> {
-        let mut chars = value.chars();
-        let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-        let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-        if first_ok && rest_ok && value.len() <= MAX_NAME_LEN {
-            Ok(Self(value.to_owned()))
+        if Self::is_valid(value) {
+            Ok(Self(value.into()))
         } else {
             Err(InvalidName)
         }
     }
 
+    /// The same check as [`Name::new`], without allocating.
+    pub fn is_valid(value: &str) -> bool {
+        let mut chars = value.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+        let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        first_ok && rest_ok && value.len() <= MAX_NAME_LEN
+    }
+
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Lets maps keyed by `Name` be searched with a plain `&str`.
+impl Borrow<str> for Name {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }

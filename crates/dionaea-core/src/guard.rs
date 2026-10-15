@@ -68,7 +68,7 @@ impl Schema {
         name: &str,
         properties: &Map<String, Value>,
     ) -> Result<Guarded, DropReason> {
-        if Name::new(name).is_err() {
+        if !Name::is_valid(name) {
             return Err(DropReason::InvalidEventName);
         }
         let def = self.event(name).ok_or(DropReason::UnknownEvent)?;
@@ -121,19 +121,20 @@ fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
         FieldKind::Id => {
             let text = value.as_str()?;
             let shaped = !text.is_empty()
-                && text.chars().count() <= MAX_ID_LEN
+                && text.len() <= MAX_ID_LEN
                 && text
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
             shaped.then(|| FieldValue::Text(text.to_owned()))
         }
         FieldKind::Text { max } => {
-            let cleaned: String = value
+            let capped: String = value
                 .as_str()?
                 .chars()
                 .map(|c| if c.is_control() { ' ' } else { c })
+                .skip_while(|c| c.is_whitespace())
+                .take(*max)
                 .collect();
-            let capped: String = cleaned.trim().chars().take(*max).collect();
             let capped = capped.trim_end();
             (!capped.is_empty()).then(|| FieldValue::Text(capped.to_owned()))
         }
@@ -457,11 +458,11 @@ mod tests {
     }
 
     #[test]
-    fn traits_are_all_optional_and_filtered() {
+    fn traits_are_filtered_like_optional_fields() {
         let traits = BTreeMap::from([
             (
                 name("plan"),
-                FieldDef::required(FieldKind::enumeration([name("free"), name("pro")]).unwrap()),
+                FieldDef::optional(FieldKind::enumeration([name("free"), name("pro")]).unwrap()),
             ),
             (
                 name("seats"),
@@ -492,6 +493,23 @@ mod tests {
             Schema::default().guard_traits(&many),
             Err(DropReason::TooManyProperties)
         );
+    }
+
+    #[test]
+    fn drop_reason_all_lists_every_variant() {
+        // The match has no wildcard: a new variant stops this from compiling
+        // until it is handled here and added to `ALL`.
+        for reason in DropReason::ALL {
+            match reason {
+                DropReason::InvalidEventName
+                | DropReason::UnknownEvent
+                | DropReason::TooManyProperties
+                | DropReason::MissingRequiredField
+                | DropReason::InvalidRequiredField => {}
+            }
+        }
+        let listed: std::collections::BTreeSet<_> = DropReason::ALL.into_iter().collect();
+        assert_eq!(listed.len(), 5);
     }
 
     #[test]
