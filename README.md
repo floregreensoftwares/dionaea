@@ -17,9 +17,10 @@ dionaea schema check examples/schema.toml          # problems print as file:line
 dionaea schema diff old.toml new.toml              # exits 1 when a change is breaking
 ```
 
-`check` exits 0 for a valid file, 1 for an invalid one and 2 when the file
-cannot be read. `diff` lists each change as allowed, deprecated or breaking and
-exits 1 only for breaking ones.
+`check` exits 0 for a valid file, 1 for an invalid one and 2 when the command
+could not run (wrong usage or an unreadable file). `diff` lists each change as
+allowed, deprecated or breaking, exits 2 when an input is invalid or unreadable and
+exits 1 only when a change is breaking.
 
 ## Contributing
 

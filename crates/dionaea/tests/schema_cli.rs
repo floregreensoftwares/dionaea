@@ -123,3 +123,37 @@ fn the_example_schema_in_the_repository_is_valid() {
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert!(text(&output.stdout).contains("ok (2 events, 1 traits)"));
 }
+
+#[test]
+fn check_exits_2_for_a_file_that_is_not_utf_8() {
+    let dir = dir("check_not_utf8");
+    let path = dir.join("latin1.toml");
+    fs::write(&path, b"# caf\xe9\n").expect("write the test file");
+    let output = run(&["check".as_ref(), path.as_path()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("not valid UTF-8"));
+}
+
+#[test]
+fn an_oversized_multi_byte_file_is_reported_as_too_large() {
+    let dir = dir("check_big_multibyte");
+    let file = write(&dir, "big.toml", &"é".repeat(1024 * 1024));
+    let output = run(&["check".as_ref(), file.as_path()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("larger than"));
+}
+
+#[test]
+fn diff_exits_0_and_prints_deprecations_when_nothing_is_breaking() {
+    let dir = dir("diff_deprecated");
+    let old = write(&dir, "old.toml", VALID);
+    let new = write(&dir, "new.toml", "");
+    let output = run(&["diff".as_ref(), old.as_path(), new.as_path()]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("deprecated: events.checkout: event removed"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 changes, 0 breaking"));
+}

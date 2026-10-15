@@ -15,12 +15,17 @@ pub(crate) const UNUSABLE: u8 = 2;
 
 /// Reads a schema file, never more than one byte past the size limit.
 pub(crate) fn read_schema_file(path: &Path) -> Result<String, String> {
-    let file = File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut text = String::new();
+    let fail = |e: &dyn std::fmt::Display| format!("cannot read {}: {e}", path.display());
+    let file = File::open(path).map_err(|e| fail(&e))?;
+    let mut bytes = Vec::new();
     file.take(MAX_SOURCE_LEN as u64 + 1)
-        .read_to_string(&mut text)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    Ok(text)
+        .read_to_end(&mut bytes)
+        .map_err(|e| fail(&e))?;
+    if bytes.len() > MAX_SOURCE_LEN {
+        // Over the limit: the parser reports the size, so decoding may be lossy.
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| fail(&"the file is not valid UTF-8"))
 }
 
 fn parse(label: &str, source: &str, err: &mut impl Write) -> Option<Schema> {
