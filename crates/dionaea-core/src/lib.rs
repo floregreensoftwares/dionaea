@@ -9,7 +9,7 @@ mod name;
 mod schema;
 
 pub use guard::{DropReason, FieldValue, Guarded};
-pub use name::{EnumValue, InvalidName, MAX_NAME_LEN, Name};
+pub use name::{EnumValue, InvalidEnumValue, InvalidName, MAX_NAME_LEN, Name};
 pub use schema::{
     EventDef, FieldDef, FieldKind, MAX_ENUM_VALUES, MAX_INTEGER_CEILING, MAX_PROPERTIES,
     MAX_TEXT_CEILING, Schema, SchemaError,

@@ -91,12 +91,26 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnumValue(Arc<str>);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidEnumValue;
+
+impl fmt::Display for InvalidEnumValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "enum values match [a-z0-9][a-z0-9_.-]* with at most {MAX_NAME_LEN} characters"
+        )
+    }
+}
+
+impl std::error::Error for InvalidEnumValue {}
+
 impl EnumValue {
-    pub fn new(value: &str) -> Result<Self, InvalidName> {
+    pub fn new(value: &str) -> Result<Self, InvalidEnumValue> {
         if Self::is_valid(value) {
             Ok(Self(value.into()))
         } else {
-            Err(InvalidName)
+            Err(InvalidEnumValue)
         }
     }
 

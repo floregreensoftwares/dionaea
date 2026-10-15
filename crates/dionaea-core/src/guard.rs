@@ -594,3 +594,32 @@ mod tests {
         assert_eq!(names.len(), DropReason::ALL.len());
     }
 }
+
+#[cfg(test)]
+mod unsafe_char_tests {
+    use super::is_unsafe_char;
+
+    fn flagged(code: u32) -> bool {
+        is_unsafe_char(char::from_u32(code).unwrap())
+    }
+
+    #[test]
+    fn range_edges_are_replaced() {
+        for code in [
+            0x00AD, 0x0600, 0x0605, 0x061C, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E, 0x2060,
+            0x2064, 0x2066, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB, 0xE0001, 0xE0020, 0xE007F,
+        ] {
+            assert!(flagged(code), "U+{code:04X}");
+        }
+    }
+
+    #[test]
+    fn neighbours_of_the_ranges_are_kept() {
+        for code in [
+            0x00AC, 0x00AE, 0x05FF, 0x0606, 0x200A, 0x2010, 0x2027, 0x202F, 0x205F, 0x2070, 0xFEFE,
+            0xFF00, 0xFFF8, 0xFFFC, 0xE0000, 0xE0002, 0xE001F, 0xE0080, 0x0041, 0x00E9, 0x65E5,
+        ] {
+            assert!(!flagged(code), "U+{code:04X}");
+        }
+    }
+}
