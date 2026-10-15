@@ -107,11 +107,42 @@ jobs:
       - name: Verify the compose stack
         run: sh scripts/verify-compose.sh
 
+  # The base revision and this one, benchmarked one after the other on the
+  # same runner. It reports changes and never fails on a slowdown: shared
+  # runners are too noisy for a threshold. It fails only if a benchmark breaks.
+  bench:
+    name: benchmarks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: rustup toolchain install
+      - name: Compare with the base revision
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BENCH_MEASURE: 5
+        run: |
+          sh scripts/bench-compare.sh "$BASE" 2>&1 | tee bench.txt
+          {
+            echo '### Benchmarks against the base revision'
+            echo
+            echo 'Base first, then this revision, on the same runner. Shared runners are noisy: identical code has shown differences of 30% or more in short runs, so trust only large changes that repeat.'
+            echo
+            echo '```'
+            grep -vE '^(Benchmarking|Warning:|$)|^ *(Compiling|Finished|Running|Downloaded|Downloading|Locking|Adding|Updating)|outliers|^Found|^ +thrpt|^ +[0-9]+ \(' bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # One check to require in branch protection.
   ci:
     name: ci
     if: always()
-    needs: [messages, rust, hooks, compose]
+    needs: [messages, rust, hooks, compose, bench]
     runs-on: ubuntu-latest
     steps:
       - name: Check the results
