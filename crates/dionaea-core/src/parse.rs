@@ -337,7 +337,8 @@ fn is_known(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guard::DropReason;
+    use crate::guard::{DropReason, Dropped};
+    use crate::name::Name;
     use serde_json::json;
 
     fn errors(source: &str) -> Vec<(usize, usize, String)> {
@@ -388,7 +389,10 @@ values = ["free", "pro"]
         let missing = json!({ "coupon": "SAVE" });
         assert_eq!(
             schema.guard_event("checkout_started", missing.as_object().unwrap()),
-            Err(DropReason::MissingRequiredField)
+            Err(Dropped {
+                reason: DropReason::MissingRequiredField,
+                field: Some(Name::new("items").unwrap())
+            })
         );
         let traits = json!({ "plan": "pro" });
         assert_eq!(
