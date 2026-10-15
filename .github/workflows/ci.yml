@@ -76,11 +76,42 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+  # Real commits against the hooks in a clean clone, as a contributor sees them.
+  hooks:
+    name: hooks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - name: Verify the commit hooks
+        run: sh scripts/verify-hooks.sh
+
+  # The development ClickHouse comes up and the built binary reaches it.
+  compose:
+    name: compose
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> .cargo-target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/trigger' }}
+      - name: Build the binary
+        run: cargo build -p dionaea --locked
+      - name: Verify the compose stack
+        run: sh scripts/verify-compose.sh
+
   # One check to require in branch protection.
   ci:
     name: ci
     if: always()
-    needs: [messages, rust]
+    needs: [messages, rust, hooks, compose]
     runs-on: ubuntu-latest
     steps:
       - name: Check the results
