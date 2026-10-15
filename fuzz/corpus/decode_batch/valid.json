@@ -1,0 +1,1 @@
+{"sent_at":1760000001000,"sdk":"dionaea-rn/0.1.0","release":"1.4.2+57","events":[{"event_id":"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e","name":"checkout","ts":1760000000000,"anon_id":"a1","session_id":"s1","screen":"/orders/:id","props":{"items":3,"coupon":"SAVE"}}]}

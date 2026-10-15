@@ -18,3 +18,8 @@
 *.sqlite-wal
 *.sqlite-shm
 .env
+
+# cargo-fuzz output
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
