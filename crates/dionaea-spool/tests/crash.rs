@@ -65,7 +65,8 @@ impl Drop for TestDir {
 
 fn config(dir: &Path) -> Config {
     let mut config = Config::new(dir);
-    config.segment_bytes = 64 * 1024;
+    // Small segments, so kills often land while one is being sealed and the next created.
+    config.segment_bytes = 8 * 1024;
     config
 }
 
@@ -93,7 +94,7 @@ fn worker() {
                     thread::spawn(move || {
                         for i in 0..u64::MAX {
                             let id = base + t * ID_SPACE + i;
-                            spool.append(&payload(id)).expect("append");
+                            spool.append(payload(id)).expect("append");
                             println!("acked {id}");
                         }
                     })
@@ -235,7 +236,7 @@ fn a_kill_while_reading_and_committing_loses_nothing_and_replays_the_rest() {
         prefill.sync = false;
         let spool = Spool::open(prefill).expect("open");
         for id in 0..total {
-            spool.append(&payload(id)).expect("append");
+            spool.append(payload(id)).expect("append");
         }
     }
 

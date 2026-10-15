@@ -150,6 +150,9 @@ pub struct Stats {
     pub syncs: u64,
     /// Bytes cut off damaged or torn segment tails when the spool was opened.
     pub truncated_on_open: u64,
+    /// Why the spool refuses appends, once a write has failed; the spool is
+    /// then not ready and only reopening it recovers.
+    pub failed: Option<String>,
     /// The age of the oldest segment still on disk.
     pub oldest_segment_age: Option<Duration>,
 }
@@ -219,6 +222,9 @@ struct Core {
     appended_bytes: AtomicU64,
     syncs: AtomicU64,
     truncated_on_open: u64,
+    /// Test hook: 1 makes the next write fail, 2 makes it panic.
+    #[cfg(test)]
+    fault: std::sync::atomic::AtomicU8,
     _lock: File,
 }
 
@@ -323,13 +329,23 @@ impl Spool {
             appended_bytes: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
             truncated_on_open: recovered.truncated,
+            #[cfg(test)]
+            fault: std::sync::atomic::AtomicU8::new(0),
             config,
             _lock: lock_file,
         });
         let writer_core = Arc::clone(&core);
         let thread = std::thread::Builder::new()
             .name("spool-writer".to_owned())
-            .spawn(move || run_writer(&writer_core, active))?;
+            .spawn(move || {
+                // A panic must not leave appenders waiting forever.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_writer(&writer_core, active);
+                }));
+                if outcome.is_err() {
+                    fail_all(&writer_core, "the spool writer panicked", &[]);
+                }
+            })?;
         let writer = Arc::new(WriterHandle {
             core: Arc::clone(&core),
             thread: Mutex::new(Some(thread)),
@@ -342,7 +358,8 @@ impl Spool {
 
     /// Writes one record and returns once it is durable. Blocks the caller for
     /// the duration of a group commit; async callers run it on a blocking pool.
-    pub fn append(&self, payload: &[u8]) -> Result<Position, SpoolError> {
+    pub fn append(&self, payload: impl Into<Vec<u8>>) -> Result<Position, SpoolError> {
+        let payload: Vec<u8> = payload.into();
         let config = &self.core.config;
         if payload.is_empty() {
             return Err(SpoolError::Empty);
@@ -369,7 +386,7 @@ impl Spool {
             shared.pending_bytes += size;
             shared.used_bytes += size;
             shared.queue.push(Pending {
-                payload: payload.to_vec(),
+                payload,
                 slot: Arc::clone(&slot),
             });
         }
@@ -509,9 +526,14 @@ impl Spool {
     }
 
     pub fn stats(&self) -> Stats {
-        let (bytes_used, pending_bytes, segments) = {
+        let (bytes_used, pending_bytes, segments, failed) = {
             let shared = lock(&self.core.shared);
-            (shared.used_bytes, shared.pending_bytes, shared.segments)
+            (
+                shared.used_bytes,
+                shared.pending_bytes,
+                shared.segments,
+                shared.failed.clone(),
+            )
         };
         let oldest_segment_age = first_sequence(&self.core.config.dir)
             .ok()
@@ -527,6 +549,7 @@ impl Spool {
             appended_bytes: self.core.appended_bytes.load(Ordering::Relaxed),
             syncs: self.core.syncs.load(Ordering::Relaxed),
             truncated_on_open: self.core.truncated_on_open,
+            failed,
             oldest_segment_age,
         }
     }
@@ -549,43 +572,55 @@ fn run_writer(core: &Arc<Core>, mut active: Active) {
             }
             std::mem::take(&mut shared.queue)
         };
-        match write_batch(core, &mut active, &batch) {
-            Ok(positions) => {
-                let bytes: u64 = batch
-                    .iter()
-                    .map(|p| RECORD_OVERHEAD + p.payload.len() as u64)
-                    .sum();
-                {
-                    let mut shared = lock(&core.shared);
-                    shared.pending_bytes = shared.pending_bytes.saturating_sub(bytes);
-                    shared.durable = Position {
-                        segment: active.sequence,
-                        offset: active.len,
-                    };
-                }
-                core.appended_records
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                core.appended_bytes.fetch_add(bytes, Ordering::Relaxed);
-                for (pending, position) in batch.iter().zip(positions) {
-                    pending.slot.finish(Ok(position));
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                for pending in &batch {
-                    pending.slot.finish(Err(SpoolError::Io(message.clone())));
-                }
-                let queued = {
-                    let mut shared = lock(&core.shared);
-                    shared.failed = Some(message.clone());
-                    std::mem::take(&mut shared.queue)
-                };
-                for pending in queued {
-                    pending.slot.finish(Err(SpoolError::Io(message.clone())));
-                }
+        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_batch(core, &mut active, &batch)
+        }));
+        match written {
+            Err(_) => {
+                fail_all(core, "the spool writer panicked", &batch);
                 return;
             }
+            Ok(result) => match result {
+                Ok(positions) => {
+                    let bytes: u64 = batch
+                        .iter()
+                        .map(|p| RECORD_OVERHEAD + p.payload.len() as u64)
+                        .sum();
+                    {
+                        let mut shared = lock(&core.shared);
+                        shared.pending_bytes = shared.pending_bytes.saturating_sub(bytes);
+                        shared.durable = Position {
+                            segment: active.sequence,
+                            offset: active.len,
+                        };
+                    }
+                    core.appended_records
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    core.appended_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    for (pending, position) in batch.iter().zip(positions) {
+                        pending.slot.finish(Ok(position));
+                    }
+                }
+                Err(error) => {
+                    fail_all(core, &error.to_string(), &batch);
+                    return;
+                }
+            },
         }
+    }
+}
+
+/// Puts the spool in the failed state and answers every append that is
+/// waiting, `batch` (the one being written) and whatever is queued. The only
+/// way out is to open the spool again, which cuts a torn tail.
+fn fail_all(core: &Core, message: &str, batch: &[Pending]) {
+    let queued = {
+        let mut shared = lock(&core.shared);
+        shared.failed = Some(message.to_owned());
+        std::mem::take(&mut shared.queue)
+    };
+    for pending in batch.iter().chain(queued.iter()) {
+        pending.slot.finish(Err(SpoolError::Io(message.to_owned())));
     }
 }
 
@@ -593,6 +628,12 @@ fn run_writer(core: &Arc<Core>, mut active: Active) {
 /// durable with one `fsync` of the last file (earlier ones are synced when they
 /// are sealed). Returns each record's position.
 fn write_batch(core: &Core, active: &mut Active, batch: &[Pending]) -> io::Result<Vec<Position>> {
+    #[cfg(test)]
+    match core.fault.load(Ordering::Relaxed) {
+        1 => return Err(io::Error::other("injected failure")),
+        2 => panic!("injected panic"),
+        _ => {}
+    }
     let config = &core.config;
     let mut positions = Vec::with_capacity(batch.len());
     let mut buffer = Vec::new();

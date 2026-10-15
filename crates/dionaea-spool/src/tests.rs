@@ -64,7 +64,7 @@ fn read_respects_the_record_and_byte_limits() {
     let dir = TestDir::new();
     let spool = Spool::open(dir.config()).unwrap();
     for i in 0..10u8 {
-        spool.append(&[i; 10]).unwrap();
+        spool.append([i; 10]).unwrap();
     }
     assert_eq!(spool.read(3, usize::MAX).unwrap().len(), 3);
     // 25 bytes of payload allow three 10-byte records: the limit is checked
@@ -82,8 +82,8 @@ fn bad_payloads_are_refused() {
     config.max_record_bytes = 8;
     let spool = Spool::open(config).unwrap();
     assert_eq!(spool.append(b""), Err(SpoolError::Empty));
-    assert_eq!(spool.append(&[0u8; 9]), Err(SpoolError::TooLarge));
-    assert!(spool.append(&[0u8; 8]).is_ok());
+    assert_eq!(spool.append([0u8; 9]), Err(SpoolError::TooLarge));
+    assert!(spool.append([0u8; 8]).is_ok());
 }
 
 #[test]
@@ -94,19 +94,19 @@ fn a_full_quota_refuses_appends_and_commit_frees_it() {
     config.quota_bytes = 200;
     let spool = Spool::open(config).unwrap();
     let mut accepted = 0;
-    while spool.append(&[1u8; 20]).is_ok() {
+    while spool.append([1u8; 20]).is_ok() {
         accepted += 1;
         assert!(accepted < 100, "the quota never bit");
     }
     assert!(accepted >= 3);
-    assert_eq!(spool.append(&[1u8; 20]), Err(SpoolError::Full));
+    assert_eq!(spool.append([1u8; 20]), Err(SpoolError::Full));
     assert!(spool.stats().bytes_used <= 200);
 
     let records = spool.read(100, usize::MAX).unwrap();
     assert_eq!(records.len(), accepted);
     spool.commit(records.last().unwrap().next).unwrap();
     assert!(
-        spool.append(&[1u8; 20]).is_ok(),
+        spool.append([1u8; 20]).is_ok(),
         "committed segments free the quota"
     );
 }
@@ -118,7 +118,7 @@ fn records_never_span_segments_and_every_one_is_read() {
     config.segment_bytes = 100;
     let spool = Spool::open(config).unwrap();
     for i in 0..50u8 {
-        spool.append(&[i; 30]).unwrap();
+        spool.append([i; 30]).unwrap();
     }
     assert!(spool.stats().segments > 5);
     let records = spool.read(1000, usize::MAX).unwrap();
@@ -137,7 +137,7 @@ fn commit_deletes_consumed_segments_and_survives_a_restart() {
     {
         let spool = Spool::open(config.clone()).unwrap();
         for i in 0..20u8 {
-            spool.append(&[i; 30]).unwrap();
+            spool.append([i; 30]).unwrap();
         }
         let records = spool.read(8, usize::MAX).unwrap();
         assert_eq!(records.len(), 8);
@@ -230,7 +230,7 @@ fn a_damaged_record_ends_its_segment_but_not_the_ones_after() {
     {
         let spool = Spool::open(config.clone()).unwrap();
         for i in 0..12u8 {
-            spool.append(&[i; 30]).unwrap();
+            spool.append([i; 30]).unwrap();
         }
     }
     // Flip a bit inside the second record of the first segment.
@@ -333,8 +333,8 @@ fn the_pending_limit_answers_busy_instead_of_growing() {
     config.max_pending_bytes = 100;
     let spool = Spool::open(config).unwrap();
     // One record larger than the pending limit can never be queued.
-    assert_eq!(spool.append(&[0u8; 200]), Err(SpoolError::Busy));
-    assert!(spool.append(&[0u8; 50]).is_ok());
+    assert_eq!(spool.append([0u8; 200]), Err(SpoolError::Busy));
+    assert!(spool.append([0u8; 50]).is_ok());
 }
 
 #[test]
@@ -382,4 +382,81 @@ fn the_marker_round_trips_and_rejects_damage() {
         damaged[index] ^= 0x01;
         assert_eq!(decode_marker(&damaged), None, "byte {index}");
     }
+}
+
+fn outcome_within(spool: &Spool, payload: &'static [u8]) -> Result<Position, SpoolError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spool = spool.clone();
+    thread::spawn(move || {
+        let _ = sender.send(spool.append(payload));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the append returned instead of hanging")
+}
+
+#[test]
+fn a_failed_write_fails_that_append_and_every_later_one_and_is_reported() {
+    let dir = TestDir::new();
+    let spool = Spool::open(dir.config()).unwrap();
+    assert!(spool.append(b"fine").is_ok());
+    assert_eq!(spool.stats().failed, None);
+
+    spool.core.fault.store(1, Ordering::Relaxed);
+    let first = outcome_within(&spool, b"doomed");
+    assert!(
+        matches!(&first, Err(SpoolError::Io(m)) if m.contains("injected failure")),
+        "{first:?}"
+    );
+    assert!(matches!(
+        outcome_within(&spool, b"later"),
+        Err(SpoolError::Io(_))
+    ));
+    assert!(
+        spool
+            .stats()
+            .failed
+            .is_some_and(|m| m.contains("injected failure"))
+    );
+    // What was durable before the failure is still readable.
+    assert_eq!(
+        payloads(&spool.read(10, usize::MAX).unwrap()),
+        vec![b"fine".to_vec()]
+    );
+}
+
+#[test]
+fn a_panic_in_the_writer_does_not_hang_the_appenders() {
+    let dir = TestDir::new();
+    let spool = Spool::open(dir.config()).unwrap();
+    spool.core.fault.store(2, Ordering::Relaxed);
+    let first = outcome_within(&spool, b"doomed");
+    assert!(
+        matches!(&first, Err(SpoolError::Io(m)) if m.contains("panicked")),
+        "{first:?}"
+    );
+    assert!(matches!(
+        outcome_within(&spool, b"later"),
+        Err(SpoolError::Io(_))
+    ));
+    assert!(spool.stats().failed.is_some());
+}
+
+#[test]
+fn reopening_after_a_failure_recovers_what_was_durable() {
+    let dir = TestDir::new();
+    let config = dir.config();
+    {
+        let spool = Spool::open(config.clone()).unwrap();
+        spool.append(b"durable").unwrap();
+        spool.core.fault.store(1, Ordering::Relaxed);
+        assert!(outcome_within(&spool, b"lost").is_err());
+    }
+    let spool = Spool::open(config).unwrap();
+    assert_eq!(spool.stats().failed, None);
+    assert_eq!(
+        payloads(&spool.read(10, usize::MAX).unwrap()),
+        vec![b"durable".to_vec()]
+    );
+    assert!(spool.append(b"works again").is_ok());
 }

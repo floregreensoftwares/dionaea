@@ -90,7 +90,7 @@ fn reads(c: &mut Criterion) {
     let dir = Dir::new("read");
     let spool = Spool::open(config(&dir, false)).expect("open");
     for _ in 0..records {
-        spool.append(&payload).expect("append");
+        spool.append(payload.as_slice()).expect("append");
     }
 
     let mut group = c.benchmark_group("read and commit");
@@ -120,7 +120,7 @@ fn reads(c: &mut Criterion) {
     with_sync.segment_bytes = 1024 * 1024;
     let spool = Spool::open(with_sync).expect("open");
     for _ in 0..2_000 {
-        spool.append(&payload).expect("append");
+        spool.append(payload.as_slice()).expect("append");
     }
     let mut group = c.benchmark_group("commit");
     group.sample_size(20);
