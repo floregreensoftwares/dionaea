@@ -55,6 +55,17 @@ pub(crate) fn check(label: &str, source: &str, out: &mut impl Write, err: &mut i
     }
 }
 
+/// Prints the JSON Schema of the schema file format.
+pub(crate) fn json_schema(out: &mut impl Write) -> u8 {
+    match serde_json::to_string_pretty(&dionaea_core::schema_file_json_schema()) {
+        Ok(text) => {
+            let _ = writeln!(out, "{text}");
+            OK
+        }
+        Err(_) => UNUSABLE,
+    }
+}
+
 pub(crate) fn compare(
     (old_label, old_source): (&str, &str),
     (new_label, new_source): (&str, &str),

@@ -157,3 +157,13 @@ fn diff_exits_0_and_prints_deprecations_when_nothing_is_breaking() {
     );
     assert!(stdout.contains("1 changes, 0 breaking"));
 }
+
+#[test]
+fn json_schema_prints_a_json_schema_document() {
+    let output = run(&["json-schema".as_ref()]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = text(&output.stdout);
+    assert!(stdout.trim_start().starts_with('{'));
+    assert!(stdout.contains("\"$schema\": \"https://json-schema.org/draft/2020-12/schema\""));
+    assert!(stdout.contains("\"duration\""));
+}
