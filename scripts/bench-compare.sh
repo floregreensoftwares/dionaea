@@ -25,8 +25,11 @@ work=$(mktemp -d)
 base_tree=$work/base
 trap 'git -C "$repo_root" worktree remove --force "$base_tree" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 
-# One target directory for both trees, so Criterion finds the saved baseline.
-export CARGO_TARGET_DIR=$work/target
+# Each tree builds in its own target directory. Cargo names a path package's
+# artifacts from its path inside the workspace, so two trees sharing one
+# directory would reuse the base's library for the branch and measure the same
+# code twice. Criterion's baselines live in one shared place instead.
+export CRITERION_HOME=$work/criterion
 
 # `--bench <name>` for every file in a crate's benches folder. Naming the
 # targets keeps the library's own test harness, which rejects Criterion's
@@ -44,7 +47,11 @@ run_benches() {
     shift 2
     targets=$(bench_targets "$tree/crates/$crate/benches")
     # shellcheck disable=SC2086
-    (cd "$tree" && cargo bench -p "$crate" $targets --locked -- "$@")
+    (
+        cd "$tree"
+        export CARGO_TARGET_DIR="$work/target-$(basename "$tree")"
+        cargo bench -p "$crate" $targets --locked -- "$@"
+    )
 }
 
 timing() {
