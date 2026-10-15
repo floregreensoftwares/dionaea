@@ -126,12 +126,19 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           BENCH_MEASURE: 5
+          BENCH_NOISE_FLOOR: 1
         run: |
+          # Nothing to measure when the pull request touches no Rust code.
+          if ! git diff --name-only "$BASE" HEAD | grep -qE '^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/bench-compare\.sh$)'; then
+            echo 'No Rust code changed; benchmarks skipped.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          started=$SECONDS
           sh scripts/bench-compare.sh "$BASE" 2>&1 | tee bench.txt
           {
             echo '### Benchmarks against the base revision'
             echo
-            echo 'Base first, then this revision, on the same runner. Shared runners are noisy: identical code has shown differences of 30% or more in short runs, so trust only large changes that repeat.'
+            echo "Took $((SECONDS - started)) s. The base revision is measured twice: the section named noise floor compares it with itself, so any change there is noise. Read the last section against it, and trust only changes well above it that repeat."
             echo
             echo '```'
             grep -vE '^(Benchmarking|Warning:|$)|^ *(Compiling|Finished|Running|Downloaded|Downloading|Locking|Adding|Updating)|outliers|^Found|^ +thrpt|^ +[0-9]+ \(' bench.txt

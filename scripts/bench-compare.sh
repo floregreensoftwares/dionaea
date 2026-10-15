@@ -5,7 +5,12 @@
 # this never fails on a slowdown; it fails only if a benchmark cannot run.
 #
 # Usage: scripts/bench-compare.sh <base-revision> [crate...]   (default: dionaea-core)
-# Crates live in crates/<name>/. BENCH_WARM_UP and BENCH_MEASURE are seconds.
+# Crates live in crates/<name>/. Every file directly in a crate's benches/
+# folder must be a bench target; helper modules go in a subfolder.
+#
+# BENCH_WARM_UP and BENCH_MEASURE are seconds. With BENCH_NOISE_FLOOR=1 the
+# base is benchmarked a second time against the first, which shows how much
+# unchanged code moves on this machine; read the real comparison against it.
 set -eu
 
 base=${1:?usage: bench-compare.sh <base-revision> [crate...]}
@@ -13,6 +18,7 @@ shift
 crates=${*:-dionaea-core}
 warm_up=${BENCH_WARM_UP:-1}
 measure=${BENCH_MEASURE:-3}
+noise_floor=${BENCH_NOISE_FLOOR:-0}
 
 repo_root=$(git rev-parse --show-toplevel)
 work=$(mktemp -d)
@@ -41,25 +47,33 @@ run_benches() {
     (cd "$tree" && cargo bench -p "$crate" $targets --locked -- "$@")
 }
 
+timing() {
+    printf -- '--warm-up-time %s --measurement-time %s' "$warm_up" "$measure"
+}
+
 git -C "$repo_root" worktree add --detach --quiet "$base_tree" "$base"
 
 for crate in $crates; do
-    if [ -d "$base_tree/crates/$crate/benches" ]; then
-        echo "== $crate: base revision ($base)"
-        run_benches "$base_tree" "$crate" --save-baseline base \
-            --warm-up-time "$warm_up" --measurement-time "$measure" >/dev/null
-    else
+    if [ ! -d "$repo_root/crates/$crate/benches" ]; then
+        echo "== $crate: no benchmarks in the working tree, skipped"
+        continue
+    fi
+    if [ ! -d "$base_tree/crates/$crate/benches" ]; then
         echo "== $crate: the base revision has no benchmarks; nothing to compare to"
+        # shellcheck disable=SC2046
+        run_benches "$repo_root" "$crate" $(timing)
+        continue
     fi
-done
 
-for crate in $crates; do
-    echo "== $crate: working tree"
-    if [ -d "$base_tree/crates/$crate/benches" ]; then
-        run_benches "$repo_root" "$crate" --baseline-lenient base \
-            --warm-up-time "$warm_up" --measurement-time "$measure"
-    else
-        run_benches "$repo_root" "$crate" \
-            --warm-up-time "$warm_up" --measurement-time "$measure"
+    echo "== $crate: base revision ($base)"
+    # shellcheck disable=SC2046
+    run_benches "$base_tree" "$crate" --save-baseline base $(timing) >/dev/null
+    if [ "$noise_floor" = 1 ]; then
+        echo "== $crate: noise floor (the base revision against itself)"
+        # shellcheck disable=SC2046
+        run_benches "$base_tree" "$crate" --baseline base $(timing)
     fi
+    echo "== $crate: working tree against the base revision"
+    # shellcheck disable=SC2046
+    run_benches "$repo_root" "$crate" --baseline-lenient base $(timing)
 done
