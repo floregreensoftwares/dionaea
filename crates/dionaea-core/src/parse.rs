@@ -24,7 +24,7 @@ use toml::Spanned;
 
 use crate::builtin;
 use crate::name::{EnumValue, Name};
-use crate::schema::{EventDef, FieldDef, FieldKind, Schema};
+use crate::schema::{EventDef, FieldDef, FieldKind, MAX_PROPERTIES, Schema};
 
 /// Largest schema file accepted, in bytes.
 pub const MAX_SOURCE_LEN: usize = 1 << 20;
@@ -68,9 +68,12 @@ struct RawField {
     values: Option<Spanned<Vec<Spanned<String>>>>,
 }
 
+/// Most diagnostics returned; further problems are summarised in one line.
+pub const MAX_DIAGNOSTICS: usize = 100;
+
 /// Parses and validates a schema file. Syntax and shape errors stop at the
 /// first problem the TOML reader finds; once the file has the right shape,
-/// every rule violation is reported.
+/// rule violations are reported in file order, up to [`MAX_DIAGNOSTICS`].
 pub fn parse_schema(source: &str) -> Result<Schema, Vec<Diagnostic>> {
     if source.len() > MAX_SOURCE_LEN {
         return Err(vec![Diagnostic {
@@ -79,25 +82,28 @@ pub fn parse_schema(source: &str) -> Result<Schema, Vec<Diagnostic>> {
             message: format!("the schema file is larger than {MAX_SOURCE_LEN} bytes"),
         }]);
     }
+    let locator = Locator::new(source);
     let raw: RawFile = toml::from_str(source).map_err(|error| {
         let offset = error.span().map_or(0, |span| span.start);
-        vec![diagnostic(source, offset, error.message())]
+        vec![locator.diagnostic(offset, error.message())]
     })?;
 
     let mut diagnostics = Diagnostics {
-        source,
+        locator,
         found: Vec::new(),
+        omitted: 0,
     };
     let mut events = BTreeMap::new();
     for (key, event) in &raw.events {
-        let Some(name) = diagnostics.name(key) else {
+        let name = diagnostics.name(key);
+        let fields = diagnostics.fields(&event.fields);
+        let Some(name) = name else {
             continue;
         };
         if builtin::is_reserved(name.as_str()) {
             diagnostics.report(&key.span(), format!("event name `{name}` is reserved"));
             continue;
         }
-        let fields = diagnostics.fields(&event.fields);
         match EventDef::new(fields) {
             Ok(def) => {
                 events.insert(name, def);
@@ -105,40 +111,92 @@ pub fn parse_schema(source: &str) -> Result<Schema, Vec<Diagnostic>> {
             Err(error) => diagnostics.report(&key.span(), error.to_string()),
         }
     }
+    if raw.traits.len() > MAX_PROPERTIES {
+        let mut spans: Vec<Range<usize>> = raw.traits.keys().map(Spanned::span).collect();
+        spans.sort_by_key(|span| span.start);
+        diagnostics.report(
+            &spans[MAX_PROPERTIES],
+            format!("at most {MAX_PROPERTIES} identity traits may be declared"),
+        );
+    }
     let traits = diagnostics.traits(&raw.traits);
 
-    if !diagnostics.found.is_empty() {
-        return Err(diagnostics.found);
+    if let Some(found) = diagnostics.finish() {
+        return Err(found);
     }
-    Schema::new(events, traits).map_err(|error| vec![diagnostic(source, 0, &error.to_string())])
+    Schema::new(events, traits).map_err(|error| {
+        vec![Diagnostic {
+            line: 1,
+            column: 1,
+            message: error.to_string(),
+        }]
+    })
 }
 
-fn diagnostic(source: &str, offset: usize, message: &str) -> Diagnostic {
-    let mut offset = offset.min(source.len());
-    while !source.is_char_boundary(offset) {
-        offset -= 1;
+/// Turns byte offsets into 1-based line and column, with the line starts
+/// computed once.
+struct Locator<'a> {
+    source: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> Locator<'a> {
+    fn new(source: &'a str) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(index, _)| index + 1))
+            .collect();
+        Self {
+            source,
+            line_starts,
+        }
     }
-    let before = &source[..offset];
-    Diagnostic {
-        line: before.matches('\n').count() + 1,
-        column: before
-            .rsplit('\n')
-            .next()
-            .map_or(0, |line| line.chars().count())
-            + 1,
-        message: message.to_owned(),
+
+    fn diagnostic(&self, offset: usize, message: &str) -> Diagnostic {
+        let mut offset = offset.min(self.source.len());
+        while !self.source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let line = self.line_starts.partition_point(|&start| start <= offset);
+        let start = self.line_starts[line - 1];
+        Diagnostic {
+            line,
+            column: self.source[start..offset].chars().count() + 1,
+            message: message.to_owned(),
+        }
     }
 }
 
 struct Diagnostics<'a> {
-    source: &'a str,
+    locator: Locator<'a>,
     found: Vec<Diagnostic>,
+    omitted: usize,
 }
 
 impl Diagnostics<'_> {
     fn report(&mut self, span: &Range<usize>, message: impl AsRef<str>) {
+        if self.found.len() >= MAX_DIAGNOSTICS {
+            self.omitted += 1;
+            return;
+        }
         self.found
-            .push(diagnostic(self.source, span.start, message.as_ref()));
+            .push(self.locator.diagnostic(span.start, message.as_ref()));
+    }
+
+    /// The diagnostics in file order, or `None` when there are none.
+    fn finish(&mut self) -> Option<Vec<Diagnostic>> {
+        if self.found.is_empty() {
+            return None;
+        }
+        let mut found = std::mem::take(&mut self.found);
+        found.sort_by_key(|d| (d.line, d.column));
+        if self.omitted > 0 {
+            found.push(Diagnostic {
+                line: found.last().map_or(1, |d| d.line),
+                column: 1,
+                message: format!("{} more problems not shown", self.omitted),
+            });
+        }
+        Some(found)
     }
 
     fn name(&mut self, key: &Spanned<String>) -> Option<Name> {
@@ -476,6 +534,43 @@ values = ["free", "pro"]
         assert_eq!((found[0].0, found[0].1), (3, 8));
         let found = errors("[events.a.fields.b]\nkind = \"é\"\n");
         assert_eq!((found[0].0, found[0].1), (2, 8));
+    }
+
+    #[test]
+    fn diagnostics_are_in_file_order_not_key_order() {
+        let source = "[events.zeta.fields.b]\nkind = \"float\"\n\n[events.alpha.fields.b]\nkind = \"nope\"\n";
+        let lines: Vec<usize> = errors(source).iter().map(|d| d.0).collect();
+        assert_eq!(lines, vec![2, 5]);
+    }
+
+    #[test]
+    fn too_many_traits_are_located_at_the_first_one_past_the_limit() {
+        let mut source = String::new();
+        for i in 0..=crate::MAX_PROPERTIES {
+            source.push_str(&format!("[traits.t{i:02}]\nkind = \"id\"\n"));
+        }
+        let found = errors(&source);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, crate::MAX_PROPERTIES * 2 + 1);
+        assert!(found[0].2.contains("identity traits"));
+    }
+
+    #[test]
+    fn errors_inside_an_event_with_a_bad_name_are_still_reported() {
+        let found = errors("[events.Checkout.fields.x]\nkind = \"float\"\n");
+        let lines: Vec<usize> = found.iter().map(|d| d.0).collect();
+        assert_eq!(lines, vec![1, 2]);
+    }
+
+    #[test]
+    fn the_number_of_diagnostics_is_capped() {
+        let mut source = String::new();
+        for i in 0..(MAX_DIAGNOSTICS * 3) {
+            source.push_str(&format!("[traits.t{i}]\nkind = \"nope\"\n"));
+        }
+        let found = errors(&source);
+        assert_eq!(found.len(), MAX_DIAGNOSTICS + 1);
+        assert!(found.last().unwrap().2.contains("more problems"));
     }
 
     #[test]
