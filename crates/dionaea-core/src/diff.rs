@@ -32,47 +32,129 @@ impl fmt::Display for Severity {
     }
 }
 
+/// What happened, with the data a report needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeKind {
+    EventAdded,
+    EventRemoved,
+    FieldAdded {
+        required: bool,
+    },
+    FieldRemoved,
+    BecameRequired,
+    BecameOptional,
+    KindChanged {
+        from: &'static str,
+        to: &'static str,
+    },
+    /// The declared `max` of a text, count or duration field.
+    MaxChanged {
+        from: u64,
+        to: u64,
+        rejects: bool,
+    },
+    EnumValuesRemoved(Vec<String>),
+    EnumValuesAdded(Vec<String>),
+}
+
+impl ChangeKind {
+    pub fn severity(&self) -> Severity {
+        match self {
+            Self::EventAdded
+            | Self::BecameOptional
+            | Self::FieldAdded { required: false }
+            | Self::EnumValuesAdded(_) => Severity::Allowed,
+            Self::EventRemoved | Self::FieldRemoved => Severity::Deprecated,
+            Self::FieldAdded { required: true }
+            | Self::BecameRequired
+            | Self::KindChanged { .. }
+            | Self::EnumValuesRemoved(_) => Severity::Breaking,
+            Self::MaxChanged { from, to, .. } if to < from => Severity::Breaking,
+            Self::MaxChanged { .. } => Severity::Allowed,
+        }
+    }
+}
+
+impl fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EventAdded => f.write_str("event added"),
+            Self::EventRemoved => f.write_str("event removed; older apps may still send it"),
+            Self::FieldAdded { required: true } => {
+                f.write_str("required field added; older apps do not send it")
+            }
+            Self::FieldAdded { required: false } => f.write_str("optional field added"),
+            Self::FieldRemoved => {
+                f.write_str("field removed; older apps may still send it and it will be stripped")
+            }
+            Self::BecameRequired => f.write_str("optional field became required"),
+            Self::BecameOptional => f.write_str("required field became optional"),
+            Self::KindChanged { from, to } => write!(f, "kind changed from {from} to {to}"),
+            Self::MaxChanged { from, to, rejects } if to < from => {
+                let effect = if *rejects {
+                    "larger values are now rejected"
+                } else {
+                    "longer text is now cut shorter"
+                };
+                write!(f, "max narrowed from {from} to {to}; {effect}")
+            }
+            Self::MaxChanged { from, to, .. } => write!(f, "max widened from {from} to {to}"),
+            Self::EnumValuesRemoved(values) => {
+                write!(f, "enum values removed: {}", values.join(", "))
+            }
+            Self::EnumValuesAdded(values) => {
+                write!(f, "enum values added: {}", values.join(", "))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
-    pub severity: Severity,
     /// Where it happened, for example `events.checkout.fields.items`.
     pub path: String,
-    pub description: String,
+    pub kind: ChangeKind,
+}
+
+impl Change {
+    pub fn severity(&self) -> Severity {
+        self.kind.severity()
+    }
 }
 
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}: {}", self.severity, self.path, self.description)
+        write!(f, "{}: {}: {}", self.severity(), self.path, self.kind)
     }
 }
 
-/// Every difference between `old` and `new`, in a stable order. An empty list
-/// means the two schemas declare the same thing.
+/// Every difference between `old` and `new`: events present in `new` first
+/// (by name), then events only in `old`, then traits. An empty list means the
+/// two schemas declare the same thing.
 pub fn diff(old: &Schema, new: &Schema) -> Vec<Change> {
     let mut changes = Vec::new();
 
     for (name, new_event) in new.events() {
-        let path = format!("events.{name}");
         match old.events().get(name) {
-            None => push(&mut changes, Severity::Allowed, &path, "event added"),
-            Some(old_event) => {
-                diff_fields(
-                    &mut changes,
-                    &format!("{path}.fields"),
-                    old_event.fields(),
-                    new_event.fields(),
-                );
-            }
+            None => changes.push(Change {
+                path: format!("events.{name}"),
+                kind: ChangeKind::EventAdded,
+            }),
+            Some(old_event) if old_event != new_event => diff_fields(
+                &mut changes,
+                &format!("events.{name}.fields"),
+                old_event.fields(),
+                new_event.fields(),
+            ),
+            Some(_) => {}
         }
     }
     for name in old.events().keys() {
         if !new.events().contains_key(name) {
-            push(
-                &mut changes,
-                Severity::Deprecated,
-                &format!("events.{name}"),
-                "event removed; older apps may still send it",
-            );
+            changes.push(Change {
+                path: format!("events.{name}"),
+                kind: ChangeKind::EventRemoved,
+            });
         }
     }
 
@@ -82,15 +164,7 @@ pub fn diff(old: &Schema, new: &Schema) -> Vec<Change> {
 
 /// Whether any change in the list is breaking.
 pub fn is_breaking(changes: &[Change]) -> bool {
-    changes.iter().any(|c| c.severity == Severity::Breaking)
-}
-
-fn push(changes: &mut Vec<Change>, severity: Severity, path: &str, description: &str) {
-    changes.push(Change {
-        severity,
-        path: path.to_owned(),
-        description: description.to_owned(),
-    });
+    changes.iter().any(|c| c.severity() == Severity::Breaking)
 }
 
 fn diff_fields(
@@ -99,109 +173,78 @@ fn diff_fields(
     old: &BTreeMap<Name, FieldDef>,
     new: &BTreeMap<Name, FieldDef>,
 ) {
+    let path = |name: &Name| format!("{prefix}.{name}");
     for (name, new_field) in new {
-        let path = format!("{prefix}.{name}");
         match old.get(name) {
-            None if new_field.required => push(
-                changes,
-                Severity::Breaking,
-                &path,
-                "required field added; older apps do not send it",
-            ),
-            None => push(changes, Severity::Allowed, &path, "optional field added"),
-            Some(old_field) => diff_field(changes, &path, old_field, new_field),
+            None => changes.push(Change {
+                path: path(name),
+                kind: ChangeKind::FieldAdded {
+                    required: new_field.required,
+                },
+            }),
+            Some(old_field) if old_field != new_field => {
+                diff_field(changes, &path(name), old_field, new_field);
+            }
+            Some(_) => {}
         }
     }
     for name in old.keys() {
         if !new.contains_key(name) {
-            push(
-                changes,
-                Severity::Deprecated,
-                &format!("{prefix}.{name}"),
-                "field removed; older apps may still send it and it will be stripped",
-            );
+            changes.push(Change {
+                path: path(name),
+                kind: ChangeKind::FieldRemoved,
+            });
         }
     }
 }
 
 fn diff_field(changes: &mut Vec<Change>, path: &str, old: &FieldDef, new: &FieldDef) {
+    let mut report = |kind| {
+        changes.push(Change {
+            path: path.to_owned(),
+            kind,
+        });
+    };
     match (old.required, new.required) {
-        (false, true) => push(
-            changes,
-            Severity::Breaking,
-            path,
-            "optional field became required",
-        ),
-        (true, false) => push(
-            changes,
-            Severity::Allowed,
-            path,
-            "required field became optional",
-        ),
+        (false, true) => report(ChangeKind::BecameRequired),
+        (true, false) => report(ChangeKind::BecameOptional),
         _ => {}
     }
-    diff_kind(changes, path, &old.kind, &new.kind);
-}
-
-fn diff_kind(changes: &mut Vec<Change>, path: &str, old: &FieldKind, new: &FieldKind) {
-    match (old, new) {
+    match (&old.kind, &new.kind) {
         (FieldKind::Id, FieldKind::Id) | (FieldKind::Unit, FieldKind::Unit) => {}
         (FieldKind::Text { max: old }, FieldKind::Text { max: new }) => {
-            compare_max(changes, path, old, new);
+            if old != new {
+                report(ChangeKind::MaxChanged {
+                    from: *old as u64,
+                    to: *new as u64,
+                    rejects: false,
+                });
+            }
         }
         (FieldKind::Count { max: old }, FieldKind::Count { max: new })
         | (FieldKind::Duration { max: old }, FieldKind::Duration { max: new }) => {
-            compare_max(changes, path, old, new);
+            if old != new {
+                report(ChangeKind::MaxChanged {
+                    from: *old,
+                    to: *new,
+                    rejects: true,
+                });
+            }
         }
         (FieldKind::Enum { values: old }, FieldKind::Enum { values: new }) => {
-            let removed: Vec<&str> = old.difference(new).map(|v| v.as_str()).collect();
+            let removed: Vec<String> = old.difference(new).map(|v| v.as_str().to_owned()).collect();
+            let added: Vec<String> = new.difference(old).map(|v| v.as_str().to_owned()).collect();
             if !removed.is_empty() {
-                push(
-                    changes,
-                    Severity::Breaking,
-                    path,
-                    &format!("enum values removed: {}", removed.join(", ")),
-                );
+                report(ChangeKind::EnumValuesRemoved(removed));
             }
-            let added: Vec<&str> = new.difference(old).map(|v| v.as_str()).collect();
             if !added.is_empty() {
-                push(
-                    changes,
-                    Severity::Allowed,
-                    path,
-                    &format!("enum values added: {}", added.join(", ")),
-                );
+                report(ChangeKind::EnumValuesAdded(added));
             }
         }
-        (old, new) => push(
-            changes,
-            Severity::Breaking,
-            path,
-            &format!("kind changed from {} to {}", old.name(), new.name()),
-        ),
-    }
-}
-
-fn compare_max<T: PartialOrd + fmt::Display>(
-    changes: &mut Vec<Change>,
-    path: &str,
-    old: &T,
-    new: &T,
-) {
-    if new < old {
-        push(
-            changes,
-            Severity::Breaking,
-            path,
-            &format!("max narrowed from {old} to {new}"),
-        );
-    } else if new > old {
-        push(
-            changes,
-            Severity::Allowed,
-            path,
-            &format!("max widened from {old} to {new}"),
-        );
+        (old, new) => report(ChangeKind::KindChanged {
+            from: old.name(),
+            to: new.name(),
+        }),
     }
 }
 
@@ -214,14 +257,13 @@ mod tests {
         parse_schema(source).unwrap()
     }
 
-    /// One event `e` with a single field `f` described by `field_toml`, plus
-    /// the optional extra lines appended to the file.
+    /// One event `e` with a single field `f` described by `field_toml`.
     fn with_field(field_toml: &str) -> Schema {
         schema(&format!("[events.e.fields.f]\n{field_toml}\n"))
     }
 
     fn severities(old: &Schema, new: &Schema) -> Vec<Severity> {
-        diff(old, new).into_iter().map(|c| c.severity).collect()
+        diff(old, new).iter().map(Change::severity).collect()
     }
 
     #[test]
@@ -236,7 +278,8 @@ mod tests {
         let new = schema("[events.e.fields.f]\nkind = \"id\"\nrequired = true\n");
         let changes = diff(&Schema::default(), &new);
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].severity, Severity::Allowed);
+        assert_eq!(changes[0].kind, ChangeKind::EventAdded);
+        assert_eq!(changes[0].severity(), Severity::Allowed);
         assert_eq!(changes[0].path, "events.e");
     }
 
@@ -244,8 +287,8 @@ mod tests {
     fn removing_an_event_is_a_deprecation() {
         let old = with_field("kind = \"id\"");
         let changes = diff(&old, &Schema::default());
-        assert_eq!(changes[0].severity, Severity::Deprecated);
-        assert_eq!(changes[0].path, "events.e");
+        assert_eq!(changes[0].kind, ChangeKind::EventRemoved);
+        assert_eq!(changes[0].severity(), Severity::Deprecated);
         assert!(!is_breaking(&changes));
     }
 
@@ -253,6 +296,10 @@ mod tests {
     fn adding_an_optional_field_is_allowed() {
         let old = schema("[events.e]\n");
         let new = with_field("kind = \"id\"");
+        assert_eq!(
+            diff(&old, &new)[0].kind,
+            ChangeKind::FieldAdded { required: false }
+        );
         assert_eq!(severities(&old, &new), vec![Severity::Allowed]);
     }
 
@@ -260,6 +307,10 @@ mod tests {
     fn adding_a_required_field_to_an_existing_event_is_breaking() {
         let old = schema("[events.e]\n");
         let new = with_field("kind = \"id\"\nrequired = true");
+        assert_eq!(
+            diff(&old, &new)[0].kind,
+            ChangeKind::FieldAdded { required: true }
+        );
         assert_eq!(severities(&old, &new), vec![Severity::Breaking]);
     }
 
@@ -267,6 +318,7 @@ mod tests {
     fn removing_a_field_is_a_deprecation() {
         let old = with_field("kind = \"id\"");
         let new = schema("[events.e]\n");
+        assert_eq!(diff(&old, &new)[0].kind, ChangeKind::FieldRemoved);
         assert_eq!(severities(&old, &new), vec![Severity::Deprecated]);
     }
 
@@ -274,6 +326,7 @@ mod tests {
     fn making_an_optional_field_required_is_breaking() {
         let old = with_field("kind = \"id\"");
         let new = with_field("kind = \"id\"\nrequired = true");
+        assert_eq!(diff(&old, &new)[0].kind, ChangeKind::BecameRequired);
         assert_eq!(severities(&old, &new), vec![Severity::Breaking]);
     }
 
@@ -281,28 +334,35 @@ mod tests {
     fn making_a_required_field_optional_is_allowed() {
         let old = with_field("kind = \"id\"\nrequired = true");
         let new = with_field("kind = \"id\"");
+        assert_eq!(diff(&old, &new)[0].kind, ChangeKind::BecameOptional);
         assert_eq!(severities(&old, &new), vec![Severity::Allowed]);
     }
 
     #[test]
     fn changing_a_kind_is_breaking_for_every_pair() {
         let kinds = [
-            "kind = \"id\"",
-            "kind = \"unit\"",
-            "kind = \"text\"\nmax = 10",
-            "kind = \"enum\"\nvalues = [\"a\"]",
-            "kind = \"count\"\nmax = 10",
-            "kind = \"duration\"\nmax = 10",
+            ("id", "kind = \"id\""),
+            ("unit", "kind = \"unit\""),
+            ("text", "kind = \"text\"\nmax = 10"),
+            ("enum", "kind = \"enum\"\nvalues = [\"a\"]"),
+            ("count", "kind = \"count\"\nmax = 10"),
+            ("duration", "kind = \"duration\"\nmax = 10"),
         ];
-        for (i, from) in kinds.iter().enumerate() {
-            for (j, to) in kinds.iter().enumerate() {
-                if i == j {
+        for (from_name, from) in kinds {
+            for (to_name, to) in kinds {
+                if from_name == to_name {
                     continue;
                 }
                 let changes = diff(&with_field(from), &with_field(to));
-                assert_eq!(changes.len(), 1, "{from} -> {to}");
-                assert_eq!(changes[0].severity, Severity::Breaking, "{from} -> {to}");
-                assert!(changes[0].description.contains("kind changed"));
+                assert_eq!(changes.len(), 1, "{from_name} -> {to_name}");
+                assert_eq!(
+                    changes[0].kind,
+                    ChangeKind::KindChanged {
+                        from: from_name,
+                        to: to_name
+                    }
+                );
+                assert_eq!(changes[0].severity(), Severity::Breaking);
             }
         }
     }
@@ -327,12 +387,29 @@ mod tests {
     }
 
     #[test]
+    fn the_report_says_whether_a_narrower_max_rejects_or_cuts() {
+        let text = diff(
+            &with_field("kind = \"text\"\nmax = 20"),
+            &with_field("kind = \"text\"\nmax = 10"),
+        );
+        assert!(text[0].to_string().contains("cut shorter"), "{}", text[0]);
+        let count = diff(
+            &with_field("kind = \"count\"\nmax = 20"),
+            &with_field("kind = \"count\"\nmax = 10"),
+        );
+        assert!(count[0].to_string().contains("rejected"), "{}", count[0]);
+    }
+
+    #[test]
     fn removing_enum_values_is_breaking_and_adding_is_allowed() {
         let wide = with_field("kind = \"enum\"\nvalues = [\"a\", \"b\"]");
         let narrow = with_field("kind = \"enum\"\nvalues = [\"a\"]");
         let changes = diff(&wide, &narrow);
-        assert_eq!(changes[0].severity, Severity::Breaking);
-        assert!(changes[0].description.contains('b'));
+        assert_eq!(
+            changes[0].kind,
+            ChangeKind::EnumValuesRemoved(vec!["b".to_owned()])
+        );
+        assert_eq!(changes[0].severity(), Severity::Breaking);
         assert_eq!(severities(&narrow, &wide), vec![Severity::Allowed]);
     }
 
@@ -347,11 +424,41 @@ mod tests {
     }
 
     #[test]
+    fn one_field_changing_in_several_ways_reports_each() {
+        let old = with_field("kind = \"count\"\nmax = 10");
+        let new = with_field("kind = \"text\"\nmax = 10\nrequired = true");
+        let kinds: Vec<ChangeKind> = diff(&old, &new).into_iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ChangeKind::BecameRequired,
+                ChangeKind::KindChanged {
+                    from: "count",
+                    to: "text"
+                }
+            ]
+        );
+        assert!(is_breaking(&diff(&old, &new)));
+    }
+
+    #[test]
+    fn a_new_event_with_required_fields_is_one_allowed_change() {
+        let old = schema("[events.a]\n");
+        let new = schema(
+            "[events.a]\n[events.b.fields.x]\nkind = \"id\"\nrequired = true\n[events.b.fields.y]\nkind = \"id\"\nrequired = true\n",
+        );
+        let changes = diff(&old, &new);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "events.b");
+        assert_eq!(changes[0].severity(), Severity::Allowed);
+    }
+
+    #[test]
     fn traits_follow_the_same_rules() {
         let old = schema("[traits.plan]\nkind = \"enum\"\nvalues = [\"free\", \"pro\"]\n");
         let narrowed = schema("[traits.plan]\nkind = \"enum\"\nvalues = [\"free\"]\n");
         let changes = diff(&old, &narrowed);
-        assert_eq!(changes[0].severity, Severity::Breaking);
+        assert_eq!(changes[0].severity(), Severity::Breaking);
         assert_eq!(changes[0].path, "traits.plan");
         let added = schema(
             "[traits.plan]\nkind = \"enum\"\nvalues = [\"free\", \"pro\"]\n[traits.seats]\nkind = \"count\"\nmax = 5\n",
@@ -369,5 +476,14 @@ mod tests {
         let paths: Vec<String> = diff(&old, &new).into_iter().map(|c| c.path).collect();
         assert_eq!(paths, vec!["events.a.fields.x", "events.c", "events.b"]);
         assert!(is_breaking(&diff(&old, &new)));
+    }
+
+    #[test]
+    fn display_names_severity_path_and_effect() {
+        let changes = diff(&schema("[events.e]\n"), &with_field("kind = \"id\""));
+        assert_eq!(
+            changes[0].to_string(),
+            "allowed: events.e.fields.f: optional field added"
+        );
     }
 }

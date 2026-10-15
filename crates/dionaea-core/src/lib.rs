@@ -10,7 +10,7 @@ mod name;
 mod parse;
 mod schema;
 
-pub use diff::{Change, Severity, diff, is_breaking};
+pub use diff::{Change, ChangeKind, Severity, diff, is_breaking};
 pub use guard::{DropReason, FieldValue, Guarded};
 pub use name::{EnumValue, InvalidEnumValue, InvalidName, MAX_NAME_LEN, Name};
 pub use parse::{Diagnostic, MAX_DIAGNOSTICS, MAX_SOURCE_LEN, parse_schema};
