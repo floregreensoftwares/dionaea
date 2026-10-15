@@ -189,7 +189,9 @@ dependencies = [
 name = "dionaea-core"
 version = "0.0.0"
 dependencies = [
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
