@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "diff"
 harness = false
+
+[[bench]]
+name = "wire"
+harness = false
