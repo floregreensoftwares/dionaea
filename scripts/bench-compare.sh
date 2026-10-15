@@ -36,9 +36,11 @@ export CRITERION_HOME=$work/criterion
 
 # Drops the release-profile artifacts (benchmarks build there) of every
 # workspace crate of a tree; `cargo clean -p` alone only cleans the dev profile.
+# Package names come from each crate's Cargo.toml, not from its folder name.
 clean_workspace_crates() {
-    for dir in "$1"/crates/*/; do
-        (cd "$1" && cargo clean --quiet --release -p "$(basename "$dir")")
+    for manifest in "$1"/crates/*/Cargo.toml; do
+        package=$(sed -n 's/^name = "\(.*\)"$/\1/p' "$manifest" | head -n 1)
+        (cd "$1" && cargo clean --quiet --release -p "$package")
     done
 }
 
@@ -95,5 +97,17 @@ for crate in $crates; do
     echo "== $crate: working tree against the base revision"
     # shellcheck disable=SC2046
     clean_workspace_crates "$repo_root"
-    run_benches "$repo_root" "$crate" --baseline-lenient base $(timing)
+    log=$work/branch-$crate.log
+    if ! run_benches "$repo_root" "$crate" --baseline-lenient base $(timing) >"$log" 2>&1; then
+        cat "$log"
+        exit 1
+    fi
+    cat "$log"
+    # A stale artifact would measure the base twice and look healthy, so when
+    # the crate differs from the base it must have been compiled for this run.
+    if ! git -C "$repo_root" diff --quiet "$base" -- "crates/$crate" &&
+        ! grep -q "Compiling.*$crate" "$log"; then
+        echo "error: crates/$crate differs from $base but was not rebuilt for the branch run" >&2
+        exit 1
+    fi
 done
