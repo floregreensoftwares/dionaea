@@ -34,10 +34,13 @@ impl Name {
 
     /// The same check as [`Name::new`], without allocating.
     pub fn is_valid(value: &str) -> bool {
+        if value.len() > MAX_NAME_LEN {
+            return false;
+        }
         let mut chars = value.chars();
         let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
         let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-        first_ok && rest_ok && value.len() <= MAX_NAME_LEN
+        first_ok && rest_ok
     }
 
     pub fn as_str(&self) -> &str {
@@ -115,13 +118,16 @@ impl EnumValue {
     }
 
     pub fn is_valid(value: &str) -> bool {
+        if value.len() > MAX_NAME_LEN {
+            return false;
+        }
         let mut chars = value.chars();
         let first_ok = chars
             .next()
             .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
         let rest_ok = chars
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'));
-        first_ok && rest_ok && value.len() <= MAX_NAME_LEN
+        first_ok && rest_ok
     }
 
     pub fn as_str(&self) -> &str {

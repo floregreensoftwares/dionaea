@@ -90,15 +90,21 @@ fn guard_fields(
     if properties.len() > MAX_PROPERTIES {
         return Err(DropReason::TooManyProperties);
     }
+    // A missing required field is reported before an invalid one, so the
+    // reason does not depend on how the fields happen to be named.
+    if enforce_required
+        && declared
+            .iter()
+            .any(|(name, def)| def.required && !properties.contains_key(name.as_str()))
+    {
+        return Err(DropReason::MissingRequiredField);
+    }
     let mut fields = BTreeMap::new();
     let mut present = 0;
     let mut invalid = Vec::new();
     for (name, def) in declared {
         let required = def.required && enforce_required;
         let Some(value) = properties.get(name.as_str()) else {
-            if required {
-                return Err(DropReason::MissingRequiredField);
-            }
             continue;
         };
         present += 1;
@@ -435,6 +441,51 @@ mod tests {
         assert_eq!(
             schema.guard_event("probe", &props(json!({ "f": "not ok" }))),
             Err(DropReason::InvalidRequiredField)
+        );
+    }
+
+    #[test]
+    fn missing_required_field_wins_over_an_invalid_one_whatever_the_names() {
+        for (first, second) in [("a", "b"), ("b", "a")] {
+            let def = EventDef::new(BTreeMap::from([
+                (name(first), FieldDef::required(FieldKind::Id)),
+                (name(second), FieldDef::required(FieldKind::Id)),
+            ]))
+            .unwrap();
+            let schema =
+                Schema::new(BTreeMap::from([(name("probe"), def)]), BTreeMap::new()).unwrap();
+            let properties = props(json!({ first: "not ok" }));
+            assert_eq!(
+                schema.guard_event("probe", &properties),
+                Err(DropReason::MissingRequiredField)
+            );
+        }
+    }
+
+    #[test]
+    fn screen_and_experiment_viewed_have_their_fixed_shapes() {
+        let schema = Schema::default();
+        assert!(
+            schema
+                .guard_event("screen", &props(json!({ "name": "home" })))
+                .is_ok()
+        );
+        assert_eq!(
+            schema.guard_event("screen", &props(json!({ "title": "home" }))),
+            Err(DropReason::MissingRequiredField)
+        );
+        let experiment = json!({ "experiment": "new_checkout", "variant": "b" });
+        assert_eq!(
+            schema
+                .guard_event("experiment_viewed", &props(experiment))
+                .unwrap()
+                .fields
+                .len(),
+            2
+        );
+        assert_eq!(
+            schema.guard_event("experiment_viewed", &props(json!({ "experiment": "x" }))),
+            Err(DropReason::MissingRequiredField)
         );
     }
 

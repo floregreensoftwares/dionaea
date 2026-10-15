@@ -54,7 +54,8 @@ impl std::error::Error for SchemaError {}
 pub enum FieldKind {
     /// Identifier-shaped string: `[A-Za-z0-9_.:-]`, 1 to 64 characters.
     Id,
-    /// Free text, control characters replaced, trimmed, cut at `max` characters.
+    /// Free text: control and format characters and line separators become
+    /// spaces, trimmed, cut at `max` characters.
     Text { max: usize },
     /// Finite number clamped to 0..1 and rounded to three decimals.
     Unit,
@@ -83,6 +84,17 @@ impl FieldKind {
             return Err(SchemaError::EnumValuesInvalid);
         }
         Ok(Self::Enum { values: distinct })
+    }
+
+    /// Re-checks the limits the constructors enforce. The variants are public,
+    /// so a kind built by hand is validated again when it joins a schema.
+    fn validate(&self) -> Result<(), SchemaError> {
+        match self {
+            Self::Id | Self::Unit => Ok(()),
+            Self::Text { max } => Self::text(*max).map(|_| ()),
+            Self::Enum { values } => Self::enumeration(values.iter().cloned()).map(|_| ()),
+            Self::Count { max } | Self::Duration { max } => integer_max(*max).map(|_| ()),
+        }
     }
 
     pub fn count(max: u64) -> Result<Self, SchemaError> {
@@ -134,6 +146,9 @@ impl EventDef {
         if fields.len() > MAX_PROPERTIES {
             return Err(SchemaError::TooManyFields);
         }
+        for def in fields.values() {
+            def.kind.validate()?;
+        }
         Ok(Self { fields })
     }
 
@@ -166,6 +181,9 @@ impl Schema {
         }
         if let Some((name, _)) = traits.iter().find(|(_, def)| def.required) {
             return Err(SchemaError::RequiredTrait(name.clone()));
+        }
+        for def in traits.values() {
+            def.kind.validate()?;
         }
         Ok(Self { events, traits })
     }
@@ -266,6 +284,36 @@ mod tests {
     fn site_may_declare_its_own_event_names() {
         let events = BTreeMap::from([(name("checkout"), EventDef::new(BTreeMap::new()).unwrap())]);
         assert!(Schema::new(events, BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn hand_built_kinds_are_validated_when_they_join_a_schema() {
+        let bad = [
+            (
+                FieldKind::Text { max: usize::MAX },
+                SchemaError::TextMaxOutOfRange,
+            ),
+            (
+                FieldKind::Count { max: u64::MAX },
+                SchemaError::IntegerMaxOutOfRange,
+            ),
+            (
+                FieldKind::Duration { max: 0 },
+                SchemaError::IntegerMaxOutOfRange,
+            ),
+            (
+                FieldKind::Enum {
+                    values: BTreeSet::new(),
+                },
+                SchemaError::EnumValuesInvalid,
+            ),
+        ];
+        for (kind, error) in bad {
+            let fields = BTreeMap::from([(name("f"), FieldDef::optional(kind.clone()))]);
+            assert_eq!(EventDef::new(fields), Err(error.clone()));
+            let traits = BTreeMap::from([(name("f"), FieldDef::optional(kind))]);
+            assert_eq!(Schema::new(BTreeMap::new(), traits), Err(error));
+        }
     }
 
     #[test]
