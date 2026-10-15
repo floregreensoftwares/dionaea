@@ -521,3 +521,44 @@ proptest! {
         prop_assert!(changes.iter().all(|c| c.severity() != dionaea_core::Severity::Breaking));
     }
 }
+
+// The 32-entry limit
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// More than 32 properties drop the event, whatever they hold, for events,
+    /// for traits and in the decoder, which does not store the excess.
+    #[test]
+    fn more_than_the_limit_is_always_refused(
+        count in (MAX_PROPERTIES + 1)..(MAX_PROPERTIES + 40),
+        value in json_value(),
+    ) {
+        let props: Map<String, Value> =
+            (0..count).map(|i| (format!("k{i}"), value.clone())).collect();
+        let dropped = probe_schema().guard_event("probe", &props).expect_err("too many");
+        prop_assert_eq!(dropped.reason, DropReason::TooManyProperties);
+        prop_assert!(dropped.field.is_none());
+        let dropped = probe_schema().guard_traits(&props).expect_err("too many");
+        prop_assert_eq!(dropped.reason, DropReason::TooManyProperties);
+
+        let entries: Vec<String> = (0..count).map(|i| format!("\"k{i}\":1")).collect();
+        let body = format!(
+            "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":{{{}}}}}]}}",
+            entries.join(",")
+        );
+        let batch = decode_batch(body.as_bytes()).expect("a valid envelope");
+        prop_assert!(batch.events.is_empty());
+        prop_assert_eq!(batch.rejected.len(), 1);
+        prop_assert_eq!(batch.rejected[0].reason, DropReason::TooManyProperties);
+    }
+
+    /// Exactly the limit is accepted and every entry is accounted for.
+    #[test]
+    fn exactly_the_limit_is_accepted(value in json_value()) {
+        let props: Map<String, Value> =
+            (0..MAX_PROPERTIES).map(|i| (format!("k{i}"), value.clone())).collect();
+        let guarded = probe_schema().guard_event("probe", &props).expect("at the limit");
+        prop_assert_eq!(guarded.undeclared, MAX_PROPERTIES);
+    }
+}
