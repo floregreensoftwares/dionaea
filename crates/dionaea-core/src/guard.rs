@@ -5,12 +5,20 @@ use serde_json::{Map, Value};
 use crate::name::Name;
 use crate::schema::{FieldDef, FieldKind, MAX_PROPERTIES, Schema};
 
-const MAX_ID_LEN: usize = 64;
+pub(crate) const MAX_ID_LEN: usize = 64;
 
 /// Why an event was not accepted. Counters are keyed by these, never by the
-/// payload.
+/// payload. The first group comes from reading the request, the second from
+/// the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DropReason {
+    MalformedEvent,
+    InvalidEventId,
+    InvalidTimestamp,
+    InvalidAnonId,
+    InvalidSessionId,
+    InvalidScreen,
+    InvalidProperties,
     InvalidEventName,
     UnknownEvent,
     TooManyProperties,
@@ -19,7 +27,14 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 12] = [
+        Self::MalformedEvent,
+        Self::InvalidEventId,
+        Self::InvalidTimestamp,
+        Self::InvalidAnonId,
+        Self::InvalidSessionId,
+        Self::InvalidScreen,
+        Self::InvalidProperties,
         Self::InvalidEventName,
         Self::UnknownEvent,
         Self::TooManyProperties,
@@ -29,6 +44,13 @@ impl DropReason {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::MalformedEvent => "malformed_event",
+            Self::InvalidEventId => "invalid_event_id",
+            Self::InvalidTimestamp => "invalid_timestamp",
+            Self::InvalidAnonId => "invalid_anon_id",
+            Self::InvalidSessionId => "invalid_session_id",
+            Self::InvalidScreen => "invalid_screen",
+            Self::InvalidProperties => "invalid_properties",
             Self::InvalidEventName => "invalid_event_name",
             Self::UnknownEvent => "unknown_event",
             Self::TooManyProperties => "too_many_properties",
@@ -155,16 +177,20 @@ fn is_unsafe_char(c: char) -> bool {
         )
 }
 
+/// The shape of an `id` value: `[A-Za-z0-9_.:-]`, 1 to 64 characters.
+pub(crate) fn is_id(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_ID_LEN
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
 fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
     match kind {
         FieldKind::Id => {
             let text = value.as_str()?;
-            let shaped = !text.is_empty()
-                && text.len() <= MAX_ID_LEN
-                && text
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
-            shaped.then(|| FieldValue::Text(text.to_owned()))
+            is_id(text).then(|| FieldValue::Text(text.to_owned()))
         }
         FieldKind::Text { max } => {
             let capped: String = value
@@ -627,7 +653,14 @@ mod tests {
         // until it is handled here and added to `ALL`.
         for reason in DropReason::ALL {
             match reason {
-                DropReason::InvalidEventName
+                DropReason::MalformedEvent
+                | DropReason::InvalidEventId
+                | DropReason::InvalidTimestamp
+                | DropReason::InvalidAnonId
+                | DropReason::InvalidSessionId
+                | DropReason::InvalidScreen
+                | DropReason::InvalidProperties
+                | DropReason::InvalidEventName
                 | DropReason::UnknownEvent
                 | DropReason::TooManyProperties
                 | DropReason::MissingRequiredField
@@ -635,7 +668,7 @@ mod tests {
             }
         }
         let listed: std::collections::BTreeSet<_> = DropReason::ALL.into_iter().collect();
-        assert_eq!(listed.len(), 5);
+        assert_eq!(listed.len(), 12);
     }
 
     #[test]
