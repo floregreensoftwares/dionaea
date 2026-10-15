@@ -1,0 +1,58 @@
+{
+  "description": "How each field kind accepts, cleans or rejects a value. Every field is optional, so a bad value is stripped and listed under `invalid`.",
+  "schema": "[events.probe.fields.i]\nkind = \"id\"\n[events.probe.fields.t]\nkind = \"text\"\nmax = 8\n[events.probe.fields.u]\nkind = \"unit\"\n[events.probe.fields.e]\nkind = \"enum\"\nvalues = [\"a\", \"us-east\"]\n[events.probe.fields.c]\nkind = \"count\"\nmax = 10\n[events.probe.fields.d]\nkind = \"duration\"\nmax = 5000\n",
+  "cases": [
+    { "name": "empty properties", "event": "probe", "props": {}, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": [] } } },
+
+    { "name": "id: plain", "event": "probe", "props": { "i": "abc" }, "expect": { "accepted": { "fields": { "i": "abc" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "id: every allowed character", "event": "probe", "props": { "i": "A-1_b.c:d" }, "expect": { "accepted": { "fields": { "i": "A-1_b.c:d" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "id: a uuid", "event": "probe", "props": { "i": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e" }, "expect": { "accepted": { "fields": { "i": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "id: 64 characters is the longest", "event": "probe", "props": { "i": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "expect": { "accepted": { "fields": { "i": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "id: 65 characters", "event": "probe", "props": { "i": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+    { "name": "id: a space", "event": "probe", "props": { "i": "a b" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+    { "name": "id: a slash", "event": "probe", "props": { "i": "a/b" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+    { "name": "id: empty", "event": "probe", "props": { "i": "" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+    { "name": "id: not ASCII", "event": "probe", "props": { "i": "café" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+    { "name": "id: a number", "event": "probe", "props": { "i": 1 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+    { "name": "id: null", "event": "probe", "props": { "i": null }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i"] } } },
+
+    { "name": "text: plain", "event": "probe", "props": { "t": "hello" }, "expect": { "accepted": { "fields": { "t": "hello" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text: trimmed", "event": "probe", "props": { "t": "  hi  " }, "expect": { "accepted": { "fields": { "t": "hi" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text: control characters become spaces", "event": "probe", "props": { "t": "a\tb\nc" }, "expect": { "accepted": { "fields": { "t": "a b c" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text: cut at the maximum", "event": "probe", "props": { "t": "abcdefghij" }, "expect": { "accepted": { "fields": { "t": "abcdefgh" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text: the maximum counts characters, not bytes", "event": "probe", "props": { "t": "ééééééééé" }, "expect": { "accepted": { "fields": { "t": "éééééééé" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text: only spaces is empty and so invalid", "event": "probe", "props": { "t": "   " }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["t"] } } },
+    { "name": "text: empty", "event": "probe", "props": { "t": "" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["t"] } } },
+    { "name": "text: a number", "event": "probe", "props": { "t": 5 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["t"] } } },
+
+    { "name": "unit: inside the range", "event": "probe", "props": { "u": 0.5 }, "expect": { "accepted": { "fields": { "u": 0.5 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "unit: clamped above", "event": "probe", "props": { "u": 1.7 }, "expect": { "accepted": { "fields": { "u": 1.0 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "unit: clamped below", "event": "probe", "props": { "u": -3.0 }, "expect": { "accepted": { "fields": { "u": 0.0 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "unit: rounded down to three decimals", "event": "probe", "props": { "u": 0.12345 }, "expect": { "accepted": { "fields": { "u": 0.123 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "unit: rounded up to three decimals", "event": "probe", "props": { "u": 0.1236 }, "expect": { "accepted": { "fields": { "u": 0.124 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "unit: an integer is a number", "event": "probe", "props": { "u": 1 }, "expect": { "accepted": { "fields": { "u": 1.0 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "unit: a string", "event": "probe", "props": { "u": "0.5" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["u"] } } },
+
+    { "name": "enum: a declared value", "event": "probe", "props": { "e": "a" }, "expect": { "accepted": { "fields": { "e": "a" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "enum: a value with a hyphen", "event": "probe", "props": { "e": "us-east" }, "expect": { "accepted": { "fields": { "e": "us-east" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "enum: another case is another value", "event": "probe", "props": { "e": "A" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["e"] } } },
+    { "name": "enum: not declared", "event": "probe", "props": { "e": "c" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["e"] } } },
+    { "name": "enum: a number", "event": "probe", "props": { "e": 1 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["e"] } } },
+
+    { "name": "count: zero", "event": "probe", "props": { "c": 0 }, "expect": { "accepted": { "fields": { "c": 0 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "count: the maximum", "event": "probe", "props": { "c": 10 }, "expect": { "accepted": { "fields": { "c": 10 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "count: above the maximum is rejected, not clamped", "event": "probe", "props": { "c": 11 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["c"] } } },
+    { "name": "count: negative", "event": "probe", "props": { "c": -1 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["c"] } } },
+    { "name": "count: a fraction", "event": "probe", "props": { "c": 1.5 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["c"] } } },
+    { "name": "count: a float with no fraction is still a float", "event": "probe", "props": { "c": 3.0 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["c"] } } },
+    { "name": "count: a string", "event": "probe", "props": { "c": "3" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["c"] } } },
+
+    { "name": "duration: the maximum", "event": "probe", "props": { "d": 5000 }, "expect": { "accepted": { "fields": { "d": 5000 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "duration: above the maximum", "event": "probe", "props": { "d": 5001 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["d"] } } },
+    { "name": "duration: negative", "event": "probe", "props": { "d": -5 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["d"] } } },
+
+    { "name": "undeclared properties are stripped and counted", "event": "probe", "props": { "i": "x", "extra": 1, "other": "y" }, "expect": { "accepted": { "fields": { "i": "x" }, "undeclared": 2, "invalid": [] } } },
+    { "name": "an invalid optional value is stripped and named", "event": "probe", "props": { "i": "x", "c": 99, "z": 1 }, "expect": { "accepted": { "fields": { "i": "x" }, "undeclared": 1, "invalid": ["c"] } } },
+    { "name": "arrays and objects are never accepted", "event": "probe", "props": { "i": { "a": 1 }, "t": ["x"] }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["i", "t"] } } }
+  ]
+}

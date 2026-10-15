@@ -55,6 +55,27 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
+impl RequestError {
+    /// The name used for counters and in the conformance vectors.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BodyTooLarge => "body_too_large",
+            Self::NotJson => "not_json",
+            Self::NotAnObject => "not_an_object",
+            Self::InvalidField(_) => "invalid_field",
+            Self::TooManyEvents => "too_many_events",
+        }
+    }
+
+    /// The envelope field behind an `InvalidField`.
+    pub fn field(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidField(field) => Some(field),
+            _ => None,
+        }
+    }
+}
+
 /// A UUID version 7 (time-ordered), kept as 128 bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(u128);

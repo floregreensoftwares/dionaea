@@ -1,0 +1,37 @@
+{
+  "description": "Bodies of POST /v1/identify. All of sent_at, sdk, anon_id and user_id are required; ids are id-shaped, so an email address is not a valid user id.",
+  "endpoint": "identify",
+  "cases": [
+    {
+      "name": "a valid identify with traits",
+      "body": "{\"sent_at\":5,\"sdk\":\"dionaea-web/0.1.0\",\"anon_id\":\"a1\",\"user_id\":\"u_42\",\"traits\":{\"plan\":\"pro\",\"seats\":25}}",
+      "expect": { "identify": { "sent_at": 5, "sdk": "dionaea-web/0.1.0", "anon_id": "a1", "user_id": "u_42", "traits": { "plan": "pro", "seats": 25 } } }
+    },
+    {
+      "name": "traits are optional",
+      "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"u1\"}",
+      "expect": { "identify": { "sent_at": 5, "sdk": "s", "anon_id": "a1", "user_id": "u1", "traits": {} } }
+    },
+    {
+      "name": "null traits count as absent",
+      "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"u1\",\"traits\":null}",
+      "expect": { "identify": { "sent_at": 5, "sdk": "s", "anon_id": "a1", "user_id": "u1", "traits": {} } }
+    },
+    {
+      "name": "unknown fields are ignored",
+      "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"u1\",\"future\":[1]}",
+      "expect": { "identify": { "sent_at": 5, "sdk": "s", "anon_id": "a1", "user_id": "u1", "traits": {} } }
+    },
+    { "name": "no anon id", "body": "{\"sent_at\":5,\"sdk\":\"s\",\"user_id\":\"u1\"}", "expect": { "request_error": "invalid_field", "field": "anon_id" } },
+    { "name": "an anon id with a space", "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a 1\",\"user_id\":\"u1\"}", "expect": { "request_error": "invalid_field", "field": "anon_id" } },
+    { "name": "no user id", "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\"}", "expect": { "request_error": "invalid_field", "field": "user_id" } },
+    { "name": "an email address is not a user id", "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"a@b.c\"}", "expect": { "request_error": "invalid_field", "field": "user_id" } },
+    { "name": "traits as an array", "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"u1\",\"traits\":[1]}", "expect": { "request_error": "invalid_field", "field": "traits" } },
+    { "name": "traits as a string", "body": "{\"sent_at\":5,\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"u1\",\"traits\":\"x\"}", "expect": { "request_error": "invalid_field", "field": "traits" } },
+    { "name": "no sent_at", "body": "{\"sdk\":\"s\",\"anon_id\":\"a1\",\"user_id\":\"u1\"}", "expect": { "request_error": "invalid_field", "field": "sent_at" } },
+    { "name": "a bad sdk", "body": "{\"sent_at\":5,\"sdk\":\"bad sdk\",\"anon_id\":\"a1\",\"user_id\":\"u1\"}", "expect": { "request_error": "invalid_field", "field": "sdk" } },
+    { "name": "not JSON", "body": "nope", "expect": { "request_error": "not_json" } },
+    { "name": "an array", "body": "[]", "expect": { "request_error": "not_an_object" } },
+    { "name": "a body over 256 KiB", "body_parts": { "prefix": "", "repeat": " ", "times": 262145, "suffix": "" }, "expect": { "request_error": "body_too_large" } }
+  ]
+}

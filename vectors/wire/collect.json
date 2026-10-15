@@ -1,0 +1,200 @@
+{
+  "description": "Bodies of POST /v1/collect. A bad envelope refuses the request; a bad event is set aside alone with its reason. The checks inside an event run in a fixed order. `body_parts` builds a body as prefix + repeat x times + suffix.",
+  "endpoint": "collect",
+  "cases": [
+    {
+      "name": "a minimal valid batch",
+      "body": "{\"sent_at\":1760000001000,\"sdk\":\"dionaea-rn/0.1.0\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"checkout\",\"ts\":1760000000000,\"anon_id\":\"a1\"}]}",
+      "expect": { "batch": { "sent_at": 1760000001000, "sdk": "dionaea-rn/0.1.0", "release": null, "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "checkout", "ts": 1760000000000, "anon_id": "a1", "session_id": null, "screen": null, "props": {} } ], "rejected": [] } }
+    },
+    {
+      "name": "every field present",
+      "body": "{\"sent_at\":1760000001000,\"sdk\":\"dionaea-web/0.1.0\",\"release\":\"1.4.2+57\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"checkout\",\"ts\":1760000000000,\"anon_id\":\"a1\",\"session_id\":\"s1\",\"screen\":\"/orders/:id\",\"props\":{\"items\":3,\"coupon\":\"SAVE\",\"ok\":true,\"ratio\":0.5,\"none\":null}}]}",
+      "expect": { "batch": { "sent_at": 1760000001000, "sdk": "dionaea-web/0.1.0", "release": "1.4.2+57", "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "checkout", "ts": 1760000000000, "anon_id": "a1", "session_id": "s1", "screen": "/orders/:id", "props": { "items": 3, "coupon": "SAVE", "ok": true, "ratio": 0.5, "none": null } } ], "rejected": [] } }
+    },
+    {
+      "name": "optional fields set to null count as absent",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"release\":null,\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"session_id\":null,\"screen\":null,\"props\":null}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "e", "ts": 1, "anon_id": "a", "session_id": null, "screen": null, "props": {} } ], "rejected": [] } }
+    },
+    {
+      "name": "an upper-case event id is normalised to lower case",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190F7E2-7C3E-7A52-9A0E-5F3C2A1B4D6E\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "e", "ts": 1, "anon_id": "a", "session_id": null, "screen": null, "props": {} } ], "rejected": [] } }
+    },
+    {
+      "name": "an empty batch is valid",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [] } }
+    },
+    {
+      "name": "unknown fields are ignored at every level",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"future\":{\"a\":[1,2]},\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"future_field\":[1,2,3]}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "e", "ts": 1, "anon_id": "a", "session_id": null, "screen": null, "props": {} } ], "rejected": [] } }
+    },
+    {
+      "name": "a malformed event is set aside and its neighbours go on",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\"},\"oops\",{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6f\",\"name\":\"f\",\"ts\":2,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "e", "ts": 1, "anon_id": "a", "session_id": null, "screen": null, "props": {} }, { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6f", "name": "f", "ts": 2, "anon_id": "a", "session_id": null, "screen": null, "props": {} } ], "rejected": [ { "index": 1, "reason": "malformed_event" } ] } }
+    },
+
+    {
+      "name": "event: no event id",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_id" } ] } }
+    },
+    {
+      "name": "event: an event id of version 4",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-4a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_id" } ] } }
+    },
+    {
+      "name": "event: an event id that is a number",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":7,\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_id" } ] } }
+    },
+    {
+      "name": "event: a name with a capital and a space",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"Bad Name\",\"ts\":1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_name" } ] } }
+    },
+    {
+      "name": "event: no name",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"ts\":1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_name" } ] } }
+    },
+    {
+      "name": "event: no timestamp",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_timestamp" } ] } }
+    },
+    {
+      "name": "event: a negative timestamp",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":-1,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_timestamp" } ] } }
+    },
+    {
+      "name": "event: a fractional timestamp",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1.5,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_timestamp" } ] } }
+    },
+    {
+      "name": "event: a timestamp that is a string",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":\"1\",\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_timestamp" } ] } }
+    },
+    {
+      "name": "event: a timestamp above 2^53 - 1",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":9007199254740992,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_timestamp" } ] } }
+    },
+    {
+      "name": "event: the largest timestamp is accepted",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":9007199254740991,\"anon_id\":\"a\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [ { "event_id": "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "name": "e", "ts": 9007199254740991, "anon_id": "a", "session_id": null, "screen": null, "props": {} } ], "rejected": [] } }
+    },
+    {
+      "name": "event: no anon id",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_anon_id" } ] } }
+    },
+    {
+      "name": "event: an anon id with a space",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a b\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_anon_id" } ] } }
+    },
+    {
+      "name": "event: a session id with a space",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"session_id\":\"s s\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_session_id" } ] } }
+    },
+    {
+      "name": "event: a session id that is a number",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"session_id\":3}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_session_id" } ] } }
+    },
+    {
+      "name": "event: a screen with a space",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"screen\":\"has space\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_screen" } ] } }
+    },
+    {
+      "name": "event: a screen that is not ASCII",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"screen\":\"café\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_screen" } ] } }
+    },
+    {
+      "name": "event: properties that are an array",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":[1]}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_properties" } ] } }
+    },
+    {
+      "name": "event: properties that are a string",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":\"x\"}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_properties" } ] } }
+    },
+    {
+      "name": "event: 33 properties",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":{\"k0\":1,\"k1\":1,\"k2\":1,\"k3\":1,\"k4\":1,\"k5\":1,\"k6\":1,\"k7\":1,\"k8\":1,\"k9\":1,\"k10\":1,\"k11\":1,\"k12\":1,\"k13\":1,\"k14\":1,\"k15\":1,\"k16\":1,\"k17\":1,\"k18\":1,\"k19\":1,\"k20\":1,\"k21\":1,\"k22\":1,\"k23\":1,\"k24\":1,\"k25\":1,\"k26\":1,\"k27\":1,\"k28\":1,\"k29\":1,\"k30\":1,\"k31\":1,\"k32\":1}}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "too_many_properties" } ] } }
+    },
+    {
+      "name": "event: with every field wrong the event id is reported first",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"x\",\"name\":\"Bad\",\"ts\":-1,\"anon_id\":\"a b\",\"session_id\":\"s s\",\"screen\":\"a b\",\"props\":1}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_id" } ] } }
+    },
+    {
+      "name": "event: with the id fixed the name is reported next",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"Bad\",\"ts\":-1,\"anon_id\":\"a b\",\"session_id\":\"s s\",\"screen\":\"a b\",\"props\":1}]}",
+      "expect": { "batch": { "sent_at": 1, "sdk": "s", "release": null, "events": [], "rejected": [ { "index": 0, "reason": "invalid_event_name" } ] } }
+    },
+
+    {
+      "name": "request: a body over 256 KiB",
+      "body_parts": { "prefix": "", "repeat": " ", "times": 262145, "suffix": "" },
+      "expect": { "request_error": "body_too_large" }
+    },
+    {
+      "name": "request: not JSON",
+      "body": "not json",
+      "expect": { "request_error": "not_json" }
+    },
+    {
+      "name": "request: an empty body",
+      "body": "",
+      "expect": { "request_error": "not_json" }
+    },
+    {
+      "name": "request: text after the JSON value",
+      "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[]} trailing",
+      "expect": { "request_error": "not_json" }
+    },
+    {
+      "name": "request: a repeated key",
+      "body": "{\"sent_at\":1,\"sent_at\":2,\"sdk\":\"s\",\"events\":[]}",
+      "expect": { "request_error": "not_json" }
+    },
+    { "name": "request: an array", "body": "[]", "expect": { "request_error": "not_an_object" } },
+    { "name": "request: a number", "body": "3", "expect": { "request_error": "not_an_object" } },
+    { "name": "request: a string", "body": "\"x\"", "expect": { "request_error": "not_an_object" } },
+    { "name": "request: null", "body": "null", "expect": { "request_error": "not_an_object" } },
+    { "name": "request: no sent_at", "body": "{\"sdk\":\"s\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sent_at" } },
+    { "name": "request: sent_at as a string", "body": "{\"sent_at\":\"1\",\"sdk\":\"s\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sent_at" } },
+    { "name": "request: a negative sent_at", "body": "{\"sent_at\":-1,\"sdk\":\"s\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sent_at" } },
+    { "name": "request: a fractional sent_at", "body": "{\"sent_at\":1.5,\"sdk\":\"s\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sent_at" } },
+    { "name": "request: sent_at above 2^53 - 1", "body": "{\"sent_at\":9007199254740992,\"sdk\":\"s\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sent_at" } },
+    { "name": "request: no sdk", "body": "{\"sent_at\":1,\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sdk" } },
+    { "name": "request: a null sdk", "body": "{\"sent_at\":1,\"sdk\":null,\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sdk" } },
+    { "name": "request: an sdk with a space", "body": "{\"sent_at\":1,\"sdk\":\"bad sdk\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sdk" } },
+    { "name": "request: an sdk of 65 characters", "body": "{\"sent_at\":1,\"sdk\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "sdk" } },
+    { "name": "request: a release with a space", "body": "{\"sent_at\":1,\"sdk\":\"s\",\"release\":\"1 2\",\"events\":[]}", "expect": { "request_error": "invalid_field", "field": "release" } },
+    { "name": "request: no events", "body": "{\"sent_at\":1,\"sdk\":\"s\"}", "expect": { "request_error": "invalid_field", "field": "events" } },
+    { "name": "request: null events", "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":null}", "expect": { "request_error": "invalid_field", "field": "events" } },
+    { "name": "request: events as an object", "body": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":{}}", "expect": { "request_error": "invalid_field", "field": "events" } },
+    {
+      "name": "request: 101 events",
+      "body_parts": { "prefix": "{\"sent_at\":1,\"sdk\":\"s\",\"events\":[", "repeat": "1,", "times": 100, "suffix": "1]}" },
+      "expect": { "request_error": "too_many_events" }
+    }
+  ]
+}

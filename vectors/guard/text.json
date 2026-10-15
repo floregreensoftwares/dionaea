@@ -1,0 +1,28 @@
+{
+  "description": "What `text` replaces with a space: controls, format characters, line and paragraph separators, blank fillers and every Unicode space except the ASCII one. Replacement is per character (a run is not collapsed); the value is then trimmed and cut at the maximum, and text that is empty after cleaning is invalid.",
+  "schema": "[events.t.fields.v]\nkind = \"text\"\nmax = 50\n[events.t.fields.s]\nkind = \"text\"\nmax = 4\n",
+  "cases": [
+    { "name": "a right-to-left override", "event": "t", "props": { "v": "a‮b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a zero-width space", "event": "t", "props": { "v": "a​b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "bidi isolates", "event": "t", "props": { "v": "a⁦b⁩c" }, "expect": { "accepted": { "fields": { "v": "a b c" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a byte order mark", "event": "t", "props": { "v": "a﻿b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a soft hyphen", "event": "t", "props": { "v": "a­b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "line and paragraph separators", "event": "t", "props": { "v": "a b c" }, "expect": { "accepted": { "fields": { "v": "a b c" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a tag character (outside the basic plane)", "event": "t", "props": { "v": "a󠁁b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a Hangul filler", "event": "t", "props": { "v": "aㅤb" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "two Hangul fillers make two spaces", "event": "t", "props": { "v": "aᅟᅠb" }, "expect": { "accepted": { "fields": { "v": "a  b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a halfwidth Hangul filler", "event": "t", "props": { "v": "aﾠb" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a braille blank", "event": "t", "props": { "v": "a⠀b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a no-break space", "event": "t", "props": { "v": "a b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "an ideographic space", "event": "t", "props": { "v": "a　b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "an em space and a narrow no-break space", "event": "t", "props": { "v": "a b c" }, "expect": { "accepted": { "fields": { "v": "a b c" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "invisible characters at the start are trimmed away", "event": "t", "props": { "v": "ㅤ x" }, "expect": { "accepted": { "fields": { "v": "x" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text of only invisible characters is invalid", "event": "t", "props": { "v": "ㅤ⠀ " }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["v"] } } },
+    { "name": "the ASCII space is kept", "event": "t", "props": { "v": "a b" }, "expect": { "accepted": { "fields": { "v": "a b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "ordinary non-ASCII text is kept", "event": "t", "props": { "v": "café 日本 ✓" }, "expect": { "accepted": { "fields": { "v": "café 日本 ✓" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a visible braille pattern is kept", "event": "t", "props": { "v": "a⠁b" }, "expect": { "accepted": { "fields": { "v": "a⠁b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a hyphenation point is kept", "event": "t", "props": { "v": "a‧b" }, "expect": { "accepted": { "fields": { "v": "a‧b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "cleaning happens before the cut", "event": "t", "props": { "s": "abㅤcd" }, "expect": { "accepted": { "fields": { "s": "ab c" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "spaces left at the end of the cut are trimmed", "event": "t", "props": { "s": "abㅤㅤcd" }, "expect": { "accepted": { "fields": { "s": "ab" }, "undeclared": 0, "invalid": [] } } }
+  ]
+}
