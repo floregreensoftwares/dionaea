@@ -24,7 +24,7 @@ const RESERVED: &[&str] = &[
 pub(crate) fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&name)
 }
-pub(crate) fn reserved() -> &'static [&'static str] {
+pub fn reserved_event_names() -> &'static [&'static str] {
     RESERVED
 }
 

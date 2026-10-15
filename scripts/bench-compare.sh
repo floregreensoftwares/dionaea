@@ -25,11 +25,24 @@ work=$(mktemp -d)
 base_tree=$work/base
 trap 'git -C "$repo_root" worktree remove --force "$base_tree" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 
-# Each tree builds in its own target directory. Cargo names a path package's
-# artifacts from its path inside the workspace, so two trees sharing one
-# directory would reuse the base's library for the branch and measure the same
-# code twice. Criterion's baselines live in one shared place instead.
+# One target directory for both trees, so the dependencies (the bulk of the
+# build) compile once. Cargo names a path package's artifacts from its path
+# inside the workspace, so the two trees would otherwise reuse the base's
+# library for the branch and measure the same code twice; the workspace crates
+# are therefore cleaned before each tree is built. Criterion's baselines live in
+# one shared place. BENCH_TARGET_DIR lets CI keep the directory in its cache.
+export CARGO_TARGET_DIR=${BENCH_TARGET_DIR:-$work/target}
 export CRITERION_HOME=$work/criterion
+
+# Drops the release-profile artifacts (benchmarks build there) of every
+# workspace crate of a tree; `cargo clean -p` alone only cleans the dev profile.
+# Package names come from each crate's Cargo.toml, not from its folder name.
+clean_workspace_crates() {
+    for manifest in "$1"/crates/*/Cargo.toml; do
+        package=$(sed -n 's/^name = "\(.*\)"$/\1/p' "$manifest" | head -n 1)
+        (cd "$1" && cargo clean --quiet --release -p "$package")
+    done
+}
 
 # `--bench <name>` for every file in a crate's benches folder. Naming the
 # targets keeps the library's own test harness, which rejects Criterion's
@@ -49,11 +62,6 @@ run_benches() {
     # shellcheck disable=SC2086
     (
         cd "$tree"
-        if [ "$tree" = "$base_tree" ]; then
-            export CARGO_TARGET_DIR="$work/target-base"
-        else
-            export CARGO_TARGET_DIR="$work/target-branch"
-        fi
         cargo bench -p "$crate" $targets --locked -- "$@"
     )
 }
@@ -72,12 +80,14 @@ for crate in $crates; do
     if [ ! -d "$base_tree/crates/$crate/benches" ]; then
         echo "== $crate: the base revision has no benchmarks; nothing to compare to"
         # shellcheck disable=SC2046
+        clean_workspace_crates "$repo_root"
         run_benches "$repo_root" "$crate" $(timing)
         continue
     fi
 
     echo "== $crate: base revision ($base)"
     # shellcheck disable=SC2046
+    clean_workspace_crates "$base_tree"
     run_benches "$base_tree" "$crate" --save-baseline base $(timing) >/dev/null
     if [ "$noise_floor" = 1 ]; then
         echo "== $crate: noise floor (the base revision against itself)"
@@ -86,5 +96,18 @@ for crate in $crates; do
     fi
     echo "== $crate: working tree against the base revision"
     # shellcheck disable=SC2046
-    run_benches "$repo_root" "$crate" --baseline-lenient base $(timing)
+    clean_workspace_crates "$repo_root"
+    log=$work/branch-$crate.log
+    if ! run_benches "$repo_root" "$crate" --baseline-lenient base $(timing) >"$log" 2>&1; then
+        cat "$log"
+        exit 1
+    fi
+    cat "$log"
+    # A stale artifact would measure the base twice and look healthy, so when
+    # the crate differs from the base it must have been compiled for this run.
+    if ! git -C "$repo_root" diff --quiet "$base" -- "crates/$crate" &&
+        ! grep -q "Compiling.*$crate" "$log"; then
+        echo "error: crates/$crate differs from $base but was not rebuilt for the branch run" >&2
+        exit 1
+    fi
 done

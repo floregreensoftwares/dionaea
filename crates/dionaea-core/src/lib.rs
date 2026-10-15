@@ -12,6 +12,7 @@ mod parse;
 mod schema;
 mod wire;
 
+pub use builtin::reserved_event_names;
 pub use diff::{Change, ChangeKind, Severity, diff, is_breaking};
 pub use guard::{DropReason, Dropped, FieldValue, Guarded};
 pub use json_schema::schema_file_json_schema;

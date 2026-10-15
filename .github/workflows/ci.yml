@@ -102,8 +102,14 @@ jobs:
           workspaces: ". -> .cargo-target"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/trigger' }}
-      - name: Build the binary
-        run: cargo build -p dionaea --locked
+      # The image downloads while the binary compiles.
+      - name: Build the binary and pull the image
+        shell: bash
+        run: |
+          docker compose pull --quiet &
+          pull=$!
+          cargo build -p dionaea --locked
+          wait "$pull"
       - name: Verify the compose stack
         run: sh scripts/verify-compose.sh
 
@@ -121,12 +127,21 @@ jobs:
           fetch-depth: 0
       - name: Install toolchain
         run: rustup toolchain install
+      # The target directory is the one .cargo/config.toml names, so the cache
+      # holds the dependencies of both revisions (they build once, see the script).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> .cargo-target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/trigger' }}
       - name: Compare with the base revision
         shell: bash
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          BENCH_MEASURE: 5
+          BENCH_WARM_UP: 0.5
+          BENCH_MEASURE: 2
           BENCH_NOISE_FLOOR: 1
+          BENCH_TARGET_DIR: ${{ github.workspace }}/.cargo-target
         run: |
           # Nothing to measure when the pull request touches no Rust code.
           if ! git diff --name-only "$BASE" HEAD | grep -qE '^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|scripts/bench-compare\.sh$)'; then
