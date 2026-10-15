@@ -7,11 +7,16 @@
 //! older server. Nothing here looks at the schema; that is the guard's job.
 
 use std::fmt;
+use std::marker::PhantomData;
 
+use serde::Deserialize;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::guard::{DropReason, is_id};
 use crate::name::Name;
+use crate::schema::MAX_PROPERTIES;
 
 /// Largest request body read, in bytes. Checked before anything is parsed.
 pub const MAX_BODY_LEN: usize = 256 * 1024;
@@ -141,13 +146,370 @@ pub struct Identify {
     pub traits: Map<String, Value>,
 }
 
-fn parse_object(body: &[u8]) -> Result<Map<String, Value>, RequestError> {
+// Reading. The body is read straight into small typed values, never into a
+// generic tree: scalars keep only what the checks need, nested values are
+// consumed without being stored, and arrays and objects stop growing at their
+// limits. A 256 KiB body therefore costs about the same whatever its shape.
+
+/// A JSON value reduced to what the checks look at. Arrays and objects are
+/// read to the end (so the document stays valid) and kept as `Other`.
+enum Scalar {
+    Str(String),
+    Uint(u64),
+    Other,
+}
+
+struct ScalarVisitor;
+
+impl<'de> Visitor<'de> for ScalarVisitor {
+    type Value = Scalar;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<Scalar, E> {
+        Ok(Scalar::Other)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Scalar, E> {
+        Ok(Scalar::Other)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Scalar, E> {
+        Ok(Scalar::Other)
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<Scalar, E> {
+        Ok(Scalar::Uint(value))
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
+        Ok(Scalar::Other)
+    }
+    fn visit_str<E>(self, value: &str) -> Result<Scalar, E> {
+        Ok(Scalar::Str(value.to_owned()))
+    }
+    fn visit_string<E>(self, value: String) -> Result<Scalar, E> {
+        Ok(Scalar::Str(value))
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Scalar, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Scalar::Other)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Scalar, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Scalar::Other)
+    }
+}
+
+impl<'de> Deserialize<'de> for Scalar {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ScalarVisitor)
+    }
+}
+
+/// A property value. Arrays and objects are replaced by an empty array, since
+/// no field kind accepts them.
+struct PropValue(Value);
+
+struct PropValueVisitor;
+
+impl<'de> Visitor<'de> for PropValueVisitor {
+    type Value = PropValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<PropValue, E> {
+        Ok(PropValue(Value::Null))
+    }
+    fn visit_bool<E>(self, value: bool) -> Result<PropValue, E> {
+        Ok(PropValue(Value::Bool(value)))
+    }
+    fn visit_i64<E>(self, value: i64) -> Result<PropValue, E> {
+        Ok(PropValue(Value::from(value)))
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<PropValue, E> {
+        Ok(PropValue(Value::from(value)))
+    }
+    fn visit_f64<E>(self, value: f64) -> Result<PropValue, E> {
+        Ok(PropValue(Value::from(value)))
+    }
+    fn visit_str<E>(self, value: &str) -> Result<PropValue, E> {
+        Ok(PropValue(Value::String(value.to_owned())))
+    }
+    fn visit_string<E>(self, value: String) -> Result<PropValue, E> {
+        Ok(PropValue(Value::String(value)))
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<PropValue, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(PropValue(Value::Array(Vec::new())))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<PropValue, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(PropValue(Value::Array(Vec::new())))
+    }
+}
+
+impl<'de> Deserialize<'de> for PropValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(PropValueVisitor)
+    }
+}
+
+/// The `props` or `traits` object: at most [`MAX_PROPERTIES`] entries are
+/// stored, the rest are consumed without allocating.
+enum Props {
+    Map(Map<String, Value>),
+    TooMany,
+    Other,
+}
+
+struct PropsVisitor;
+
+impl<'de> Visitor<'de> for PropsVisitor {
+    type Value = Props;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<Props, E> {
+        Ok(Props::Other)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Props, E> {
+        Ok(Props::Other)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Props, E> {
+        Ok(Props::Other)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Props, E> {
+        Ok(Props::Other)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Props, E> {
+        Ok(Props::Other)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Props, E> {
+        Ok(Props::Other)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Props, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Props::Other)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Props, A::Error> {
+        let mut stored = Map::new();
+        let mut entries = 0usize;
+        loop {
+            if entries < MAX_PROPERTIES {
+                let Some((key, value)) = map.next_entry::<String, PropValue>()? else {
+                    break;
+                };
+                stored.insert(key, value.0);
+            } else if map.next_entry::<IgnoredAny, IgnoredAny>()?.is_none() {
+                break;
+            }
+            entries += 1;
+        }
+        Ok(if entries > MAX_PROPERTIES {
+            Props::TooMany
+        } else {
+            Props::Map(stored)
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Props {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(PropsVisitor)
+    }
+}
+
+/// An element of `events`: an object read as a [`RawEvent`], or anything else.
+enum Element {
+    Event(RawEvent),
+    NotObject,
+}
+
+struct ElementVisitor;
+
+impl<'de> Visitor<'de> for ElementVisitor {
+    type Value = Element;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<Element, E> {
+        Ok(Element::NotObject)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Element, E> {
+        Ok(Element::NotObject)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Element, E> {
+        Ok(Element::NotObject)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Element, E> {
+        Ok(Element::NotObject)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Element, E> {
+        Ok(Element::NotObject)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Element, E> {
+        Ok(Element::NotObject)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Element, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Element::NotObject)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Element, A::Error> {
+        RawEvent::deserialize(MapAccessDeserializer::new(map)).map(Element::Event)
+    }
+}
+
+impl<'de> Deserialize<'de> for Element {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ElementVisitor)
+    }
+}
+
+/// The `events` field: at most [`MAX_BATCH_EVENTS`] elements are stored, and
+/// the rest are consumed and reported as an overflow.
+enum Events {
+    Array { items: Vec<Element>, overflow: bool },
+    Other,
+}
+
+struct EventsVisitor;
+
+impl<'de> Visitor<'de> for EventsVisitor {
+    type Value = Events;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<Events, E> {
+        Ok(Events::Other)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Events, E> {
+        Ok(Events::Other)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Events, E> {
+        Ok(Events::Other)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Events, E> {
+        Ok(Events::Other)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Events, E> {
+        Ok(Events::Other)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Events, E> {
+        Ok(Events::Other)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Events, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Events::Other)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Events, A::Error> {
+        let mut items = Vec::new();
+        while items.len() < MAX_BATCH_EVENTS {
+            match seq.next_element::<Element>()? {
+                Some(element) => items.push(element),
+                None => {
+                    return Ok(Events::Array {
+                        items,
+                        overflow: false,
+                    });
+                }
+            }
+        }
+        let overflow = seq.next_element::<IgnoredAny>()?.is_some();
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Events::Array { items, overflow })
+    }
+}
+
+impl<'de> Deserialize<'de> for Events {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(EventsVisitor)
+    }
+}
+
+/// A top-level body: an object read as `T`, or anything else.
+enum Top<T> {
+    Object(T),
+    NotObject,
+}
+
+struct TopVisitor<T>(PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> Visitor<'de> for TopVisitor<T> {
+    type Value = Top<T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<Top<T>, E> {
+        Ok(Top::NotObject)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Top<T>, E> {
+        Ok(Top::NotObject)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Top<T>, E> {
+        Ok(Top::NotObject)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Top<T>, E> {
+        Ok(Top::NotObject)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Top<T>, E> {
+        Ok(Top::NotObject)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Top<T>, E> {
+        Ok(Top::NotObject)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Top<T>, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Top::NotObject)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Top<T>, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map)).map(Top::Object)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Top<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(TopVisitor(PhantomData))
+    }
+}
+
+#[derive(Deserialize)]
+struct RawBatch {
+    sent_at: Option<Scalar>,
+    sdk: Option<Scalar>,
+    release: Option<Scalar>,
+    events: Option<Events>,
+}
+
+#[derive(Deserialize)]
+struct RawEvent {
+    event_id: Option<Scalar>,
+    name: Option<Scalar>,
+    ts: Option<Scalar>,
+    anon_id: Option<Scalar>,
+    session_id: Option<Scalar>,
+    screen: Option<Scalar>,
+    props: Option<Props>,
+}
+
+#[derive(Deserialize)]
+struct RawIdentify {
+    sent_at: Option<Scalar>,
+    sdk: Option<Scalar>,
+    anon_id: Option<Scalar>,
+    user_id: Option<Scalar>,
+    traits: Option<Props>,
+}
+
+fn read<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, RequestError> {
     if body.len() > MAX_BODY_LEN {
         return Err(RequestError::BodyTooLarge);
     }
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(object)) => Ok(object),
-        Ok(_) => Err(RequestError::NotAnObject),
+    match serde_json::from_slice::<Top<T>>(body) {
+        Ok(Top::Object(object)) => Ok(object),
+        Ok(Top::NotObject) => Err(RequestError::NotAnObject),
         Err(_) => Err(RequestError::NotJson),
     }
 }
@@ -164,48 +526,55 @@ fn screen(text: &str) -> bool {
     !text.is_empty() && text.len() <= MAX_SCREEN_LEN && text.chars().all(|c| c.is_ascii_graphic())
 }
 
-fn timestamp(value: Option<&Value>) -> Option<u64> {
-    value?.as_u64().filter(|ts| *ts <= MAX_TIMESTAMP)
-}
-
-/// The string under `key`, when it is present and not null.
-fn optional_string<'a>(object: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>, ()> {
-    match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text)),
-        Some(_) => Err(()),
+fn timestamp(value: Option<Scalar>) -> Option<u64> {
+    match value {
+        Some(Scalar::Uint(ts)) if ts <= MAX_TIMESTAMP => Some(ts),
+        _ => None,
     }
 }
 
-fn envelope_label(
-    object: &Map<String, Value>,
-    key: &'static str,
+/// A required string that passes `valid`.
+fn required(
+    value: Option<Scalar>,
+    valid: impl Fn(&str) -> bool,
+    field: &'static str,
+) -> Result<String, RequestError> {
+    match value {
+        Some(Scalar::Str(text)) if valid(&text) => Ok(text),
+        _ => Err(RequestError::InvalidField(field)),
+    }
+}
+
+/// An optional string that passes `valid` when present.
+fn optional(
+    value: Option<Scalar>,
+    valid: impl Fn(&str) -> bool,
+    field: &'static str,
 ) -> Result<Option<String>, RequestError> {
-    match optional_string(object, key) {
-        Ok(Some(text)) if label(text) => Ok(Some(text.to_owned())),
-        Ok(None) => Ok(None),
-        _ => Err(RequestError::InvalidField(key)),
+    match value {
+        None => Ok(None),
+        other => required(other, valid, field).map(Some),
     }
 }
 
 /// Decodes a `/v1/collect` body.
 pub fn decode_batch(body: &[u8]) -> Result<Batch, RequestError> {
-    let mut object = parse_object(body)?;
-    let sent_at = timestamp(object.get("sent_at")).ok_or(RequestError::InvalidField("sent_at"))?;
-    let sdk = envelope_label(&object, "sdk")?.ok_or(RequestError::InvalidField("sdk"))?;
-    let release = envelope_label(&object, "release")?;
-    let events = match object.remove("events") {
-        Some(Value::Array(events)) => events,
+    let raw: RawBatch = read(body)?;
+    let sent_at = timestamp(raw.sent_at).ok_or(RequestError::InvalidField("sent_at"))?;
+    let sdk = required(raw.sdk, label, "sdk")?;
+    let release = optional(raw.release, label, "release")?;
+    let (items, overflow) = match raw.events {
+        Some(Events::Array { items, overflow }) => (items, overflow),
         _ => return Err(RequestError::InvalidField("events")),
     };
-    if events.len() > MAX_BATCH_EVENTS {
+    if overflow {
         return Err(RequestError::TooManyEvents);
     }
 
-    let mut accepted = Vec::with_capacity(events.len());
+    let mut accepted = Vec::with_capacity(items.len());
     let mut rejected = Vec::new();
-    for (index, event) in events.into_iter().enumerate() {
-        match decode_event(event) {
+    for (index, element) in items.into_iter().enumerate() {
+        match decode_event(element) {
             Ok(event) => accepted.push(event),
             Err(reason) => rejected.push(Rejected { index, reason }),
         }
@@ -219,38 +588,27 @@ pub fn decode_batch(body: &[u8]) -> Result<Batch, RequestError> {
     })
 }
 
-fn decode_event(value: Value) -> Result<WireEvent, DropReason> {
-    let Value::Object(mut object) = value else {
+fn decode_event(element: Element) -> Result<WireEvent, DropReason> {
+    let Element::Event(raw) = element else {
         return Err(DropReason::MalformedEvent);
     };
-    let event_id = object
-        .get("event_id")
-        .and_then(Value::as_str)
-        .and_then(EventId::parse)
-        .ok_or(DropReason::InvalidEventId)?;
-    let name = match object.remove("name") {
-        Some(Value::String(name)) if Name::is_valid(&name) => name,
-        _ => return Err(DropReason::InvalidEventName),
-    };
-    let ts = timestamp(object.get("ts")).ok_or(DropReason::InvalidTimestamp)?;
-    let anon_id = match optional_string(&object, "anon_id") {
-        Ok(Some(id)) if is_id(id) => id.to_owned(),
-        _ => return Err(DropReason::InvalidAnonId),
-    };
-    let session_id = match optional_string(&object, "session_id") {
-        Ok(None) => None,
-        Ok(Some(id)) if is_id(id) => Some(id.to_owned()),
-        _ => return Err(DropReason::InvalidSessionId),
-    };
-    let screen = match optional_string(&object, "screen") {
-        Ok(None) => None,
-        Ok(Some(text)) if screen(text) => Some(text.to_owned()),
-        _ => return Err(DropReason::InvalidScreen),
-    };
-    let props = match object.remove("props") {
-        None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(props)) => props,
-        Some(_) => return Err(DropReason::InvalidProperties),
+    let event_id = match raw.event_id {
+        Some(Scalar::Str(text)) => EventId::parse(&text),
+        _ => None,
+    }
+    .ok_or(DropReason::InvalidEventId)?;
+    let name =
+        required(raw.name, Name::is_valid, "name").map_err(|_| DropReason::InvalidEventName)?;
+    let ts = timestamp(raw.ts).ok_or(DropReason::InvalidTimestamp)?;
+    let anon_id = required(raw.anon_id, is_id, "anon_id").map_err(|_| DropReason::InvalidAnonId)?;
+    let session_id =
+        optional(raw.session_id, is_id, "session_id").map_err(|_| DropReason::InvalidSessionId)?;
+    let screen = optional(raw.screen, screen, "screen").map_err(|_| DropReason::InvalidScreen)?;
+    let props = match raw.props {
+        None => Map::new(),
+        Some(Props::Map(props)) => props,
+        Some(Props::TooMany) => return Err(DropReason::TooManyProperties),
+        Some(Props::Other) => return Err(DropReason::InvalidProperties),
     };
     Ok(WireEvent {
         event_id,
@@ -265,18 +623,14 @@ fn decode_event(value: Value) -> Result<WireEvent, DropReason> {
 
 /// Decodes a `/v1/identify` body.
 pub fn decode_identify(body: &[u8]) -> Result<Identify, RequestError> {
-    let mut object = parse_object(body)?;
-    let sent_at = timestamp(object.get("sent_at")).ok_or(RequestError::InvalidField("sent_at"))?;
-    let sdk = envelope_label(&object, "sdk")?.ok_or(RequestError::InvalidField("sdk"))?;
-    let id = |key: &'static str| match optional_string(&object, key) {
-        Ok(Some(id)) if is_id(id) => Ok(id.to_owned()),
-        _ => Err(RequestError::InvalidField(key)),
-    };
-    let anon_id = id("anon_id")?;
-    let user_id = id("user_id")?;
-    let traits = match object.remove("traits") {
-        None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(traits)) => traits,
+    let raw: RawIdentify = read(body)?;
+    let sent_at = timestamp(raw.sent_at).ok_or(RequestError::InvalidField("sent_at"))?;
+    let sdk = required(raw.sdk, label, "sdk")?;
+    let anon_id = required(raw.anon_id, is_id, "anon_id")?;
+    let user_id = required(raw.user_id, is_id, "user_id")?;
+    let traits = match raw.traits {
+        None => Map::new(),
+        Some(Props::Map(traits)) => traits,
         Some(_) => return Err(RequestError::InvalidField("traits")),
     };
     Ok(Identify {
@@ -396,7 +750,16 @@ mod tests {
     #[test]
     fn deeply_nested_bodies_are_refused_without_overflowing() {
         let body = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
-        assert_eq!(decode_batch(body.as_bytes()), Err(RequestError::NotJson));
+        assert!(decode_batch(body.as_bytes()).is_err());
+        // Nesting inside a property value and in an unknown field is read past
+        // without being stored, at any depth the body limit allows.
+        let depth = 60_000;
+        let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let in_props = format!(
+            "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{{\"event_id\":\"{ID}\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":{{\"k\":{nested}}}}}],\"other\":{nested}}}"
+        );
+        let decoded = decode_batch(in_props.as_bytes()).unwrap();
+        assert_eq!(decoded.events.len(), 1);
     }
 
     #[test]
@@ -567,6 +930,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_first_failing_check_names_the_reason() {
+        // Every field bad: the event id is checked first, then the others in
+        // the documented order as each is repaired.
+        let mut bad = json!({
+            "event_id": "x", "name": "Bad", "ts": -1, "anon_id": "a b",
+            "session_id": "s s", "screen": "has space", "props": 1
+        });
+        let order = [
+            ("event_id", json!(ID), DropReason::InvalidEventId),
+            ("name", json!("ok"), DropReason::InvalidEventName),
+            ("ts", json!(1), DropReason::InvalidTimestamp),
+            ("anon_id", json!("a"), DropReason::InvalidAnonId),
+            ("session_id", json!("s"), DropReason::InvalidSessionId),
+            ("screen", json!("/s"), DropReason::InvalidScreen),
+            ("props", json!({}), DropReason::InvalidProperties),
+        ];
+        for (field, fixed, reason) in order {
+            assert_eq!(reason_of(bad.clone()), reason, "before fixing {field}");
+            bad[field] = fixed;
+        }
+        let decoded = decode_batch(&batch(vec![bad])).unwrap();
+        assert_eq!(decoded.events.len(), 1);
+    }
+
+    #[test]
+    fn a_body_of_tiny_properties_is_dropped_without_storing_them() {
+        let mut props = String::from("{");
+        let mut index = 0;
+        while props.len() < MAX_BODY_LEN - 400 {
+            props.push_str(&format!("\"k{index}\":1,"));
+            index += 1;
+        }
+        props.push_str("\"last\":1}");
+        let body = format!(
+            "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{{\"event_id\":\"{ID}\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":{props}}}]}}"
+        );
+        assert!(body.len() <= MAX_BODY_LEN);
+        let decoded = decode_batch(body.as_bytes()).unwrap();
+        assert!(decoded.events.is_empty());
+        assert_eq!(
+            decoded.rejected,
+            vec![Rejected {
+                index: 0,
+                reason: DropReason::TooManyProperties
+            }]
+        );
+    }
     #[test]
     fn optional_event_fields_may_be_absent_or_null() {
         let base = with(

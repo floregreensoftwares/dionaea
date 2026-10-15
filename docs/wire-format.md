@@ -21,8 +21,11 @@ together. After that release a breaking change needs a new version prefix.
   for example `dionaea-rn/0.1.0` and `1.4.2+57`.
 - **Unknown fields are ignored**, at every level, so a newer SDK can add fields
   without breaking an older server. Optional fields may be absent or `null`.
-- **Nothing is trusted.** The body size is checked before anything is parsed;
-  nesting deeper than the JSON reader's limit is refused.
+- **Nothing is trusted.** The body size is checked before anything is parsed,
+  and the body is read without building a general tree: arrays and objects
+  inside `props` are read past and count as invalid values, an event stops
+  being stored after 32 properties, and a batch after 100 events, so a body of
+  tiny elements costs about as much as a normal one.
 
 ## Limits
 
@@ -98,8 +101,9 @@ order and the first failure names the reason:
 | 6 | `invalid_session_id` | present but not id-shaped |
 | 7 | `invalid_screen` | present but not a valid screen |
 | 8 | `invalid_properties` | present but not an object |
+| 9 | `too_many_properties` | more than 32 entries (counted as written, duplicates included) |
 
-The schema guard then adds `unknown_event`, `too_many_properties`,
+The schema guard then adds `unknown_event`, `too_many_properties` (for traits),
 `missing_required_field` and `invalid_required_field`.
 
 ## `POST /v1/identify`

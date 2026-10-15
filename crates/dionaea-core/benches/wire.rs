@@ -63,6 +63,31 @@ fn wire(c: &mut Criterion) {
     group.bench_function("reject: 10000 levels of nesting", |b| {
         b.iter(|| decode_batch(black_box(nested.as_bytes())));
     });
+
+    // The shapes that fit the body limit and cost the most to read.
+    let mut tiny_props = String::from("{");
+    let mut index = 0;
+    while tiny_props.len() < 256 * 1024 - 400 {
+        tiny_props.push_str(&format!("\"k{index}\":1,"));
+        index += 1;
+    }
+    tiny_props.push_str("\"last\":1}");
+    let one_event_many_props = format!(
+        "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{{\"event_id\":\"0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e\",\"name\":\"e\",\"ts\":1,\"anon_id\":\"a\",\"props\":{tiny_props}}}]}}"
+    );
+    group.throughput(Throughput::Bytes(one_event_many_props.len() as u64));
+    group.bench_function("worst case: one event, 256 KiB of tiny properties", |b| {
+        b.iter(|| decode_batch(black_box(one_event_many_props.as_bytes())));
+    });
+
+    let many_scalars = format!(
+        "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{}1]}}",
+        "1,".repeat(120_000)
+    );
+    group.throughput(Throughput::Bytes(many_scalars.len() as u64));
+    group.bench_function("worst case: 120000 tiny array elements, refused", |b| {
+        b.iter(|| decode_batch(black_box(many_scalars.as_bytes())));
+    });
     group.finish();
 
     let identify = serde_json::to_vec(&json!({
