@@ -227,6 +227,60 @@ mod tests {
     }
 
     #[test]
+    fn the_json_schema_and_the_parser_agree_on_every_combination() {
+        let validator = validator();
+        let kinds = ["id", "text", "unit", "enum", "count", "duration", "float"];
+        let maxes = [
+            None,
+            Some("0"),
+            Some("1"),
+            Some("4096"),
+            Some("4097"),
+            Some("9007199254740991"),
+            Some("9007199254740992"),
+        ];
+        let values = [
+            None,
+            Some("[]"),
+            Some("[\"a\"]"),
+            Some("[\"a\", \"a\"]"),
+            Some("[\"A\"]"),
+        ];
+        let requireds = [None, Some("true"), Some("false")];
+        let mut checked = 0;
+        let mut accepted = 0;
+        for kind in kinds {
+            for max in maxes {
+                for values in values {
+                    for required in requireds {
+                        for header in ["[events.e.fields.f]", "[traits.f]"] {
+                            let mut source = format!("{header}\nkind = \"{kind}\"\n");
+                            if let Some(max) = max {
+                                source.push_str(&format!("max = {max}\n"));
+                            }
+                            if let Some(values) = values {
+                                source.push_str(&format!("values = {values}\n"));
+                            }
+                            if let Some(required) = required {
+                                source.push_str(&format!("required = {required}\n"));
+                            }
+                            let parser = parse_schema(&source).is_ok();
+                            let json_schema = schema_accepts(&validator, &source);
+                            assert_eq!(
+                                parser, json_schema,
+                                "the parser says {parser} and the JSON Schema says {json_schema} for:\n{source}"
+                            );
+                            checked += 1;
+                            accepted += usize::from(parser);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 7 * 7 * 5 * 3 * 2);
+        assert!(accepted > 20, "{accepted} accepted of {checked}");
+    }
+    #[test]
     fn the_example_schema_is_accepted() {
         let source = include_str!("../../../examples/schema.toml");
         assert!(schema_accepts(&validator(), source));
