@@ -19,6 +19,8 @@ together. After that release a breaking change needs a new version prefix.
   opaque id.
 - **Labels** (`sdk`, `release`) match `[A-Za-z0-9_.+/-]`, 1 to 64 characters,
   for example `dionaea-rn/0.1.0` and `1.4.2+57`.
+- **A repeated key** inside the envelope or an event refuses the request (the
+  reader treats it as invalid JSON); SDKs never write one.
 - **Unknown fields are ignored**, at every level, so a newer SDK can add fields
   without breaking an older server. Optional fields may be absent or `null`.
 - **Nothing is trusted.** The body size is checked before anything is parsed,

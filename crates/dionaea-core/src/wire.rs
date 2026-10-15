@@ -149,10 +149,59 @@ pub struct Identify {
 // Reading. The body is read straight into small typed values, never into a
 // generic tree: scalars keep only what the checks need, nested values are
 // consumed without being stored, and arrays and objects stop growing at their
-// limits. A 256 KiB body therefore costs about the same whatever its shape.
+// limits. A 256 KiB body therefore costs about as much whatever its shape.
+//
+// Every visitor below answers "any JSON value". The `skip!` macro writes the
+// methods that map a shape to one fixed answer (arrays and objects are read
+// to the end first, so the document stays valid); each visitor spells out
+// only the shapes it actually uses.
 
-/// A JSON value reduced to what the checks look at. Arrays and objects are
-/// read to the end (so the document stays valid) and kept as `Other`.
+macro_rules! skip {
+    ($value:expr; $($shape:ident)*) => { $( skip!(@one $value, $shape); )* };
+    (@one $value:expr, unit) => {
+        fn visit_unit<E>(self) -> Result<Self::Value, E> { Ok($value) }
+    };
+    (@one $value:expr, bool) => {
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> { Ok($value) }
+    };
+    (@one $value:expr, i64) => {
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> { Ok($value) }
+    };
+    (@one $value:expr, u64) => {
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> { Ok($value) }
+    };
+    (@one $value:expr, f64) => {
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> { Ok($value) }
+    };
+    (@one $value:expr, str) => {
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> { Ok($value) }
+    };
+    (@one $value:expr, seq) => {
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok($value)
+        }
+    };
+    (@one $value:expr, map) => {
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok($value)
+        }
+    };
+}
+
+/// Makes a type deserialize through its visitor, as "any JSON value".
+macro_rules! from_any {
+    ($ty:ident, $visitor:expr) => {
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserializer.deserialize_any($visitor)
+            }
+        }
+    };
+}
+
+/// A JSON value reduced to what the checks look at.
 enum Scalar {
     Str(String),
     Uint(u64),
@@ -167,20 +216,9 @@ impl<'de> Visitor<'de> for ScalarVisitor {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any JSON value")
     }
-    fn visit_unit<E>(self) -> Result<Scalar, E> {
-        Ok(Scalar::Other)
-    }
-    fn visit_bool<E>(self, _: bool) -> Result<Scalar, E> {
-        Ok(Scalar::Other)
-    }
-    fn visit_i64<E>(self, _: i64) -> Result<Scalar, E> {
-        Ok(Scalar::Other)
-    }
+    skip!(Scalar::Other; unit bool i64 f64 seq map);
     fn visit_u64<E>(self, value: u64) -> Result<Scalar, E> {
         Ok(Scalar::Uint(value))
-    }
-    fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
-        Ok(Scalar::Other)
     }
     fn visit_str<E>(self, value: &str) -> Result<Scalar, E> {
         Ok(Scalar::Str(value.to_owned()))
@@ -188,21 +226,9 @@ impl<'de> Visitor<'de> for ScalarVisitor {
     fn visit_string<E>(self, value: String) -> Result<Scalar, E> {
         Ok(Scalar::Str(value))
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Scalar, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Scalar::Other)
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Scalar, A::Error> {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(Scalar::Other)
-    }
 }
 
-impl<'de> Deserialize<'de> for Scalar {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ScalarVisitor)
-    }
-}
+from_any!(Scalar, ScalarVisitor);
 
 /// A property value. Arrays and objects are replaced by an empty array, since
 /// no field kind accepts them.
@@ -216,9 +242,8 @@ impl<'de> Visitor<'de> for PropValueVisitor {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any JSON value")
     }
-    fn visit_unit<E>(self) -> Result<PropValue, E> {
-        Ok(PropValue(Value::Null))
-    }
+    skip!(PropValue(Value::Null); unit);
+    skip!(PropValue(Value::Array(Vec::new())); seq map);
     fn visit_bool<E>(self, value: bool) -> Result<PropValue, E> {
         Ok(PropValue(Value::Bool(value)))
     }
@@ -237,21 +262,9 @@ impl<'de> Visitor<'de> for PropValueVisitor {
     fn visit_string<E>(self, value: String) -> Result<PropValue, E> {
         Ok(PropValue(Value::String(value)))
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<PropValue, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(PropValue(Value::Array(Vec::new())))
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<PropValue, A::Error> {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(PropValue(Value::Array(Vec::new())))
-    }
 }
 
-impl<'de> Deserialize<'de> for PropValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(PropValueVisitor)
-    }
-}
+from_any!(PropValue, PropValueVisitor);
 
 /// The `props` or `traits` object: at most [`MAX_PROPERTIES`] entries are
 /// stored, the rest are consumed without allocating.
@@ -269,28 +282,7 @@ impl<'de> Visitor<'de> for PropsVisitor {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any JSON value")
     }
-    fn visit_unit<E>(self) -> Result<Props, E> {
-        Ok(Props::Other)
-    }
-    fn visit_bool<E>(self, _: bool) -> Result<Props, E> {
-        Ok(Props::Other)
-    }
-    fn visit_i64<E>(self, _: i64) -> Result<Props, E> {
-        Ok(Props::Other)
-    }
-    fn visit_u64<E>(self, _: u64) -> Result<Props, E> {
-        Ok(Props::Other)
-    }
-    fn visit_f64<E>(self, _: f64) -> Result<Props, E> {
-        Ok(Props::Other)
-    }
-    fn visit_str<E>(self, _: &str) -> Result<Props, E> {
-        Ok(Props::Other)
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Props, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Props::Other)
-    }
+    skip!(Props::Other; unit bool i64 u64 f64 str seq);
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Props, A::Error> {
         let mut stored = Map::new();
         let mut entries = 0usize;
@@ -313,11 +305,7 @@ impl<'de> Visitor<'de> for PropsVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for Props {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(PropsVisitor)
-    }
-}
+from_any!(Props, PropsVisitor);
 
 /// An element of `events`: an object read as a [`RawEvent`], or anything else.
 enum Element {
@@ -333,38 +321,13 @@ impl<'de> Visitor<'de> for ElementVisitor {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any JSON value")
     }
-    fn visit_unit<E>(self) -> Result<Element, E> {
-        Ok(Element::NotObject)
-    }
-    fn visit_bool<E>(self, _: bool) -> Result<Element, E> {
-        Ok(Element::NotObject)
-    }
-    fn visit_i64<E>(self, _: i64) -> Result<Element, E> {
-        Ok(Element::NotObject)
-    }
-    fn visit_u64<E>(self, _: u64) -> Result<Element, E> {
-        Ok(Element::NotObject)
-    }
-    fn visit_f64<E>(self, _: f64) -> Result<Element, E> {
-        Ok(Element::NotObject)
-    }
-    fn visit_str<E>(self, _: &str) -> Result<Element, E> {
-        Ok(Element::NotObject)
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Element, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Element::NotObject)
-    }
+    skip!(Element::NotObject; unit bool i64 u64 f64 str seq);
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Element, A::Error> {
         RawEvent::deserialize(MapAccessDeserializer::new(map)).map(Element::Event)
     }
 }
 
-impl<'de> Deserialize<'de> for Element {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ElementVisitor)
-    }
-}
+from_any!(Element, ElementVisitor);
 
 /// The `events` field: at most [`MAX_BATCH_EVENTS`] elements are stored, and
 /// the rest are consumed and reported as an overflow.
@@ -381,28 +344,7 @@ impl<'de> Visitor<'de> for EventsVisitor {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any JSON value")
     }
-    fn visit_unit<E>(self) -> Result<Events, E> {
-        Ok(Events::Other)
-    }
-    fn visit_bool<E>(self, _: bool) -> Result<Events, E> {
-        Ok(Events::Other)
-    }
-    fn visit_i64<E>(self, _: i64) -> Result<Events, E> {
-        Ok(Events::Other)
-    }
-    fn visit_u64<E>(self, _: u64) -> Result<Events, E> {
-        Ok(Events::Other)
-    }
-    fn visit_f64<E>(self, _: f64) -> Result<Events, E> {
-        Ok(Events::Other)
-    }
-    fn visit_str<E>(self, _: &str) -> Result<Events, E> {
-        Ok(Events::Other)
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Events, A::Error> {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(Events::Other)
-    }
+    skip!(Events::Other; unit bool i64 u64 f64 str map);
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Events, A::Error> {
         let mut items = Vec::new();
         while items.len() < MAX_BATCH_EVENTS {
@@ -422,11 +364,7 @@ impl<'de> Visitor<'de> for EventsVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for Events {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(EventsVisitor)
-    }
-}
+from_any!(Events, EventsVisitor);
 
 /// A top-level body: an object read as `T`, or anything else.
 enum Top<T> {
@@ -442,28 +380,7 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for TopVisitor<T> {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any JSON value")
     }
-    fn visit_unit<E>(self) -> Result<Top<T>, E> {
-        Ok(Top::NotObject)
-    }
-    fn visit_bool<E>(self, _: bool) -> Result<Top<T>, E> {
-        Ok(Top::NotObject)
-    }
-    fn visit_i64<E>(self, _: i64) -> Result<Top<T>, E> {
-        Ok(Top::NotObject)
-    }
-    fn visit_u64<E>(self, _: u64) -> Result<Top<T>, E> {
-        Ok(Top::NotObject)
-    }
-    fn visit_f64<E>(self, _: f64) -> Result<Top<T>, E> {
-        Ok(Top::NotObject)
-    }
-    fn visit_str<E>(self, _: &str) -> Result<Top<T>, E> {
-        Ok(Top::NotObject)
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Top<T>, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Top::NotObject)
-    }
+    skip!(Top::NotObject; unit bool i64 u64 f64 str seq);
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Top<T>, A::Error> {
         T::deserialize(MapAccessDeserializer::new(map)).map(Top::Object)
     }
@@ -976,6 +893,27 @@ mod tests {
                 index: 0,
                 reason: DropReason::TooManyProperties
             }]
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_refuses_the_whole_request() {
+        let body = format!(
+            "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{{\"event_id\":\"{ID}\",\"name\":\"a\",\"name\":\"b\",\"ts\":1,\"anon_id\":\"a\"}}]}}"
+        );
+        assert_eq!(decode_batch(body.as_bytes()), Err(RequestError::NotJson));
+    }
+
+    #[test]
+    fn many_tiny_elements_are_refused_as_too_many_events() {
+        let body = format!(
+            "{{\"sent_at\":1,\"sdk\":\"s\",\"events\":[{}1]}}",
+            "1,".repeat(100_000)
+        );
+        assert!(body.len() <= MAX_BODY_LEN);
+        assert_eq!(
+            decode_batch(body.as_bytes()),
+            Err(RequestError::TooManyEvents)
         );
     }
     #[test]
