@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6.7", features = ["derive"] }
+dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util"] }
 toml = "1.1.8"

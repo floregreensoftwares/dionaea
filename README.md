@@ -6,6 +6,21 @@ Dionaea is an open-source product analytics engine written in Rust. Like the fly
 
 Early development. There is no usable release yet, and no crate is published.
 
+## Schema files
+
+A site declares its events and identity traits in a TOML file (see
+[`examples/schema.toml`](examples/schema.toml)). Two commands work on local
+files:
+
+```sh
+dionaea schema check examples/schema.toml          # problems print as file:line:column
+dionaea schema diff old.toml new.toml              # exits 1 when a change is breaking
+```
+
+`check` exits 0 for a valid file, 1 for an invalid one and 2 when the file
+cannot be read. `diff` lists each change as allowed, deprecated or breaking and
+exits 1 only for breaking ones.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
