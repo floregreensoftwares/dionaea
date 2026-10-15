@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+    branches: [trigger, snap]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request makes the older run useless.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+
+jobs:
+  # The same check the commit-msg and pre-push hooks run, for commits made
+  # without the hooks installed.
+  messages:
+    name: commit messages
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commit messages
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for sha in $(git rev-list "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$sha" | sh .githooks/check-message; then
+              echo "offending commit: $sha"
+              status=1
+            fi
+          done
+          exit $status
+
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - name: Install toolchain
+        run: rustup toolchain install
+
+      # The target folder is set to .cargo-target by .cargo/config.toml.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> .cargo-target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/trigger' }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Clippy type-checks every target, so a separate `cargo check` would
+      # only compile the same code again.
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  # One check to require in branch protection.
+  ci:
+    name: ci
+    if: always()
+    needs: [messages, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the results
+        run: |
+          echo '${{ toJSON(needs) }}'
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            exit 1
+          fi
