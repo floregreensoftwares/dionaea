@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::builtin;
-use crate::name::Name;
+use crate::name::{EnumValue, Name};
 
 /// Most fields one event (or the identity traits) may declare, and the most
 /// properties one incoming event may carry.
@@ -59,7 +59,7 @@ pub enum FieldKind {
     /// Finite number clamped to 0..1 and rounded to three decimals.
     Unit,
     /// One of the declared values.
-    Enum { values: BTreeSet<Name> },
+    Enum { values: BTreeSet<EnumValue> },
     /// Non-negative integer no greater than `max`.
     Count { max: u64 },
     /// Milliseconds, a non-negative integer no greater than `max`.
@@ -75,9 +75,9 @@ impl FieldKind {
         }
     }
 
-    pub fn enumeration<I: IntoIterator<Item = Name>>(values: I) -> Result<Self, SchemaError> {
-        let values: Vec<Name> = values.into_iter().collect();
-        let distinct: BTreeSet<Name> = values.iter().cloned().collect();
+    pub fn enumeration<I: IntoIterator<Item = EnumValue>>(values: I) -> Result<Self, SchemaError> {
+        let values: Vec<EnumValue> = values.into_iter().collect();
+        let distinct: BTreeSet<EnumValue> = values.iter().cloned().collect();
         if distinct.is_empty() || distinct.len() != values.len() || distinct.len() > MAX_ENUM_VALUES
         {
             return Err(SchemaError::EnumValuesInvalid);
@@ -188,6 +188,10 @@ impl Schema {
 mod tests {
     use super::*;
 
+    fn value(text: &str) -> EnumValue {
+        EnumValue::new(text).unwrap()
+    }
+
     fn name(value: &str) -> Name {
         Name::new(value).unwrap()
     }
@@ -216,16 +220,16 @@ mod tests {
 
     #[test]
     fn enum_needs_distinct_values_within_bounds() {
-        assert!(FieldKind::enumeration([name("a"), name("b")]).is_ok());
+        assert!(FieldKind::enumeration([value("a"), value("b")]).is_ok());
         assert_eq!(
             FieldKind::enumeration([]),
             Err(SchemaError::EnumValuesInvalid)
         );
         assert_eq!(
-            FieldKind::enumeration([name("a"), name("a")]),
+            FieldKind::enumeration([value("a"), value("a")]),
             Err(SchemaError::EnumValuesInvalid)
         );
-        let many = (0..=MAX_ENUM_VALUES).map(|i| name(&format!("v{i}")));
+        let many = (0..=MAX_ENUM_VALUES).map(|i| value(&format!("v{i}")));
         assert_eq!(
             FieldKind::enumeration(many),
             Err(SchemaError::EnumValuesInvalid)

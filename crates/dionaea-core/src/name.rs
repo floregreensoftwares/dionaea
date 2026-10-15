@@ -84,3 +84,61 @@ mod tests {
         assert!(Name::new(&"a".repeat(MAX_NAME_LEN)).is_ok());
     }
 }
+
+/// A declared `enum` value: lowercase, `[a-z0-9][a-z0-9_.-]*`, at most
+/// [`MAX_NAME_LEN`] long. Wider than [`Name`] so values like `us-east`, `3d`
+/// or `v1.2` can be declared.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumValue(Arc<str>);
+
+impl EnumValue {
+    pub fn new(value: &str) -> Result<Self, InvalidName> {
+        if Self::is_valid(value) {
+            Ok(Self(value.into()))
+        } else {
+            Err(InvalidName)
+        }
+    }
+
+    pub fn is_valid(value: &str) -> bool {
+        let mut chars = value.chars();
+        let first_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+        let rest_ok = chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'));
+        first_ok && rest_ok && value.len() <= MAX_NAME_LEN
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for EnumValue {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod enum_value_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_hyphens_dots_and_leading_digits() {
+        for value in ["a", "us-east", "3d", "v1.2", "a_b", "0"] {
+            assert!(EnumValue::new(value).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_uppercase_symbols_whitespace_and_leading_separators() {
+        let too_long = "a".repeat(MAX_NAME_LEN + 1);
+        for value in [
+            "", "A", "en-US", "-a", ".a", "_a", "a b", "a/b", "é", &too_long,
+        ] {
+            assert!(EnumValue::new(value).is_err(), "{value:?}");
+        }
+    }
+}

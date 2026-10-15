@@ -55,8 +55,9 @@ pub struct Guarded {
     pub fields: BTreeMap<Name, FieldValue>,
     /// Properties the schema does not declare, removed.
     pub undeclared: usize,
-    /// Declared optional properties whose value broke the rules, removed.
-    pub invalid: usize,
+    /// Declared optional properties whose value broke the rules, removed. Only
+    /// declared names are listed, never undeclared names or any value.
+    pub invalid: Vec<Name>,
 }
 
 impl Schema {
@@ -91,7 +92,7 @@ fn guard_fields(
     }
     let mut fields = BTreeMap::new();
     let mut present = 0;
-    let mut invalid = 0;
+    let mut invalid = Vec::new();
     for (name, def) in declared {
         let required = def.required && enforce_required;
         let Some(value) = properties.get(name.as_str()) else {
@@ -106,7 +107,7 @@ fn guard_fields(
                 fields.insert(name.clone(), value);
             }
             None if required => return Err(DropReason::InvalidRequiredField),
-            None => invalid += 1,
+            None => invalid.push(name.clone()),
         }
     }
     Ok(Guarded {
@@ -114,6 +115,38 @@ fn guard_fields(
         undeclared: properties.len() - present,
         invalid,
     })
+}
+
+/// Characters `text` replaces with a space: Unicode controls (Cc), the format
+/// characters (Cf) that can reorder or hide text, and the line and paragraph
+/// separators. The standard library has no category lookup, so the Cf set is
+/// listed by hand from the Unicode character database.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            u32::from(c),
+            0x00AD
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x0890..=0x0891
+                | 0x08E2
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x2028..=0x202E
+                | 0x2060..=0x2064
+                | 0x2066..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0001
+                | 0xE0020..=0xE007F
+        )
 }
 
 fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
@@ -131,7 +164,7 @@ fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
             let capped: String = value
                 .as_str()?
                 .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
+                .map(|c| if is_unsafe_char(c) { ' ' } else { c })
                 .skip_while(|c| c.is_whitespace())
                 .take(*max)
                 .collect();
@@ -147,9 +180,8 @@ fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
         }
         FieldKind::Enum { values } => {
             let text = value.as_str()?;
-            let name = Name::new(text).ok()?;
             values
-                .contains(&name)
+                .contains(text)
                 .then(|| FieldValue::Text(text.to_owned()))
         }
         FieldKind::Count { max } | FieldKind::Duration { max } => {
@@ -163,7 +195,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::name::EnumValue;
     use crate::schema::EventDef;
+
+    fn value(text: &str) -> EnumValue {
+        EnumValue::new(text).unwrap()
+    }
 
     fn name(value: &str) -> Name {
         Name::new(value).unwrap()
@@ -227,6 +264,32 @@ mod tests {
     }
 
     #[test]
+    fn text_replaces_format_characters_and_line_separators() {
+        let kind = FieldKind::text(50).unwrap();
+        let cases = [
+            ("a\u{202E}b", "a b"),
+            ("a\u{200B}b", "a b"),
+            ("a\u{2066}b\u{2069}c", "a b c"),
+            ("a\u{FEFF}b", "a b"),
+            ("a\u{2028}b\u{2029}c", "a b c"),
+            ("a\u{E0041}b", "a b"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                guard_one(kind.clone(), json!(input)),
+                text(expected),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_keeps_ordinary_non_ascii_characters() {
+        let kind = FieldKind::text(50).unwrap();
+        assert_eq!(guard_one(kind, json!("café 日本 ✓")), text("café 日本 ✓"));
+    }
+
+    #[test]
     fn text_is_cut_at_the_declared_maximum() {
         let kind = FieldKind::text(3).unwrap();
         assert_eq!(guard_one(kind.clone(), json!("abcdef")), text("abc"));
@@ -274,8 +337,17 @@ mod tests {
     }
 
     #[test]
+    fn enum_values_may_use_hyphens_dots_and_leading_digits() {
+        let kind = FieldKind::enumeration([value("us-east"), value("3d"), value("v1.2")]).unwrap();
+        for declared in ["us-east", "3d", "v1.2"] {
+            assert_eq!(guard_one(kind.clone(), json!(declared)), text(declared));
+        }
+        assert_eq!(guard_one(kind, json!("US-EAST")), None);
+    }
+
+    #[test]
     fn enum_accepts_only_declared_values() {
-        let kind = FieldKind::enumeration([name("a"), name("b")]).unwrap();
+        let kind = FieldKind::enumeration([value("a"), value("b")]).unwrap();
         assert_eq!(guard_one(kind.clone(), json!("a")), text("a"));
         assert_eq!(guard_one(kind.clone(), json!("c")), None);
         assert_eq!(guard_one(kind.clone(), json!("A")), None);
@@ -326,7 +398,7 @@ mod tests {
             .unwrap();
         assert_eq!(guarded.fields.len(), 1);
         assert_eq!(guarded.undeclared, 2);
-        assert_eq!(guarded.invalid, 0);
+        assert!(guarded.invalid.is_empty());
     }
 
     #[test]
@@ -336,7 +408,7 @@ mod tests {
             .guard_event("probe", &props(json!({ "f": "not ok" })))
             .unwrap();
         assert!(guarded.fields.is_empty());
-        assert_eq!(guarded.invalid, 1);
+        assert_eq!(guarded.invalid, vec![name("f")]);
         assert_eq!(guarded.undeclared, 0);
     }
 
@@ -345,7 +417,7 @@ mod tests {
         let schema = probe(FieldKind::Id, false);
         let guarded = schema.guard_event("probe", &props(json!({}))).unwrap();
         assert!(guarded.fields.is_empty());
-        assert_eq!((guarded.invalid, guarded.undeclared), (0, 0));
+        assert_eq!((guarded.invalid.len(), guarded.undeclared), (0, 0));
     }
 
     #[test]
@@ -462,7 +534,7 @@ mod tests {
         let traits = BTreeMap::from([
             (
                 name("plan"),
-                FieldDef::optional(FieldKind::enumeration([name("free"), name("pro")]).unwrap()),
+                FieldDef::optional(FieldKind::enumeration([value("free"), value("pro")]).unwrap()),
             ),
             (
                 name("seats"),
@@ -474,7 +546,10 @@ mod tests {
             .guard_traits(&props(json!({ "seats": 500, "email": "a@b.c" })))
             .unwrap();
         assert!(guarded.fields.is_empty());
-        assert_eq!((guarded.invalid, guarded.undeclared), (1, 1));
+        assert_eq!(
+            (guarded.invalid, guarded.undeclared),
+            (vec![name("seats")], 1)
+        );
         let guarded = schema
             .guard_traits(&props(json!({ "plan": "pro" })))
             .unwrap();

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use crate::name::Name;
+use crate::name::{EnumValue, Name};
 use crate::schema::{EventDef, FieldDef, FieldKind};
 
 /// Names a site can never declare: the built-in events and the app health
@@ -39,7 +39,7 @@ static BUILTIN: LazyLock<BTreeMap<&'static str, EventDef>> = LazyLock::new(|| {
         EventDef::new(fields).expect("built-in events declare few fields")
     };
     let lifecycle =
-        FieldKind::enumeration(["launch", "foreground", "background", "terminate"].map(n))
+        FieldKind::enumeration(["launch", "foreground", "background", "terminate"].map(v))
             .expect("built-in enum is valid");
 
     BTreeMap::from([
@@ -55,6 +55,10 @@ static BUILTIN: LazyLock<BTreeMap<&'static str, EventDef>> = LazyLock::new(|| {
         ),
     ])
 });
+
+fn v(value: &str) -> EnumValue {
+    EnumValue::new(value).expect("built-in enum values are valid")
+}
 
 fn n(value: &str) -> Name {
     Name::new(value).expect("built-in names are valid")
