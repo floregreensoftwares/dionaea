@@ -60,6 +60,24 @@ impl DropReason {
     }
 }
 
+/// An event the guard did not accept: why, and for a required field that
+/// failed, which declared field it was. The field is a declared name, never
+/// a value or an undeclared name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dropped {
+    pub reason: DropReason,
+    pub field: Option<Name>,
+}
+
+impl From<DropReason> for Dropped {
+    fn from(reason: DropReason) -> Self {
+        Self {
+            reason,
+            field: None,
+        }
+    }
+}
+
 /// A value that passed its field's rules.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
@@ -90,16 +108,16 @@ impl Schema {
         &self,
         name: &str,
         properties: &Map<String, Value>,
-    ) -> Result<Guarded, DropReason> {
+    ) -> Result<Guarded, Dropped> {
         if !Name::is_valid(name) {
-            return Err(DropReason::InvalidEventName);
+            return Err(DropReason::InvalidEventName.into());
         }
         let def = self.event(name).ok_or(DropReason::UnknownEvent)?;
         guard_fields(def.fields(), properties, true)
     }
 
     /// Validates identity traits. Every trait is optional.
-    pub fn guard_traits(&self, traits: &Map<String, Value>) -> Result<Guarded, DropReason> {
+    pub fn guard_traits(&self, traits: &Map<String, Value>) -> Result<Guarded, Dropped> {
         guard_fields(self.traits(), traits, false)
     }
 }
@@ -108,18 +126,22 @@ fn guard_fields(
     declared: &BTreeMap<Name, FieldDef>,
     properties: &Map<String, Value>,
     enforce_required: bool,
-) -> Result<Guarded, DropReason> {
+) -> Result<Guarded, Dropped> {
     if properties.len() > MAX_PROPERTIES {
-        return Err(DropReason::TooManyProperties);
+        return Err(DropReason::TooManyProperties.into());
     }
     // A missing required field is reported before an invalid one, so the
-    // reason does not depend on how the fields happen to be named.
+    // reason does not depend on how the fields happen to be named. Of several
+    // missing fields, the first by name is reported.
     if enforce_required
-        && declared
+        && let Some((name, _)) = declared
             .iter()
-            .any(|(name, def)| def.required && !properties.contains_key(name.as_str()))
+            .find(|(name, def)| def.required && !properties.contains_key(name.as_str()))
     {
-        return Err(DropReason::MissingRequiredField);
+        return Err(Dropped {
+            reason: DropReason::MissingRequiredField,
+            field: Some(name.clone()),
+        });
     }
     let mut fields = BTreeMap::new();
     let mut present = 0;
@@ -134,7 +156,12 @@ fn guard_fields(
             Some(value) => {
                 fields.insert(name.clone(), value);
             }
-            None if required => return Err(DropReason::InvalidRequiredField),
+            None if required => {
+                return Err(Dropped {
+                    reason: DropReason::InvalidRequiredField,
+                    field: Some(name.clone()),
+                });
+            }
             None => invalid.push(name.clone()),
         }
     }
@@ -146,26 +173,37 @@ fn guard_fields(
 }
 
 /// Characters `text` replaces with a space: Unicode controls (Cc), the format
-/// characters (Cf) that can reorder or hide text, and the line and paragraph
-/// separators. The standard library has no category lookup, so the Cf set is
-/// listed by hand from the Unicode character database.
+/// characters (Cf) that can reorder or hide text, the line and paragraph
+/// separators, every Unicode space except the ASCII one (Zs), and the blank
+/// fillers that render as nothing (U+115F, U+1160, U+2800, U+3164, U+FFA0).
+/// The standard library has no category lookup, so the sets are listed by
+/// hand from the Unicode character database.
 fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             u32::from(c),
-            0x00AD
+            0x00A0
+                | 0x00AD
                 | 0x0600..=0x0605
                 | 0x061C
+                | 0x115F..=0x1160
+                | 0x1680
                 | 0x06DD
                 | 0x070F
                 | 0x0890..=0x0891
                 | 0x08E2
                 | 0x180E
-                | 0x200B..=0x200F
+                | 0x2000..=0x200F
                 | 0x2028..=0x202E
                 | 0x2060..=0x2064
                 | 0x2066..=0x206F
+                | 0x202F
+                | 0x205F
+                | 0x2800
+                | 0x3000
+                | 0x3164
                 | 0xFEFF
+                | 0xFFA0
                 | 0xFFF9..=0xFFFB
                 | 0x110BD
                 | 0x110CD
@@ -232,6 +270,13 @@ mod tests {
 
     fn value(text: &str) -> EnumValue {
         EnumValue::new(text).unwrap()
+    }
+
+    fn dropped(reason: DropReason, field: &str) -> Dropped {
+        Dropped {
+            reason,
+            field: Some(name(field)),
+        }
     }
 
     fn name(value: &str) -> Name {
@@ -321,6 +366,76 @@ mod tests {
         assert_eq!(guard_one(kind, json!("café 日本 ✓")), text("café 日本 ✓"));
     }
 
+    #[test]
+    fn text_replaces_blank_fillers_and_unicode_spaces() {
+        let kind = FieldKind::text(50).unwrap();
+        let cases = [
+            ("a\u{3164}b", "a b"),
+            ("a\u{115F}\u{1160}b", "a  b"),
+            ("a\u{FFA0}b", "a b"),
+            ("a\u{2800}b", "a b"),
+            ("a\u{00A0}b", "a b"),
+            ("a\u{3000}b", "a b"),
+            ("a\u{2003}b\u{202F}c", "a b c"),
+            ("\u{3164}\u{00A0}x", "x"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                guard_one(kind.clone(), json!(input)),
+                text(expected),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_made_only_of_invisible_characters_is_invalid() {
+        let kind = FieldKind::text(50).unwrap();
+        for input in [
+            "\u{3164}",
+            "\u{2800}\u{00A0}",
+            "\u{FFA0}\u{115F}",
+            " \u{3000} ",
+        ] {
+            assert_eq!(guard_one(kind.clone(), json!(input)), None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_event_names_the_declared_field_that_failed() {
+        let def = EventDef::new(BTreeMap::from([
+            (name("a"), FieldDef::required(FieldKind::Id)),
+            (name("b"), FieldDef::required(FieldKind::Id)),
+            (name("c"), FieldDef::optional(FieldKind::Id)),
+        ]))
+        .unwrap();
+        let schema = Schema::new(BTreeMap::from([(name("probe"), def)]), BTreeMap::new()).unwrap();
+        // Of two missing required fields, the first by name is reported.
+        assert_eq!(
+            schema.guard_event("probe", &props(json!({}))),
+            Err(dropped(DropReason::MissingRequiredField, "a"))
+        );
+        assert_eq!(
+            schema.guard_event("probe", &props(json!({ "b": "ok" }))),
+            Err(dropped(DropReason::MissingRequiredField, "a"))
+        );
+        // An invalid required field is named; an undeclared one never is.
+        assert_eq!(
+            schema.guard_event(
+                "probe",
+                &props(json!({ "a": "ok", "b": "no good", "zzz": 1 }))
+            ),
+            Err(dropped(DropReason::InvalidRequiredField, "b"))
+        );
+        // An event that fails the schema itself names no field.
+        assert_eq!(
+            schema
+                .guard_event("other", &props(json!({})))
+                .unwrap_err()
+                .field,
+            None
+        );
+    }
     #[test]
     fn text_is_cut_at_the_declared_maximum() {
         let kind = FieldKind::text(3).unwrap();
@@ -457,7 +572,7 @@ mod tests {
         let schema = probe(FieldKind::Id, true);
         assert_eq!(
             schema.guard_event("probe", &props(json!({}))),
-            Err(DropReason::MissingRequiredField)
+            Err(dropped(DropReason::MissingRequiredField, "f"))
         );
     }
 
@@ -466,7 +581,7 @@ mod tests {
         let schema = probe(FieldKind::Id, true);
         assert_eq!(
             schema.guard_event("probe", &props(json!({ "f": "not ok" }))),
-            Err(DropReason::InvalidRequiredField)
+            Err(dropped(DropReason::InvalidRequiredField, "f"))
         );
     }
 
@@ -483,7 +598,7 @@ mod tests {
             let properties = props(json!({ first: "not ok" }));
             assert_eq!(
                 schema.guard_event("probe", &properties),
-                Err(DropReason::MissingRequiredField)
+                Err(dropped(DropReason::MissingRequiredField, second))
             );
         }
     }
@@ -498,7 +613,7 @@ mod tests {
         );
         assert_eq!(
             schema.guard_event("screen", &props(json!({ "title": "home" }))),
-            Err(DropReason::MissingRequiredField)
+            Err(dropped(DropReason::MissingRequiredField, "name"))
         );
         let experiment = json!({ "experiment": "new_checkout", "variant": "b" });
         assert_eq!(
@@ -511,7 +626,7 @@ mod tests {
         );
         assert_eq!(
             schema.guard_event("experiment_viewed", &props(json!({ "experiment": "x" }))),
-            Err(DropReason::MissingRequiredField)
+            Err(dropped(DropReason::MissingRequiredField, "variant"))
         );
     }
 
@@ -520,7 +635,7 @@ mod tests {
         let schema = probe(FieldKind::Id, true);
         assert_eq!(
             schema.guard_event("other", &props(json!({}))),
-            Err(DropReason::UnknownEvent)
+            Err(DropReason::UnknownEvent.into())
         );
     }
 
@@ -530,7 +645,7 @@ mod tests {
         for value in ["", "Probe", "pro be", "probe\n", &"a".repeat(65)] {
             assert_eq!(
                 schema.guard_event(value, &props(json!({}))),
-                Err(DropReason::InvalidEventName),
+                Err(DropReason::InvalidEventName.into()),
                 "{value:?}"
             );
         }
@@ -544,7 +659,7 @@ mod tests {
             .collect();
         assert_eq!(
             schema.guard_event("probe", &many),
-            Err(DropReason::TooManyProperties)
+            Err(DropReason::TooManyProperties.into())
         );
     }
 
@@ -585,11 +700,11 @@ mod tests {
         assert_eq!(tap.fields.len(), 2);
         assert_eq!(
             schema.guard_event("ui_tap", &props(json!({ "screen": "home" }))),
-            Err(DropReason::MissingRequiredField)
+            Err(dropped(DropReason::MissingRequiredField, "element"))
         );
         assert_eq!(
             schema.guard_event("app_lifecycle", &props(json!({ "state": "sleeping" }))),
-            Err(DropReason::InvalidRequiredField)
+            Err(dropped(DropReason::InvalidRequiredField, "state"))
         );
         assert!(
             schema
@@ -602,7 +717,7 @@ mod tests {
     fn reserved_health_events_are_unknown_until_their_shapes_exist() {
         assert_eq!(
             Schema::default().guard_event("app_error", &props(json!({}))),
-            Err(DropReason::UnknownEvent)
+            Err(DropReason::UnknownEvent.into())
         );
     }
 
@@ -643,7 +758,7 @@ mod tests {
             .collect();
         assert_eq!(
             Schema::default().guard_traits(&many),
-            Err(DropReason::TooManyProperties)
+            Err(DropReason::TooManyProperties.into())
         );
     }
 
@@ -692,6 +807,9 @@ mod unsafe_char_tests {
         for code in [
             0x00AD, 0x0600, 0x0605, 0x061C, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E, 0x2060,
             0x2064, 0x2066, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB, 0xE0001, 0xE0020, 0xE007F,
+            // invisible fillers and Unicode spaces (Zs)
+            0x00A0, 0x115F, 0x1160, 0x1680, 0x2000, 0x200A, 0x202F, 0x205F, 0x2800, 0x3000, 0x3164,
+            0xFFA0,
         ] {
             assert!(flagged(code), "U+{code:04X}");
         }
@@ -700,8 +818,10 @@ mod unsafe_char_tests {
     #[test]
     fn neighbours_of_the_ranges_are_kept() {
         for code in [
-            0x00AC, 0x00AE, 0x05FF, 0x0606, 0x200A, 0x2010, 0x2027, 0x202F, 0x205F, 0x2070, 0xFEFE,
+            0x00AC, 0x00AE, 0x05FF, 0x0606, 0x1FFF, 0x2010, 0x2027, 0x2030, 0x205E, 0x2070, 0xFEFE,
             0xFF00, 0xFFF8, 0xFFFC, 0xE0000, 0xE0002, 0xE001F, 0xE0080, 0x0041, 0x00E9, 0x65E5,
+            0x00A1, 0x115E, 0x1161, 0x167F, 0x1681, 0x27FF, 0x2801, 0x2FFF, 0x3001, 0x3163, 0x3165,
+            0xFF9F, 0xFFA1, 0x0020,
         ] {
             assert!(!flagged(code), "U+{code:04X}");
         }

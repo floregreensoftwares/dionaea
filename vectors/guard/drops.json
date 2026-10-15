@@ -1,0 +1,36 @@
+{
+  "description": "When an event is dropped, why, and which declared required field failed. The order of checks is fixed: name, schema, property count, missing required field, invalid required field.",
+  "schema": "[events.order.fields.a]\nkind = \"id\"\nrequired = true\n[events.order.fields.b]\nkind = \"count\"\nmax = 5\nrequired = true\n[events.order.fields.note]\nkind = \"text\"\nmax = 20\n",
+  "cases": [
+    { "name": "accepted with both required fields", "event": "order", "props": { "a": "x", "b": 1 }, "expect": { "accepted": { "fields": { "a": "x", "b": 1 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "an invalid optional field does not drop the event", "event": "order", "props": { "a": "x", "b": 1, "note": 5 }, "expect": { "accepted": { "fields": { "a": "x", "b": 1 }, "undeclared": 0, "invalid": ["note"] } } },
+
+    { "name": "unknown event", "event": "nope", "props": {}, "expect": { "dropped": { "reason": "unknown_event" } } },
+    { "name": "a reserved health event is unknown until its shape exists", "event": "app_error", "props": {}, "expect": { "dropped": { "reason": "unknown_event" } } },
+    { "name": "event name with a capital", "event": "Order", "props": { "a": "x", "b": 1 }, "expect": { "dropped": { "reason": "invalid_event_name" } } },
+    { "name": "empty event name", "event": "", "props": {}, "expect": { "dropped": { "reason": "invalid_event_name" } } },
+    { "name": "event name with a trailing space", "event": "order ", "props": {}, "expect": { "dropped": { "reason": "invalid_event_name" } } },
+    { "name": "event name of 65 characters", "event": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "props": {}, "expect": { "dropped": { "reason": "invalid_event_name" } } },
+
+    { "name": "no required field present", "event": "order", "props": {}, "expect": { "dropped": { "reason": "missing_required_field", "field": "a" } } },
+    { "name": "the second required field is missing", "event": "order", "props": { "a": "x" }, "expect": { "dropped": { "reason": "missing_required_field", "field": "b" } } },
+    { "name": "the first required field is missing", "event": "order", "props": { "b": 1 }, "expect": { "dropped": { "reason": "missing_required_field", "field": "a" } } },
+    { "name": "a required field set to null counts as present but invalid", "event": "order", "props": { "a": null, "b": 1 }, "expect": { "dropped": { "reason": "invalid_required_field", "field": "a" } } },
+    { "name": "first required field invalid", "event": "order", "props": { "a": "bad id", "b": 1 }, "expect": { "dropped": { "reason": "invalid_required_field", "field": "a" } } },
+    { "name": "second required field invalid", "event": "order", "props": { "a": "x", "b": 9 }, "expect": { "dropped": { "reason": "invalid_required_field", "field": "b" } } },
+    { "name": "missing wins over invalid, whatever the names", "event": "order", "props": { "a": "bad id" }, "expect": { "dropped": { "reason": "missing_required_field", "field": "b" } } },
+    { "name": "an undeclared property is never named", "event": "order", "props": { "a": "x", "b": 9, "secret_email": "a@b.c" }, "expect": { "dropped": { "reason": "invalid_required_field", "field": "b" } } },
+
+    { "name": "33 properties drop the event before any value is read", "event": "order", "props": { "a": "x", "b": 1, "k2": 0, "k3": 0, "k4": 0, "k5": 0, "k6": 0, "k7": 0, "k8": 0, "k9": 0, "k10": 0, "k11": 0, "k12": 0, "k13": 0, "k14": 0, "k15": 0, "k16": 0, "k17": 0, "k18": 0, "k19": 0, "k20": 0, "k21": 0, "k22": 0, "k23": 0, "k24": 0, "k25": 0, "k26": 0, "k27": 0, "k28": 0, "k29": 0, "k30": 0, "k31": 0, "k32": 0 }, "expect": { "dropped": { "reason": "too_many_properties" } } },
+    { "name": "32 properties are accepted and the extras counted", "event": "order", "props": { "a": "x", "b": 1, "k2": 0, "k3": 0, "k4": 0, "k5": 0, "k6": 0, "k7": 0, "k8": 0, "k9": 0, "k10": 0, "k11": 0, "k12": 0, "k13": 0, "k14": 0, "k15": 0, "k16": 0, "k17": 0, "k18": 0, "k19": 0, "k20": 0, "k21": 0, "k22": 0, "k23": 0, "k24": 0, "k25": 0, "k26": 0, "k27": 0, "k28": 0, "k29": 0, "k30": 0, "k31": 0 }, "expect": { "accepted": { "fields": { "a": "x", "b": 1 }, "undeclared": 30, "invalid": [] } } },
+
+    { "name": "built-in screen", "event": "screen", "props": { "name": "home" }, "expect": { "accepted": { "fields": { "name": "home" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "built-in screen without its name", "event": "screen", "props": { "title": "home" }, "expect": { "dropped": { "reason": "missing_required_field", "field": "name" } } },
+    { "name": "built-in ui_tap", "event": "ui_tap", "props": { "screen": "home", "element": "buy_button" }, "expect": { "accepted": { "fields": { "element": "buy_button", "screen": "home" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "built-in ui_tap without its element", "event": "ui_tap", "props": { "screen": "home" }, "expect": { "dropped": { "reason": "missing_required_field", "field": "element" } } },
+    { "name": "built-in app_lifecycle", "event": "app_lifecycle", "props": { "state": "background" }, "expect": { "accepted": { "fields": { "state": "background" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "built-in app_lifecycle with an unknown state", "event": "app_lifecycle", "props": { "state": "sleeping" }, "expect": { "dropped": { "reason": "invalid_required_field", "field": "state" } } },
+    { "name": "built-in experiment_viewed", "event": "experiment_viewed", "props": { "experiment": "new_checkout", "variant": "b" }, "expect": { "accepted": { "fields": { "experiment": "new_checkout", "variant": "b" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "built-in experiment_viewed without its variant", "event": "experiment_viewed", "props": { "experiment": "x" }, "expect": { "dropped": { "reason": "missing_required_field", "field": "variant" } } }
+  ]
+}

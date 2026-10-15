@@ -1,0 +1,12 @@
+{
+  "description": "Identity traits: every trait is optional, undeclared ones are stripped, invalid ones are stripped and named. More than 32 properties refuse the whole set.",
+  "schema": "[traits.plan]\nkind = \"enum\"\nvalues = [\"free\", \"pro\"]\n[traits.seats]\nkind = \"count\"\nmax = 100\n[traits.nick]\nkind = \"text\"\nmax = 10\n",
+  "cases": [
+    { "name": "no traits", "traits": {}, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": [] } } },
+    { "name": "declared traits", "traits": { "plan": "pro", "seats": 5 }, "expect": { "accepted": { "fields": { "plan": "pro", "seats": 5 }, "undeclared": 0, "invalid": [] } } },
+    { "name": "an undeclared trait is stripped and counted", "traits": { "plan": "free", "email": "a@b.c" }, "expect": { "accepted": { "fields": { "plan": "free" }, "undeclared": 1, "invalid": [] } } },
+    { "name": "an invalid trait is stripped and named", "traits": { "plan": "enterprise", "seats": 101 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["plan", "seats"] } } },
+    { "name": "text traits are cleaned like any text", "traits": { "nick": "  zoéㅤz  " }, "expect": { "accepted": { "fields": { "nick": "zoé z" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "33 properties are refused as a whole", "traits": { "t0": 0, "t1": 0, "t2": 0, "t3": 0, "t4": 0, "t5": 0, "t6": 0, "t7": 0, "t8": 0, "t9": 0, "t10": 0, "t11": 0, "t12": 0, "t13": 0, "t14": 0, "t15": 0, "t16": 0, "t17": 0, "t18": 0, "t19": 0, "t20": 0, "t21": 0, "t22": 0, "t23": 0, "t24": 0, "t25": 0, "t26": 0, "t27": 0, "t28": 0, "t29": 0, "t30": 0, "t31": 0, "t32": 0 }, "expect": { "dropped": { "reason": "too_many_properties" } } }
+  ]
+}
