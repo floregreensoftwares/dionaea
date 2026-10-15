@@ -1,0 +1,273 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use crate::builtin;
+use crate::name::Name;
+
+/// Most fields one event (or the identity traits) may declare, and the most
+/// properties one incoming event may carry.
+pub const MAX_PROPERTIES: usize = 32;
+/// Hard ceiling for a declared `text` maximum, in characters.
+pub const MAX_TEXT_CEILING: usize = 4096;
+/// Largest declared `count` or `duration` maximum: the biggest integer every
+/// JSON implementation represents exactly.
+pub const MAX_INTEGER_CEILING: u64 = (1 << 53) - 1;
+/// Most values one `enum` may declare.
+pub const MAX_ENUM_VALUES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaError {
+    ReservedEventName(Name),
+    TooManyFields,
+    TextMaxOutOfRange,
+    IntegerMaxOutOfRange,
+    EnumValuesInvalid,
+}
+
+impl fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservedEventName(name) => write!(f, "event name `{name}` is reserved"),
+            Self::TooManyFields => write!(f, "at most {MAX_PROPERTIES} fields may be declared"),
+            Self::TextMaxOutOfRange => {
+                write!(f, "text max must be between 1 and {MAX_TEXT_CEILING}")
+            }
+            Self::IntegerMaxOutOfRange => {
+                write!(
+                    f,
+                    "count and duration max must be between 1 and {MAX_INTEGER_CEILING}"
+                )
+            }
+            Self::EnumValuesInvalid => write!(
+                f,
+                "an enum declares between 1 and {MAX_ENUM_VALUES} distinct values"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Identifier-shaped string: `[A-Za-z0-9_.:-]`, 1 to 64 characters.
+    Id,
+    /// Free text, control characters replaced, trimmed, cut at `max` characters.
+    Text { max: usize },
+    /// Finite number clamped to 0..1 and rounded to three decimals.
+    Unit,
+    /// One of the declared values.
+    Enum { values: BTreeSet<Name> },
+    /// Non-negative integer no greater than `max`.
+    Count { max: u64 },
+    /// Milliseconds, a non-negative integer no greater than `max`.
+    Duration { max: u64 },
+}
+
+impl FieldKind {
+    pub fn text(max: usize) -> Result<Self, SchemaError> {
+        if (1..=MAX_TEXT_CEILING).contains(&max) {
+            Ok(Self::Text { max })
+        } else {
+            Err(SchemaError::TextMaxOutOfRange)
+        }
+    }
+
+    pub fn enumeration<I: IntoIterator<Item = Name>>(values: I) -> Result<Self, SchemaError> {
+        let values: Vec<Name> = values.into_iter().collect();
+        let distinct: BTreeSet<Name> = values.iter().cloned().collect();
+        if distinct.is_empty() || distinct.len() != values.len() || distinct.len() > MAX_ENUM_VALUES
+        {
+            return Err(SchemaError::EnumValuesInvalid);
+        }
+        Ok(Self::Enum { values: distinct })
+    }
+
+    pub fn count(max: u64) -> Result<Self, SchemaError> {
+        integer_max(max).map(|max| Self::Count { max })
+    }
+
+    pub fn duration(max: u64) -> Result<Self, SchemaError> {
+        integer_max(max).map(|max| Self::Duration { max })
+    }
+}
+
+fn integer_max(max: u64) -> Result<u64, SchemaError> {
+    if (1..=MAX_INTEGER_CEILING).contains(&max) {
+        Ok(max)
+    } else {
+        Err(SchemaError::IntegerMaxOutOfRange)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDef {
+    pub kind: FieldKind,
+    pub required: bool,
+}
+
+impl FieldDef {
+    pub fn required(kind: FieldKind) -> Self {
+        Self {
+            kind,
+            required: true,
+        }
+    }
+
+    pub fn optional(kind: FieldKind) -> Self {
+        Self {
+            kind,
+            required: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDef {
+    fields: BTreeMap<Name, FieldDef>,
+}
+
+impl EventDef {
+    pub fn new(fields: BTreeMap<Name, FieldDef>) -> Result<Self, SchemaError> {
+        if fields.len() > MAX_PROPERTIES {
+            return Err(SchemaError::TooManyFields);
+        }
+        Ok(Self { fields })
+    }
+
+    pub fn fields(&self) -> &BTreeMap<Name, FieldDef> {
+        &self.fields
+    }
+}
+
+/// What a site declares: its events and its identity traits. Built-in events
+/// are always present and are not part of this value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Schema {
+    events: BTreeMap<Name, EventDef>,
+    traits: BTreeMap<Name, FieldDef>,
+}
+
+impl Schema {
+    pub fn new(
+        events: BTreeMap<Name, EventDef>,
+        traits: BTreeMap<Name, FieldDef>,
+    ) -> Result<Self, SchemaError> {
+        if let Some(name) = events
+            .keys()
+            .find(|name| builtin::is_reserved(name.as_str()))
+        {
+            return Err(SchemaError::ReservedEventName(name.clone()));
+        }
+        if traits.len() > MAX_PROPERTIES {
+            return Err(SchemaError::TooManyFields);
+        }
+        Ok(Self { events, traits })
+    }
+
+    pub fn events(&self) -> &BTreeMap<Name, EventDef> {
+        &self.events
+    }
+
+    pub fn traits(&self) -> &BTreeMap<Name, FieldDef> {
+        &self.traits
+    }
+
+    /// Built-in events first, then the site's own.
+    pub(crate) fn event(&self, name: &str) -> Option<&EventDef> {
+        builtin::event(name)
+            .or_else(|| Name::new(name).ok().and_then(|name| self.events.get(&name)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(value: &str) -> Name {
+        Name::new(value).unwrap()
+    }
+
+    #[test]
+    fn text_max_must_be_within_bounds() {
+        assert!(FieldKind::text(1).is_ok());
+        assert!(FieldKind::text(MAX_TEXT_CEILING).is_ok());
+        assert_eq!(FieldKind::text(0), Err(SchemaError::TextMaxOutOfRange));
+        assert_eq!(
+            FieldKind::text(MAX_TEXT_CEILING + 1),
+            Err(SchemaError::TextMaxOutOfRange)
+        );
+    }
+
+    #[test]
+    fn integer_max_must_be_within_bounds() {
+        assert!(FieldKind::count(1).is_ok());
+        assert!(FieldKind::duration(MAX_INTEGER_CEILING).is_ok());
+        assert_eq!(FieldKind::count(0), Err(SchemaError::IntegerMaxOutOfRange));
+        assert_eq!(
+            FieldKind::duration(MAX_INTEGER_CEILING + 1),
+            Err(SchemaError::IntegerMaxOutOfRange)
+        );
+    }
+
+    #[test]
+    fn enum_needs_distinct_values_within_bounds() {
+        assert!(FieldKind::enumeration([name("a"), name("b")]).is_ok());
+        assert_eq!(
+            FieldKind::enumeration([]),
+            Err(SchemaError::EnumValuesInvalid)
+        );
+        assert_eq!(
+            FieldKind::enumeration([name("a"), name("a")]),
+            Err(SchemaError::EnumValuesInvalid)
+        );
+        let many = (0..=MAX_ENUM_VALUES).map(|i| name(&format!("v{i}")));
+        assert_eq!(
+            FieldKind::enumeration(many),
+            Err(SchemaError::EnumValuesInvalid)
+        );
+    }
+
+    #[test]
+    fn event_declares_at_most_the_property_limit() {
+        let fields = |count: usize| -> BTreeMap<Name, FieldDef> {
+            (0..count)
+                .map(|i| (name(&format!("f{i}")), FieldDef::optional(FieldKind::Id)))
+                .collect()
+        };
+        assert!(EventDef::new(fields(MAX_PROPERTIES)).is_ok());
+        assert_eq!(
+            EventDef::new(fields(MAX_PROPERTIES + 1)),
+            Err(SchemaError::TooManyFields)
+        );
+    }
+
+    #[test]
+    fn site_cannot_declare_a_reserved_event_name() {
+        for reserved in ["screen", "ui_tap", "app_error", "web_vital"] {
+            let events =
+                BTreeMap::from([(name(reserved), EventDef::new(BTreeMap::new()).unwrap())]);
+            assert_eq!(
+                Schema::new(events, BTreeMap::new()),
+                Err(SchemaError::ReservedEventName(name(reserved)))
+            );
+        }
+    }
+
+    #[test]
+    fn site_may_declare_its_own_event_names() {
+        let events = BTreeMap::from([(name("checkout"), EventDef::new(BTreeMap::new()).unwrap())]);
+        assert!(Schema::new(events, BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn traits_declare_at_most_the_property_limit() {
+        let traits: BTreeMap<Name, FieldDef> = (0..=MAX_PROPERTIES)
+            .map(|i| (name(&format!("t{i}")), FieldDef::optional(FieldKind::Id)))
+            .collect();
+        assert_eq!(
+            Schema::new(BTreeMap::new(), traits),
+            Err(SchemaError::TooManyFields)
+        );
+    }
+}
