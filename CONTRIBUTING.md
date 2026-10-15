@@ -65,7 +65,7 @@ regression test where practical. New dependencies and any `unsafe` code
 
 Code on the ingest path has
 [Criterion](https://github.com/bheisler/criterion.rs) benchmarks next to it, in
-the crate's `benches/` folder (today the guard and the schema parser in
+the crate's `benches/` folder (today the guard, the schema parser and the schema diff in
 `dionaea-core`; new hot-path code adds its own). Run one crate's benchmarks, not the whole
 workspace:
 
