@@ -49,7 +49,11 @@ run_benches() {
     # shellcheck disable=SC2086
     (
         cd "$tree"
-        export CARGO_TARGET_DIR="$work/target-$(basename "$tree")"
+        if [ "$tree" = "$base_tree" ]; then
+            export CARGO_TARGET_DIR="$work/target-base"
+        else
+            export CARGO_TARGET_DIR="$work/target-branch"
+        fi
         cargo bench -p "$crate" $targets --locked -- "$@"
     )
 }
