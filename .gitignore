@@ -18,3 +18,12 @@
 *.sqlite-wal
 *.sqlite-shm
 .env
+
+# cargo-fuzz output
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+# libFuzzer grows its corpus beside the seeds; only the named seeds are kept
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/valid.json
+!/fuzz/corpus/*/example.toml

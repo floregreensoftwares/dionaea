@@ -83,3 +83,11 @@ summary; it never fails on a slowdown, since
 shared runners are too noisy for a threshold. A change that touches a hot
 path should state the before and after numbers, with the machine, in its pull
 request. Numbers are only comparable on the same machine.
+
+## Property tests and fuzzing
+
+`crates/dionaea/tests/properties.rs` holds property tests (proptest) for the
+parser, the guard, the decoders and the schema diff: whatever the input they
+never panic, and what they return keeps its promises. They run with the other
+tests. The parser and the decoders also have libFuzzer targets; see
+[fuzz/README.md](fuzz/README.md) for how to run them.
