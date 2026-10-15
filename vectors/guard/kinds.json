@@ -21,6 +21,7 @@
     { "name": "text: control characters become spaces", "event": "probe", "props": { "t": "a\tb\nc" }, "expect": { "accepted": { "fields": { "t": "a b c" }, "undeclared": 0, "invalid": [] } } },
     { "name": "text: cut at the maximum", "event": "probe", "props": { "t": "abcdefghij" }, "expect": { "accepted": { "fields": { "t": "abcdefgh" }, "undeclared": 0, "invalid": [] } } },
     { "name": "text: the maximum counts characters, not bytes", "event": "probe", "props": { "t": "ééééééééé" }, "expect": { "accepted": { "fields": { "t": "éééééééé" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "text: the maximum counts Unicode characters, so an emoji is one", "event": "probe", "props": { "t": "😀😀😀😀😀😀😀😀😀" }, "expect": { "accepted": { "fields": { "t": "😀😀😀😀😀😀😀😀" }, "undeclared": 0, "invalid": [] } } },
     { "name": "text: only spaces is empty and so invalid", "event": "probe", "props": { "t": "   " }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["t"] } } },
     { "name": "text: empty", "event": "probe", "props": { "t": "" }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["t"] } } },
     { "name": "text: a number", "event": "probe", "props": { "t": 5 }, "expect": { "accepted": { "fields": {}, "undeclared": 0, "invalid": ["t"] } } },

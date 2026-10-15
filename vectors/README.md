@@ -7,6 +7,9 @@ and each SDK runs the same files in its own test suite. A rule is only a rule
 here if a vector pins it, so a change to the guard or to the wire format starts
 by changing the vectors.
 
+Lengths (the text maximum, the 64 characters of an id) count Unicode scalar
+values, not UTF-16 units or bytes: an emoji is one character.
+
 The files are plain JSON, so any language can read them. Numbers are compared
 numerically (`1` and `1.0` are the same), objects without regard to key order.
 

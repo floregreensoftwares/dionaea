@@ -23,6 +23,7 @@
     { "name": "a visible braille pattern is kept", "event": "t", "props": { "v": "a⠁b" }, "expect": { "accepted": { "fields": { "v": "a⠁b" }, "undeclared": 0, "invalid": [] } } },
     { "name": "a hyphenation point is kept", "event": "t", "props": { "v": "a‧b" }, "expect": { "accepted": { "fields": { "v": "a‧b" }, "undeclared": 0, "invalid": [] } } },
     { "name": "cleaning happens before the cut", "event": "t", "props": { "s": "abㅤcd" }, "expect": { "accepted": { "fields": { "s": "ab c" }, "undeclared": 0, "invalid": [] } } },
+    { "name": "a character outside the basic plane counts as one", "event": "t", "props": { "s": "ab😀cd" }, "expect": { "accepted": { "fields": { "s": "ab😀c" }, "undeclared": 0, "invalid": [] } } },
     { "name": "spaces left at the end of the cut are trimmed", "event": "t", "props": { "s": "abㅤㅤcd" }, "expect": { "accepted": { "fields": { "s": "ab" }, "undeclared": 0, "invalid": [] } } }
   ]
 }
