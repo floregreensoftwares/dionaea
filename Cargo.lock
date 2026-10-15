@@ -346,6 +346,7 @@ dependencies = [
  "axum",
  "clap",
  "dionaea-core",
+ "jsonschema",
  "serde",
  "serde_json",
  "tokio",
@@ -360,7 +361,6 @@ name = "dionaea-core"
 version = "0.0.0"
 dependencies = [
  "criterion",
- "jsonschema",
  "serde",
  "serde_json",
  "toml",
