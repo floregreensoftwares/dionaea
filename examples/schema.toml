@@ -1,0 +1,31 @@
+# An example schema: the events and identity traits a site declares.
+# Anything not declared here is dropped (events) or stripped (fields).
+# Check it with: dionaea schema check examples/schema.toml
+
+[events.checkout_started.fields.items]
+kind = "count"
+max = 1000
+required = true
+
+[events.checkout_started.fields.cart]
+kind = "id"
+required = true
+
+[events.checkout_started.fields.coupon]
+kind = "text"
+max = 32
+
+[events.checkout_started.fields.region]
+kind = "enum"
+values = ["us-east", "eu-west"]
+
+[events.screen_loaded.fields.duration]
+kind = "duration"
+max = 60000
+
+[events.screen_loaded.fields.progress]
+kind = "unit"
+
+[traits.plan]
+kind = "enum"
+values = ["free", "pro"]

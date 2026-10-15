@@ -1,5 +1,6 @@
 mod clickhouse;
 mod config;
+mod schema_cli;
 mod server;
 
 use std::io::Write;
@@ -25,13 +26,54 @@ enum Command {
         #[arg(long, short)]
         config: Option<PathBuf>,
     },
+    /// Work with schema files
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchemaCommand {
+    /// Validate a schema file; problems are printed as file:line:column
+    Check { file: PathBuf },
+    /// List the changes from an old schema file to a new one; exits 1 when any is breaking
+    Diff { old: PathBuf, new: PathBuf },
 }
 
 fn main() -> ExitCode {
     let Cli { command } = Cli::parse();
     match command {
         Command::Serve { config } => serve(config),
+        Command::Schema { command } => schema(command),
     }
+}
+
+fn schema(command: SchemaCommand) -> ExitCode {
+    let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+    let read = |path: &PathBuf, err: &mut dyn Write| {
+        schema_cli::read_schema_file(path).inspect_err(|message| {
+            let _ = writeln!(err, "error: {message}");
+        })
+    };
+    let code = match command {
+        SchemaCommand::Check { file } => match read(&file, &mut err) {
+            Ok(source) => {
+                schema_cli::check(&file.display().to_string(), &source, &mut out, &mut err)
+            }
+            Err(_) => schema_cli::UNUSABLE,
+        },
+        SchemaCommand::Diff { old, new } => match (read(&old, &mut err), read(&new, &mut err)) {
+            (Ok(old_source), Ok(new_source)) => schema_cli::compare(
+                (&old.display().to_string(), &old_source),
+                (&new.display().to_string(), &new_source),
+                &mut out,
+                &mut err,
+            ),
+            _ => schema_cli::UNUSABLE,
+        },
+    };
+    ExitCode::from(code)
 }
 
 fn serve(path: Option<PathBuf>) -> ExitCode {

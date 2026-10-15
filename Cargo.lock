@@ -280,6 +280,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "clap",
+ "dionaea-core",
  "serde",
  "tokio",
  "toml",
