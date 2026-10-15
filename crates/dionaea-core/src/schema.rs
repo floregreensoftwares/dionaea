@@ -68,6 +68,18 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
+    /// The name used in schema files.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Text { .. } => "text",
+            Self::Unit => "unit",
+            Self::Enum { .. } => "enum",
+            Self::Count { .. } => "count",
+            Self::Duration { .. } => "duration",
+        }
+    }
+
     pub fn text(max: usize) -> Result<Self, SchemaError> {
         if (1..=MAX_TEXT_CEILING).contains(&max) {
             Ok(Self::Text { max })
