@@ -1,0 +1,25 @@
+# Development services. `docker compose up -d` starts ClickHouse on
+# 127.0.0.1:8123; the default `clickhouse_url` of `dionaea serve` reaches it.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.27.9
+    ports:
+      - "127.0.0.1:8123:8123"
+    environment:
+      CLICKHOUSE_USER: dionaea
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-dionaea-dev}
+      CLICKHOUSE_DB: dionaea
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  clickhouse-data:
