@@ -39,6 +39,8 @@ enum SchemaCommand {
     Check { file: PathBuf },
     /// List the changes from an old schema file to a new one; exits 1 when any is breaking
     Diff { old: PathBuf, new: PathBuf },
+    /// Print the JSON Schema of the schema file format, for editor completion
+    JsonSchema,
 }
 
 fn main() -> ExitCode {
@@ -63,6 +65,7 @@ fn schema(command: SchemaCommand) -> ExitCode {
             }
             Err(_) => schema_cli::UNUSABLE,
         },
+        SchemaCommand::JsonSchema => schema_cli::json_schema(&mut out),
         SchemaCommand::Diff { old, new } => match (read(&old, &mut err), read(&new, &mut err)) {
             (Ok(old_source), Ok(new_source)) => schema_cli::compare(
                 (&old.display().to_string(), &old_source),
