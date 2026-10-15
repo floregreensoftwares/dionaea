@@ -166,15 +166,22 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// The rule for what a site may call an event. Shared with the schema
+    /// file parser so both report the same thing.
+    pub(crate) fn check_event_name(name: &Name) -> Result<(), SchemaError> {
+        if builtin::is_reserved(name.as_str()) {
+            Err(SchemaError::ReservedEventName(name.clone()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn new(
         events: BTreeMap<Name, EventDef>,
         traits: BTreeMap<Name, FieldDef>,
     ) -> Result<Self, SchemaError> {
-        if let Some(name) = events
-            .keys()
-            .find(|name| builtin::is_reserved(name.as_str()))
-        {
-            return Err(SchemaError::ReservedEventName(name.clone()));
+        for name in events.keys() {
+            Self::check_event_name(name)?;
         }
         if traits.len() > MAX_PROPERTIES {
             return Err(SchemaError::TooManyFields);

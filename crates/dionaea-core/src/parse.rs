@@ -22,7 +22,6 @@ use std::ops::Range;
 use serde::Deserialize;
 use toml::Spanned;
 
-use crate::builtin;
 use crate::name::{EnumValue, Name};
 use crate::schema::{EventDef, FieldDef, FieldKind, MAX_PROPERTIES, Schema};
 
@@ -100,8 +99,8 @@ pub fn parse_schema(source: &str) -> Result<Schema, Vec<Diagnostic>> {
         let Some(name) = name else {
             continue;
         };
-        if builtin::is_reserved(name.as_str()) {
-            diagnostics.report(&key.span(), format!("event name `{name}` is reserved"));
+        if let Err(error) = Schema::check_event_name(&name) {
+            diagnostics.report(&key.span(), error.to_string());
             continue;
         }
         match EventDef::new(fields) {
