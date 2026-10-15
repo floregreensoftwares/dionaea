@@ -60,3 +60,22 @@ cargo test --workspace --locked
 Every observable behavior needs a focused test, and every bug fix a
 regression test where practical. New dependencies and any `unsafe` code
 (forbidden by default) need a stated purpose and cost in the pull request.
+
+## Benchmarks
+
+Code on the ingest path (the guard, the batch decoder, the spool) has
+[Criterion](https://github.com/bheisler/criterion.rs) benchmarks next to it, in
+the crate's `benches/` folder. Run one crate's benchmarks, not the whole
+workspace:
+
+```sh
+cargo bench -p dionaea-core
+cargo bench -p dionaea-core --bench guard -- --save-baseline before
+# change the code, then compare:
+cargo bench -p dionaea-core --bench guard -- --baseline before
+```
+
+Benchmarks are compiled by clippy (`--all-targets`) but not run in CI, since
+shared runners are too noisy to compare timings. A change that touches a hot
+path should state the before and after numbers, with the machine, in its pull
+request. Numbers are only comparable on the same machine.
