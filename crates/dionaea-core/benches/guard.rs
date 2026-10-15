@@ -96,9 +96,12 @@ fn guard(c: &mut Criterion) {
         b.iter(|| schema.guard_event(black_box(&huge_name), black_box(&typical)));
     });
 
-    let at_limit: Map<String, Value> = (0..32).map(|i| (format!("k{i}"), json!(i))).collect();
+    let mut at_limit: Map<String, Value> = (0..30).map(|i| (format!("k{i}"), json!(i))).collect();
+    at_limit.insert("items".to_owned(), json!(3));
+    at_limit.insert("cart".to_owned(), json!("c1"));
+    assert_eq!(at_limit.len(), 32);
     let over_limit: Map<String, Value> = (0..33).map(|i| (format!("k{i}"), json!(i))).collect();
-    group.bench_function("32 properties", |b| {
+    group.bench_function("accept: 32 properties, 2 declared", |b| {
         b.iter(|| schema.guard_event(black_box("checkout_started"), black_box(&at_limit)));
     });
     group.bench_function("drop: 33 properties", |b| {
