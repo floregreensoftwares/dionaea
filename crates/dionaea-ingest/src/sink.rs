@@ -5,21 +5,26 @@
 //! decoding or encoding anything again:
 //!
 //! ```text
-//! version (1 byte, = 1) | length of the event lines (u32, little endian)
-//!   | event lines | drop lines
+//! version (1 byte, = 2) | length of the event lines (u32, little endian)
+//!   | length of the alias lines (u32) | length of the trait lines (u32)
+//!   | event lines | alias lines | trait lines | drop lines
 //! ```
 //!
 //! Events and the drop counts of the request travel in the same record, so
 //! one acknowledged request is stored or not as a whole. A request that does
-//! not fit one record is split by events; the drop lines go in the first.
+//! not fit one record is split by events; the drop lines go in the first. An
+//! identify request is one record holding its alias and trait lines.
+//!
+//! Version 1 had no alias or trait lines (`version | events length | event
+//! lines | drop lines`); records of that version are still read.
 
 use dionaea_spool::{Spool, SpoolError};
-use dionaea_store::{DropRow, EventRow, Store};
+use dionaea_store::{AliasRow, DropRow, EventRow, Store, TraitsRow};
 
 use crate::pipeline::{Accepted, Processed};
 
-const VERSION: u8 = 1;
-const HEADER: usize = 5;
+const VERSION: u8 = 2;
+const HEADER: usize = 13;
 /// Most bytes of event lines in one record. A request body is at most 256 KiB,
 /// so its lines (escaping and field names included) stay far below this: every
 /// valid request is one record, acknowledged or refused as a whole. The spool
@@ -61,17 +66,27 @@ fn row(accepted: &Accepted) -> Option<EventRow> {
     })
 }
 
-fn record(event_lines: &str, drop_lines: &str) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(HEADER + event_lines.len() + drop_lines.len());
-    payload.push(VERSION);
-    // Bounded by CHUNK_BYTES.
-    payload.extend_from_slice(
-        &u32::try_from(event_lines.len())
-            .unwrap_or(u32::MAX)
-            .to_le_bytes(),
+/// The parts of a record, as the lines the store sends.
+#[derive(Debug, Clone, Copy, Default)]
+struct Parts<'a> {
+    events: &'a str,
+    aliases: &'a str,
+    traits: &'a str,
+    drops: &'a str,
+}
+
+fn record(parts: Parts<'_>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(
+        HEADER + parts.events.len() + parts.aliases.len() + parts.traits.len() + parts.drops.len(),
     );
-    payload.extend_from_slice(event_lines.as_bytes());
-    payload.extend_from_slice(drop_lines.as_bytes());
+    payload.push(VERSION);
+    // Each is bounded by CHUNK_BYTES, or by the size of one identify body.
+    for part in [parts.events, parts.aliases, parts.traits] {
+        payload.extend_from_slice(&u32::try_from(part.len()).unwrap_or(u32::MAX).to_le_bytes());
+    }
+    for part in [parts.events, parts.aliases, parts.traits, parts.drops] {
+        payload.extend_from_slice(part.as_bytes());
+    }
     payload
 }
 
@@ -145,7 +160,11 @@ pub fn enqueue(
     }
     let records = chunks.len();
     for (index, chunk) in chunks.iter().enumerate() {
-        spool.append(record(chunk, if index == 0 { &drop_lines } else { "" }))?;
+        spool.append(record(Parts {
+            events: chunk,
+            drops: if index == 0 { &drop_lines } else { "" },
+            ..Parts::default()
+        }))?;
     }
     Ok(Enqueued {
         events,
@@ -154,31 +173,77 @@ pub fn enqueue(
     })
 }
 
-/// The two halves of a record.
+/// What a record holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Lines<'a> {
     pub(crate) events: &'a str,
+    pub(crate) aliases: &'a str,
+    pub(crate) traits: &'a str,
     pub(crate) drops: &'a str,
 }
 
 /// Splits a record into its lines; `None` when it is not a record this
-/// version wrote (a bad version, a length past the end, text that is not
+/// version knows (a bad version, a length past the end, text that is not
 /// UTF-8).
 pub(crate) fn decode(payload: &[u8]) -> Option<Lines<'_>> {
     let (&version, rest) = payload.split_first()?;
-    if version != VERSION || rest.len() < 4 {
+    let sections = match version {
+        1 => 1,
+        VERSION => 3,
+        _ => return None,
+    };
+    if rest.len() < 4 * sections {
         return None;
     }
-    let (length, rest) = rest.split_at(4);
-    let length = usize::try_from(u32::from_le_bytes(length.try_into().ok()?)).ok()?;
-    if length > rest.len() {
-        return None;
+    let (header, mut rest) = rest.split_at(4 * sections);
+    let mut lengths = [0usize; 3];
+    for (length, bytes) in lengths.iter_mut().zip(header.as_chunks::<4>().0) {
+        *length = usize::try_from(u32::from_le_bytes(*bytes)).ok()?;
     }
-    let (events, drops) = rest.split_at(length);
+    let mut take = |length: usize| -> Option<&str> {
+        if length > rest.len() {
+            return None;
+        }
+        let (part, tail) = rest.split_at(length);
+        rest = tail;
+        std::str::from_utf8(part).ok()
+    };
+    let events = take(lengths[0])?;
+    let aliases = take(lengths[1])?;
+    let traits = take(lengths[2])?;
+    let drops = std::str::from_utf8(rest).ok()?;
     Some(Lines {
-        events: std::str::from_utf8(events).ok()?,
-        drops: std::str::from_utf8(drops).ok()?,
+        events,
+        aliases,
+        traits,
+        drops,
     })
+}
+
+/// Writes one identify request to the spool as a single record: the link
+/// from the anonymous id to the user, the user's traits when the request
+/// carried any, and the counts of what the guard removed. Returns once it is
+/// durable.
+pub fn enqueue_identity(
+    spool: &Spool,
+    alias: &AliasRow,
+    traits: Option<&TraitsRow>,
+    drops: &[DropRow],
+) -> Result<(), SpoolError> {
+    let io = |e: dionaea_store::Error| SpoolError::Io(e.to_string());
+    let aliases = Store::encode_aliases(std::slice::from_ref(alias)).map_err(io)?;
+    let traits = match traits {
+        Some(row) => Store::encode_traits(std::slice::from_ref(row)).map_err(io)?,
+        None => String::new(),
+    };
+    let drops = Store::encode_drops(drops).map_err(io)?;
+    spool.append(record(Parts {
+        aliases: &aliases,
+        traits: &traits,
+        drops: &drops,
+        ..Parts::default()
+    }))?;
+    Ok(())
 }
 
 /// Rows of drop counts per record, so a large flush stays well under the
@@ -205,7 +270,10 @@ pub fn enqueue_drop_rows(
                 continue;
             }
         };
-        if let Err(error) = spool.append(record("", &lines)) {
+        if let Err(error) = spool.append(record(Parts {
+            drops: &lines,
+            ..Parts::default()
+        })) {
             rest.extend(tail);
             return Err((error, rest));
         }

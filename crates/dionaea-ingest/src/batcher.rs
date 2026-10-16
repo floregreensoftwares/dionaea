@@ -33,6 +33,8 @@ use crate::sink;
 pub trait Destination: Send + Sync + 'static {
     fn insert_event_lines(&self, lines: &str, token: &str) -> Result<(), Error>;
     fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error>;
+    fn insert_alias_lines(&self, lines: &str, token: &str) -> Result<(), Error>;
+    fn insert_traits_lines(&self, lines: &str, token: &str) -> Result<(), Error>;
 
     /// Which of these (site, event id) pairs another node already stored.
     /// The default knows none, which turns the cross-node check off.
@@ -53,6 +55,14 @@ impl Destination for Store {
 
     fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
         Store::insert_drop_lines(self, lines, token)
+    }
+
+    fn insert_alias_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        Store::insert_alias_lines(self, lines, token)
+    }
+
+    fn insert_traits_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        Store::insert_traits_lines(self, lines, token)
     }
 
     fn known_event_ids(&self, keys: &[(u32, &str)]) -> Result<HashSet<(u32, String)>, Error> {
@@ -103,6 +113,7 @@ pub struct BatcherStats {
     batches: AtomicU64,
     event_rows: AtomicU64,
     drop_rows: AtomicU64,
+    identity_rows: AtomicU64,
     retries: AtomicU64,
     skipped_records: AtomicU64,
     duplicates: AtomicU64,
@@ -122,6 +133,11 @@ impl BatcherStats {
 
     pub fn drop_rows(&self) -> u64 {
         self.drop_rows.load(Ordering::Relaxed)
+    }
+
+    /// Identity link and trait rows the store confirmed.
+    pub fn identity_rows(&self) -> u64 {
+        self.identity_rows.load(Ordering::Relaxed)
     }
 
     /// Attempts repeated after a transient failure.
@@ -314,12 +330,16 @@ enum Delivered {
 enum Part {
     Events,
     Drops,
+    Aliases,
+    Traits,
 }
 
 fn token(records: &[Record], part: Part) -> String {
     let suffix = match part {
         Part::Events => 'e',
         Part::Drops => 'd',
+        Part::Aliases => 'a',
+        Part::Traits => 't',
     };
     positions(records, suffix)
 }
@@ -357,7 +377,7 @@ fn deliver(
             stats.set_error(Some("a spool record could not be read".to_owned()));
         }
     }
-    for part in [Part::Events, Part::Drops] {
+    for part in [Part::Events, Part::Aliases, Part::Traits, Part::Drops] {
         if let Delivered::Stopped =
             deliver_part(records, part, destination, config, stop, stats, backoff)
         {
@@ -480,6 +500,8 @@ fn deliver_part(
         .map(|lines| match part {
             Part::Events => lines.events,
             Part::Drops => lines.drops,
+            Part::Aliases => lines.aliases,
+            Part::Traits => lines.traits,
         })
         .collect();
     if lines.is_empty() {
@@ -519,6 +541,8 @@ fn deliver_part(
     let inserted = retry(config, stop, stats, backoff, || match part {
         Part::Events => destination.insert_event_lines(&lines, &token),
         Part::Drops => destination.insert_drop_lines(&lines, &token),
+        Part::Aliases => destination.insert_alias_lines(&lines, &token),
+        Part::Traits => destination.insert_traits_lines(&lines, &token),
     });
     match inserted {
         Attempt::Done(()) => {
@@ -526,6 +550,7 @@ fn deliver_part(
             let rows = match part {
                 Part::Events => &stats.event_rows,
                 Part::Drops => &stats.drop_rows,
+                Part::Aliases | Part::Traits => &stats.identity_rows,
             };
             rows.fetch_add(count_lines(&lines), Ordering::Relaxed);
             stats.set_error(None);

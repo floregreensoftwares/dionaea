@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
-use dionaea_store::{Config, DropRow, Error, EventRow, Store};
+use dionaea_store::{AliasRow, Config, DropRow, Error, EventRow, Store, TraitsRow};
 use serde_json::Value;
 
 fn server() -> (String, u16, String, String) {
@@ -124,7 +124,14 @@ fn migrate_creates_the_tables_and_is_idempotent() {
         .expect("tables");
     assert_eq!(
         tables.lines().collect::<Vec<_>>(),
-        vec!["_migrations", "drops_daily", "event_ids", "events"]
+        vec![
+            "_migrations",
+            "drops_daily",
+            "event_ids",
+            "events",
+            "identity_alias",
+            "user_traits"
+        ]
     );
 }
 
@@ -165,7 +172,7 @@ fn two_nodes_migrating_at_once_both_succeed() {
             ))
             .expect("count")
             .trim(),
-        "4"
+        "6"
     );
     let _ = scratch
         .admin
@@ -557,7 +564,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 2);
+    assert_eq!(count(&scratch.store, "_migrations"), 3);
 }
 
 #[test]
@@ -739,4 +746,139 @@ fn now_ms() -> u64 {
             .as_millis(),
     )
     .expect("fits")
+}
+
+fn alias(anon: &str, user: &str, at: u64) -> AliasRow {
+    AliasRow {
+        site_id: 7,
+        anon_id: anon.to_owned(),
+        user_id: user.to_owned(),
+        linked_ms: at,
+    }
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn links_keep_every_pair_and_the_latest_wins_for_an_anonymous_id() {
+    let scratch = Scratch::new();
+    let t = now_ms();
+    let rows = [
+        alias("a1", "u1", t),
+        alias("a1", "u2", t + 5_000),
+        alias("a2", "u1", t + 1_000),
+        // The same pair again, later: one row, with the later time.
+        alias("a1", "u1", t + 9_000),
+    ];
+    let lines = Store::encode_aliases(&rows).expect("encode");
+    scratch
+        .store
+        .insert_alias_lines(&lines, "alias-1")
+        .expect("insert");
+    // The same token repeats nothing.
+    scratch
+        .store
+        .insert_alias_lines(&lines, "alias-1")
+        .expect("insert again");
+    let pairs = scratch
+        .store
+        .raw_query(
+            "SELECT anon_id, user_id FROM identity_alias FINAL ORDER BY anon_id, user_id FORMAT TabSeparated",
+        )
+        .expect("pairs");
+    assert_eq!(
+        pairs.lines().collect::<Vec<_>>(),
+        vec!["a1\tu1", "a1\tu2", "a2\tu1"],
+        "both users of a1 are kept"
+    );
+    let latest = scratch
+        .store
+        .raw_query(
+            "SELECT anon_id, argMax(user_id, linked_at) FROM identity_alias FINAL GROUP BY anon_id ORDER BY anon_id FORMAT TabSeparated",
+        )
+        .expect("latest");
+    assert_eq!(
+        latest.lines().collect::<Vec<_>>(),
+        vec!["a1\tu1", "a2\tu1"],
+        "the latest link of a1 is the one made last"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_latest_traits_of_a_user_replace_the_earlier_ones() {
+    let scratch = Scratch::new();
+    let t = now_ms();
+    let traits = |plan: &str, seats: f64, at: u64| TraitsRow {
+        site_id: 7,
+        user_id: "u1".to_owned(),
+        traits_str: vec![("plan".to_owned(), plan.to_owned())],
+        traits_num: vec![("seats".to_owned(), seats)],
+        updated_ms: at,
+    };
+    let first = Store::encode_traits(&[traits("free \"x\"\n\u{1f600}", 1.0, t)]).expect("encode");
+    let second = Store::encode_traits(&[traits("pro", 5.0, t + 1_000)]).expect("encode");
+    // Delivered out of order: the later time still wins.
+    scratch
+        .store
+        .insert_traits_lines(&second, "t-2")
+        .expect("insert");
+    scratch
+        .store
+        .insert_traits_lines(&first, "t-1")
+        .expect("insert");
+    let row = scratch
+        .store
+        .raw_query(
+            "SELECT traits_str['plan'], traits_num['seats'] FROM user_traits FINAL WHERE site_id = 7 AND user_id = 'u1' FORMAT TabSeparated",
+        )
+        .expect("traits");
+    assert_eq!(row.trim(), "pro\t5");
+    assert_eq!(count(&scratch.store, "user_traits FINAL"), 1);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_ingest_user_can_write_identity_and_read_none_of_it() {
+    let scratch = Scratch::new();
+    let roles = roles("identity");
+    let _cleanup = UsersGuard(
+        &scratch.admin,
+        vec![roles.ingest_user.clone(), roles.query_user.clone()],
+    );
+    scratch.store.provision_roles(&roles).expect("provision");
+    let ingest = user_store(
+        &scratch.database,
+        &roles.ingest_user,
+        &roles.ingest_password,
+    );
+    let t = now_ms();
+    ingest
+        .insert_alias_lines(
+            &Store::encode_aliases(&[alias("a1", "u1", t)]).expect("encode"),
+            "role-alias",
+        )
+        .expect("the ingest user links");
+    ingest
+        .insert_traits_lines(
+            &Store::encode_traits(&[TraitsRow {
+                site_id: 7,
+                user_id: "u1".to_owned(),
+                traits_str: vec![],
+                traits_num: vec![],
+                updated_ms: t,
+            }])
+            .expect("encode"),
+            "role-traits",
+        )
+        .expect("and stores traits");
+    for sql in [
+        "SELECT count() FROM identity_alias",
+        "SELECT count() FROM user_traits",
+        "ALTER TABLE identity_alias DELETE WHERE 1",
+    ] {
+        let error = ingest.raw_query(sql).expect_err(sql);
+        assert!(denied(&error), "{sql}: {error:?}");
+    }
+    assert_eq!(count(&scratch.store, "identity_alias"), 1);
+    assert_eq!(count(&scratch.store, "user_traits"), 1);
 }
