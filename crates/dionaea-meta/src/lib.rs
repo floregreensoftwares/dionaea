@@ -26,7 +26,8 @@ mod sqlite;
 mod tests;
 
 pub use erasure::{
-    ErasureRequest, ErasureState, ErasureSummary, IdKind, Tombstones, tombstone_hash,
+    ErasureRequest, ErasureState, ErasureSummary, IdKind, TombstoneBatch, Tombstones,
+    tombstone_hash,
 };
 pub use sqlite::SqliteMeta;
 
@@ -128,8 +129,6 @@ pub struct Snapshot {
     /// Operational settings stored by an operator, by name. The meaning of a
     /// name and its range belong to whoever reads it.
     pub settings: BTreeMap<String, StoredSetting>,
-    /// Hashes of erased users and of their devices.
-    pub tombstones: Tombstones,
 }
 
 #[derive(Debug)]
@@ -291,6 +290,12 @@ pub trait MetaStore: Send + Sync {
 
     /// Puts a failed request back to `requested`.
     fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError>;
+
+    /// The tombstones made after position `after` (0 for all), oldest first,
+    /// at most `limit`. They are never removed, so a node that remembers the
+    /// last position it saw learns of new ones without reading the rest;
+    /// [`Tombstones::load_from`] does this.
+    fn tombstones_since(&self, after: u64, limit: usize) -> Result<TombstoneBatch, MetaError>;
 
     /// Records trouble that retrying may fix on a request that is not
     /// finished: it is let go and not claimed again for `retry_in_secs`; after

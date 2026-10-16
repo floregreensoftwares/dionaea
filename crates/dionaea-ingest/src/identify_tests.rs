@@ -186,7 +186,11 @@ fn with_erased(schemas: &[&str]) -> Admission {
         .expect("anons");
     let admission = admission(schemas);
     Admission {
-        tombstones: Arc::new(meta.snapshot().expect("snapshot").tombstones),
+        tombstones: {
+            let all = dionaea_meta::Tombstones::default();
+            all.load_from(&meta).expect("tombstones");
+            Arc::new(all)
+        },
         ..admission
     }
 }

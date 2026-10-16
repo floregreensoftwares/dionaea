@@ -5,7 +5,7 @@ use dionaea_core::is_id;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 
 use crate::erasure::{
-    ErasureRequest, ErasureState, ErasureSummary, IdKind, Tombstones, tombstone_hash,
+    ErasureRequest, ErasureState, ErasureSummary, IdKind, TombstoneBatch, tombstone_hash,
 };
 use crate::sqlite::{bump, id_of, storage};
 use crate::{MAX_LABEL_LEN, MetaError};
@@ -344,22 +344,40 @@ pub(crate) fn retry(tx: &Transaction<'_>, id: u64) -> Result<ErasureRequest, Met
     get(tx, id)
 }
 
-pub(crate) fn tombstones(tx: &Transaction<'_>) -> Result<Tombstones, MetaError> {
+/// The tombstones made after position `after`, oldest first, at most `limit`.
+pub(crate) fn tombstones_since(
+    tx: &Transaction<'_>,
+    after: u64,
+    limit: usize,
+) -> Result<TombstoneBatch, MetaError> {
     let mut statement = tx
-        .prepare("SELECT site_id, kind, hash FROM erasure_tombstones")
+        .prepare(
+            "SELECT rowid, site_id, kind, hash FROM erasure_tombstones
+             WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+        )
         .map_err(storage)?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
+        .query_map(
+            params![
+                i64::try_from(after).unwrap_or(i64::MAX),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
         .map_err(storage)?;
-    let mut all = Tombstones::default();
+    let mut batch = TombstoneBatch {
+        last: after,
+        entries: Vec::new(),
+    };
     for row in rows {
-        let (site, kind, hash) = row.map_err(storage)?;
+        let (position, site, kind, hash) = row.map_err(storage)?;
         let kind = match kind.as_str() {
             "user" => IdKind::User,
             "anon" => IdKind::Anon,
@@ -369,9 +387,10 @@ pub(crate) fn tombstones(tx: &Transaction<'_>) -> Result<Tombstones, MetaError> 
                 )));
             }
         };
-        all.insert(id_of(site)?, kind, hash);
+        batch.last = u64::try_from(position).unwrap_or(batch.last);
+        batch.entries.push((id_of(site)?, kind, hash));
     }
-    Ok(all)
+    Ok(batch)
 }
 
 /// Records trouble that retrying may fix: the request is let go, not tried

@@ -710,6 +710,13 @@ fn settings_survive_a_reopen() {
 
 // Erasure requests and tombstones.
 
+/// The tombstones a node would hold after loading them all.
+fn tombstones(store: &SqliteMeta) -> Tombstones {
+    let all = Tombstones::default();
+    all.load_from(store).unwrap();
+    all
+}
+
 fn clocked() -> (SqliteMeta, Arc<AtomicI64>) {
     let now = Arc::new(AtomicI64::new(1_000));
     let clock = Arc::clone(&now);
@@ -734,7 +741,7 @@ fn a_request_is_recorded_and_tombstones_the_user_at_once() {
     assert_eq!(request.requested_by, "ops");
     assert!(store.generation().unwrap() > before, "nodes must reload");
 
-    let tombstones = store.snapshot().unwrap().tombstones;
+    let tombstones = tombstones(&store);
     assert!(tombstones.user_erased(site.id, "u_42"));
     assert!(!tombstones.user_erased(site.id, "u_43"));
     assert!(!tombstones.user_erased(site.id + 1, "u_42"), "per site");
@@ -796,7 +803,7 @@ fn a_request_needs_a_site_a_user_id_shape_and_a_requester() {
         );
     }
     assert!(store.erasure_requests(None).unwrap().is_empty());
-    assert!(store.snapshot().unwrap().tombstones.is_empty());
+    assert!(tombstones(&store).is_empty());
 }
 
 #[test]
@@ -815,7 +822,7 @@ fn anonymous_ids_found_for_the_user_become_tombstones() {
     );
     assert_eq!(store.erasure_request(request.id).unwrap().anon_count, 2);
 
-    let tombstones = store.snapshot().unwrap().tombstones;
+    let tombstones = tombstones(&store);
     assert!(tombstones.anon_erased(site.id, "a1") && tombstones.anon_erased(site.id, "a2"));
     assert!(!tombstones.anon_erased(site.id, "a3"));
     assert!(!tombstones.anon_erased(site.id + 1, "a1"));
@@ -873,11 +880,7 @@ fn a_request_moves_forward_only_and_completing_forgets_the_user_id_but_not_its_h
         ));
     }
     assert!(
-        store
-            .snapshot()
-            .unwrap()
-            .tombstones
-            .user_erased(site.id, "u_42"),
+        tombstones(&store).user_erased(site.id, "u_42"),
         "the tombstone outlives the request"
     );
 }
@@ -1001,7 +1004,7 @@ fn tombstones_survive_reopening_the_database() {
         site.id
     };
     let store = SqliteMeta::open(&path).unwrap();
-    let tombstones = store.snapshot().unwrap().tombstones;
+    let tombstones = tombstones(&store);
     assert!(tombstones.user_erased(site_id, "u_42") && tombstones.anon_erased(site_id, "a1"));
     assert_eq!(tombstones.len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1053,11 +1056,7 @@ fn the_devices_are_kept_in_the_clear_only_until_the_request_completes() {
         .unwrap();
     assert!(store.erasure_anons(request.id).unwrap().is_empty());
     assert!(
-        store
-            .snapshot()
-            .unwrap()
-            .tombstones
-            .anon_erased(site.id, "a"),
+        tombstones(&store).anon_erased(site.id, "a"),
         "only the hashes remain, and they keep blocking"
     );
     assert!(matches!(
@@ -1225,5 +1224,86 @@ fn the_summary_counts_states_waiting_retries_and_the_oldest_open_request() {
         store.erasure_summary().unwrap().retrying,
         0,
         "the time came"
+    );
+}
+
+// Loading tombstones as they come.
+
+#[test]
+fn a_node_asks_only_for_the_tombstones_made_since_it_last_looked() {
+    let store = store();
+    let site = site(&store);
+    let held = Tombstones::default();
+    assert_eq!(held.load_from(&store).unwrap(), 0);
+    assert_eq!(held.last_seen(), 0);
+
+    let first = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    assert_eq!(held.load_from(&store).unwrap(), 1);
+    let seen = held.last_seen();
+    assert!(seen > 0);
+    assert!(held.user_erased(site.id, "u_1"));
+
+    // Nothing new: nothing is read again.
+    assert_eq!(held.load_from(&store).unwrap(), 0);
+    assert_eq!(held.last_seen(), seen);
+    let batch = store.tombstones_since(seen, 100).unwrap();
+    assert!(batch.entries.is_empty());
+    assert_eq!(batch.last, seen, "the position asked from comes back");
+
+    store
+        .add_erasure_anons(first.id, &["a1".to_owned(), "a2".to_owned()])
+        .unwrap();
+    store.request_erasure(site.id, "u_2", "ops").unwrap();
+    let batch = store.tombstones_since(seen, 100).unwrap();
+    assert_eq!(batch.entries.len(), 3, "only what came after");
+    assert_eq!(held.load_from(&store).unwrap(), 3);
+    assert_eq!(held.len(), 4);
+    assert!(held.anon_erased(site.id, "a2") && held.user_erased(site.id, "u_2"));
+}
+
+#[test]
+fn many_tombstones_are_read_in_batches_and_none_is_lost_or_counted_twice() {
+    let store = store();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let anons: Vec<String> = (0..25_000).map(|n| format!("anon_{n}")).collect();
+    store.add_erasure_anons(request.id, &anons).unwrap();
+
+    let held = Tombstones::default();
+    assert_eq!(held.load_from(&store).unwrap(), 25_001);
+    assert_eq!(held.len(), 25_001);
+    assert!(held.anon_erased(site.id, "anon_0"));
+    assert!(held.anon_erased(site.id, "anon_24999"));
+    assert!(!held.anon_erased(site.id, "anon_25000"));
+
+    // A second node loading while the first keeps going gets the same set.
+    let other = Tombstones::default();
+    other.load_from(&store).unwrap();
+    other.load_from(&store).unwrap();
+    assert_eq!(other.len(), held.len());
+    let page = store.tombstones_since(0, 10).unwrap();
+    assert_eq!(page.entries.len(), 10);
+    let next = store.tombstones_since(page.last, 10).unwrap();
+    assert_eq!(next.entries.len(), 10);
+    assert_ne!(page.entries[0], next.entries[0]);
+}
+
+#[test]
+fn the_memory_kept_for_a_tombstone_is_a_short_digest_of_its_hash() {
+    let store = store();
+    let site = site(&store);
+    store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let held = Tombstones::default();
+    held.load_from(&store).unwrap();
+    // The answer is the same as from the full hash, for the same identifier
+    // and not for another.
+    assert!(held.user_erased(site.id, "u_1"));
+    assert!(!held.user_erased(site.id, "u_2"));
+    assert!(!held.user_erased(site.id + 1, "u_1"));
+    assert!(!held.anon_erased(site.id, "u_1"));
+    let empty = Tombstones::default();
+    assert!(
+        !empty.user_erased(site.id, "u_1"),
+        "nothing loaded, nothing erased"
     );
 }

@@ -16,7 +16,7 @@ use crate::migrations::MIGRATIONS;
 use crate::{
     ErasureRequest, ErasureState, ErasureSummary, KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS,
     MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError, MetaStore, Organization, Published,
-    SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting, WriteKeyInfo,
+    SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting, TombstoneBatch, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -809,6 +809,10 @@ impl MetaStore for SqliteMeta {
         self.write(|tx, at| erasure_sql::trouble(tx, id, message, retry_in_secs, max_attempts, at))
     }
 
+    fn tombstones_since(&self, after: u64, limit: usize) -> Result<TombstoneBatch, MetaError> {
+        self.read(|tx| erasure_sql::tombstones_since(tx, after, limit))
+    }
+
     fn erasure_summary(&self) -> Result<ErasureSummary, MetaError> {
         let at = (self.clock)();
         self.read(|tx| erasure_sql::summary(tx, at))
@@ -905,7 +909,6 @@ impl MetaStore for SqliteMeta {
                 keys,
                 schemas,
                 settings: settings_of(tx)?,
-                tombstones: erasure_sql::tombstones(tx)?,
             })
         })
     }

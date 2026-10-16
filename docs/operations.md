@@ -223,6 +223,8 @@ Rows that were already in a server's spool are left out when they are inserted, 
 
 Guarantee, with the defaults: invisible to queries within a few seconds of the request reaching a server that has reloaded the metadata, and gone from disk within a day and the time one rewrite takes. If a device is shared, erasing one user removes the rows of every device that was ever linked to them, including another user's on the same device.
 
+Tombstones are never removed, so a server learns of new ones by asking only for what came after the last it saw, in batches, and keeps 128 bits of each hash (a few dozen bytes with the set's overhead: a million erased devices are tens of megabytes). A metadata change that adds none reads none.
+
 What the metadata store keeps: the user id and the devices in the clear until the request is complete, then only SHA-256 hashes (not salted: someone holding the metadata file can test whether a guessable id was erased) and an audit line (who asked, when, counts). `event_ids` holds only random event ids and expires after a day; the rollups hold no identifier.
 
 Metrics: `dionaea_identifies_total{result="erased"}`, `dionaea_batcher_erased_rows_total`, and drops with reason `erased` in `dionaea_events_dropped_total`.

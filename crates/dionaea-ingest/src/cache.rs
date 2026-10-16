@@ -52,13 +52,15 @@ struct Table {
     keys: HashMap<String, KeyEntry>,
     schemas: HashMap<u32, Arc<[(u32, Schema)]>>,
     settings: BTreeMap<String, StoredSetting>,
-    tombstones: Arc<Tombstones>,
 }
 
 /// Keys and schemas, shared by every request.
 #[derive(Debug, Default)]
 pub struct Cache {
     table: RwLock<Arc<Table>>,
+    /// Never removed from, only added to: shared by every request and updated
+    /// in place when the metadata changes.
+    tombstones: Arc<Tombstones>,
 }
 
 impl Cache {
@@ -79,7 +81,7 @@ impl Cache {
 
     /// The erased users and devices, as of the generation the cache holds.
     pub fn tombstones(&self) -> Arc<Tombstones> {
-        Arc::clone(&self.current().tombstones)
+        Arc::clone(&self.tombstones)
     }
 
     /// The generation of the data the cache holds.
@@ -96,13 +98,15 @@ impl Cache {
             return Ok(false);
         }
         let snapshot = store.snapshot()?;
+        // Before the new keys are installed, so that a key is never admitted
+        // in a moment when an erasure made before it is not known yet.
+        self.tombstones.load_from(store)?;
         let mut table = Table {
             loaded: true,
             generation: snapshot.generation,
             keys: HashMap::with_capacity(snapshot.keys.len()),
             schemas: HashMap::with_capacity(snapshot.schemas.len()),
             settings: snapshot.settings,
-            tombstones: Arc::new(snapshot.tombstones),
         };
         for key in snapshot.keys {
             table.keys.insert(
@@ -161,7 +165,7 @@ impl Cache {
         Ok(Admission {
             site_id: entry.site_id,
             schemas,
-            tombstones: Arc::clone(&table.tombstones),
+            tombstones: Arc::clone(&self.tombstones),
         })
     }
 }

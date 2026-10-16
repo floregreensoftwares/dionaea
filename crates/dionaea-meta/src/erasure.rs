@@ -16,8 +16,11 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use sha2::{Digest, Sha256};
+
+use crate::{MetaError, MetaStore};
 
 /// Where a request is. The job moves it forward one step at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,59 +119,137 @@ impl IdKind {
     }
 }
 
-/// The tombstone hash of an identifier, in lowercase hex.
-pub fn tombstone_hash(site_id: u32, kind: IdKind, id: &str) -> String {
+fn digest(site_id: u32, kind: IdKind, id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"dionaea/erasure/v1\0");
     hasher.update(kind.as_str().as_bytes());
     hasher.update([0]);
     hasher.update(site_id.to_le_bytes());
     hasher.update(id.as_bytes());
-    let digest = hasher.finalize();
+    hasher.finalize().into()
+}
+
+/// The tombstone hash of an identifier, in lowercase hex.
+pub fn tombstone_hash(site_id: u32, kind: IdKind, id: &str) -> String {
     let mut hex = String::with_capacity(64);
-    for byte in digest {
+    for byte in digest(site_id, kind, id) {
         hex.push(char::from(b"0123456789abcdef"[usize::from(byte >> 4)]));
         hex.push(char::from(b"0123456789abcdef"[usize::from(byte & 15)]));
     }
     hex
 }
 
-/// Every tombstone, for the ingest path to consult without a query.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Tombstones {
-    users: HashSet<(u32, String)>,
-    anons: HashSet<(u32, String)>,
+/// The first 128 bits of a stored hash: what a node keeps in memory. Two
+/// different identifiers sharing them is as unlikely as a collision of the
+/// whole hash would be for a set of any size that fits in memory.
+fn short(hex: &str) -> Option<u128> {
+    u128::from_str_radix(hex.get(..32)?, 16).ok()
 }
 
+fn short_of(site_id: u32, kind: IdKind, id: &str) -> u128 {
+    let digest = digest(site_id, kind, id);
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(head)
+}
+
+/// New tombstones, in the order they were made, and where to ask from next.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TombstoneBatch {
+    /// The position of the last entry (or the position asked from when there
+    /// are none).
+    pub last: u64,
+    /// Site, kind and stored hash of each.
+    pub entries: Vec<(u32, IdKind, String)>,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    users: HashSet<(u32, u128)>,
+    anons: HashSet<(u32, u128)>,
+    last: u64,
+}
+
+/// Every tombstone, for the ingest path to consult without a query. They are
+/// never removed, so a node learns of new ones by asking only for what came
+/// after the last it saw, and keeps 128 bits of each hash.
+#[derive(Debug, Default)]
+pub struct Tombstones {
+    inner: RwLock<Inner>,
+}
+
+/// How many tombstones one read of the store returns.
+const BATCH: usize = 10_000;
+
 impl Tombstones {
-    pub(crate) fn insert(&mut self, site_id: u32, kind: IdKind, hash: String) {
-        match kind {
-            IdKind::User => self.users.insert((site_id, hash)),
-            IdKind::Anon => self.anons.insert((site_id, hash)),
-        };
+    fn read(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds what the store has made since the last call. Returns how many
+    /// were new.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read; what was added before stays.
+    pub fn load_from(&self, store: &dyn MetaStore) -> Result<usize, MetaError> {
+        let mut added = 0;
+        loop {
+            let after = self.read().last;
+            let batch = store.tombstones_since(after, BATCH)?;
+            if batch.entries.is_empty() {
+                return Ok(added);
+            }
+            let full = batch.entries.len() >= BATCH;
+            let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+            for (site, kind, hash) in &batch.entries {
+                let Some(short) = short(hash) else {
+                    return Err(MetaError::Corrupt("a tombstone is not a hash".to_owned()));
+                };
+                let fresh = match kind {
+                    IdKind::User => inner.users.insert((*site, short)),
+                    IdKind::Anon => inner.anons.insert((*site, short)),
+                };
+                added += usize::from(fresh);
+            }
+            inner.last = inner.last.max(batch.last);
+            drop(inner);
+            if !full {
+                return Ok(added);
+            }
+        }
+    }
+
+    /// The position of the last tombstone this holds (0 when none).
+    pub fn last_seen(&self) -> u64 {
+        self.read().last
     }
 
     pub fn is_empty(&self) -> bool {
-        self.users.is_empty() && self.anons.is_empty()
+        let inner = self.read();
+        inner.users.is_empty() && inner.anons.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.users.len() + self.anons.len()
+        let inner = self.read();
+        inner.users.len() + inner.anons.len()
     }
 
     /// Whether this user of the site was erased or is being erased.
     pub fn user_erased(&self, site_id: u32, user_id: &str) -> bool {
-        !self.users.is_empty()
-            && self
+        let inner = self.read();
+        !inner.users.is_empty()
+            && inner
                 .users
-                .contains(&(site_id, tombstone_hash(site_id, IdKind::User, user_id)))
+                .contains(&(site_id, short_of(site_id, IdKind::User, user_id)))
     }
 
     /// Whether this device of the site belonged to an erased user.
     pub fn anon_erased(&self, site_id: u32, anon_id: &str) -> bool {
-        !self.anons.is_empty()
-            && self
+        let inner = self.read();
+        !inner.anons.is_empty()
+            && inner
                 .anons
-                .contains(&(site_id, tombstone_hash(site_id, IdKind::Anon, anon_id)))
+                .contains(&(site_id, short_of(site_id, IdKind::Anon, anon_id)))
     }
 }
