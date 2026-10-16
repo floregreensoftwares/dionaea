@@ -18,11 +18,14 @@ use std::fmt;
 
 use dionaea_core::{Change, Diagnostic, Schema};
 
+mod erasure;
+mod erasure_sql;
 mod migrations;
 mod sqlite;
 #[cfg(test)]
 mod tests;
 
+pub use erasure::{ErasureRequest, ErasureState, IdKind, Tombstones, tombstone_hash};
 pub use sqlite::SqliteMeta;
 
 /// Most origins one write key may allow.
@@ -123,6 +126,8 @@ pub struct Snapshot {
     /// Operational settings stored by an operator, by name. The meaning of a
     /// name and its range belong to whoever reads it.
     pub settings: BTreeMap<String, StoredSetting>,
+    /// Hashes of erased users and of their devices.
+    pub tombstones: Tombstones,
 }
 
 #[derive(Debug)]
@@ -231,6 +236,53 @@ pub trait MetaStore: Send + Sync {
         effective_at_ms: i64,
         now_ms: i64,
     ) -> Result<(), MetaError>;
+
+    /// Records a request to erase a user of a site, and from this moment the
+    /// ingest path drops anything of that user. A request still unfinished for
+    /// the same user is returned instead of a second one. Moves the
+    /// generation.
+    fn request_erasure(
+        &self,
+        site_id: u32,
+        user_id: &str,
+        requested_by: &str,
+    ) -> Result<ErasureRequest, MetaError>;
+
+    fn erasure_request(&self, id: u64) -> Result<ErasureRequest, MetaError>;
+
+    /// The requests, oldest first; only those in `state` when given.
+    fn erasure_requests(
+        &self,
+        state: Option<ErasureState>,
+    ) -> Result<Vec<ErasureRequest>, MetaError>;
+
+    /// Takes the oldest request in `state` that no worker holds, for
+    /// `lease_secs`; a worker that dies lets go of it by the lease running
+    /// out. `None` when there is nothing to take.
+    fn claim_erasure(
+        &self,
+        state: ErasureState,
+        worker: &str,
+        lease_secs: i64,
+    ) -> Result<Option<ErasureRequest>, MetaError>;
+
+    /// Tombstones the anonymous ids found linked to the user of a request that
+    /// is still `requested`. Returns how many were new; moves the generation
+    /// when any was.
+    fn add_erasure_anons(&self, id: u64, anon_ids: &[String]) -> Result<u64, MetaError>;
+
+    /// Moves a request: `requested` to `hidden` to `complete`, or either to
+    /// `failed`. `detail` says what the job did or why it failed. Completing
+    /// clears the user id and keeps its hash.
+    fn advance_erasure(
+        &self,
+        id: u64,
+        to: ErasureState,
+        detail: Option<&str>,
+    ) -> Result<ErasureRequest, MetaError>;
+
+    /// Puts a failed request back to `requested`.
+    fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError>;
 
     /// The live keys and active schema versions of every site.
     fn snapshot(&self) -> Result<Snapshot, MetaError>;

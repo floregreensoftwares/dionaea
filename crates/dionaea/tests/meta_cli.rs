@@ -144,3 +144,75 @@ fn an_unusable_store_exits_2() {
     assert_eq!(output.status.code(), Some(2), "{}", err(&output));
     assert!(err(&output).contains("cannot open"), "{}", err(&output));
 }
+
+#[test]
+fn an_operator_can_ask_for_an_erasure_list_it_and_retry_a_failed_one() {
+    let dir = dir("erase");
+    let db = dir.join("meta.db");
+    assert_eq!(run(&db, &["site", "create", "shop"]).status.code(), Some(0));
+
+    let asked = run(
+        &db,
+        &[
+            "erase", "request", "--site", "1", "--user", "u_42", "--by", "ops",
+        ],
+    );
+    assert_eq!(asked.status.code(), Some(0), "{}", err(&asked));
+    let line = out(&asked);
+    let fields: Vec<&str> = line.trim_end().split('\t').collect();
+    assert_eq!(&fields[..4], &["1", "1", "requested", "ops"], "{line}");
+    assert_eq!(&fields[5..8], &["-", "-", "0"]);
+    assert_eq!(fields[8].len(), 64, "the hash of the user id");
+    assert!(!line.contains("u_42"), "the user id is never printed");
+
+    // The same user again is the same request.
+    let again = run(&db, &["erase", "request", "--site", "1", "--user", "u_42"]);
+    assert_eq!(out(&again), line);
+
+    let listed = run(&db, &["erase", "list"]);
+    assert_eq!(out(&listed), line);
+    let none = run(&db, &["erase", "list", "--state", "complete"]);
+    assert_eq!((none.status.code(), out(&none).as_str()), (Some(0), ""));
+    let shown = run(&db, &["erase", "show", "1"]);
+    assert_eq!(out(&shown), line);
+
+    let retry = run(&db, &["erase", "retry", "1"]);
+    assert_eq!(retry.status.code(), Some(1), "only a failed one");
+    assert!(
+        err(&retry).contains("only a failed request"),
+        "{}",
+        err(&retry)
+    );
+}
+
+#[test]
+fn erase_refuses_what_it_cannot_do_with_a_clear_message() {
+    let dir = dir("erase-refused");
+    let db = dir.join("meta.db");
+    assert_eq!(run(&db, &["site", "create", "shop"]).status.code(), Some(0));
+
+    let no_site = run(&db, &["erase", "request", "--site", "9", "--user", "u_1"]);
+    assert_eq!(no_site.status.code(), Some(1));
+    assert!(
+        err(&no_site).contains("site not found"),
+        "{}",
+        err(&no_site)
+    );
+
+    let email = run(&db, &["erase", "request", "--site", "1", "--user", "a@b.c"]);
+    assert_eq!(email.status.code(), Some(1));
+    assert!(err(&email).contains("user id"), "{}", err(&email));
+
+    let state = run(&db, &["erase", "list", "--state", "later"]);
+    assert_eq!(state.status.code(), Some(1));
+    assert!(err(&state).contains("not a state"), "{}", err(&state));
+
+    let missing = run(&db, &["erase", "show", "7"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        err(&missing).contains("erasure request not found"),
+        "{}",
+        err(&missing)
+    );
+    assert_eq!(out(&run(&db, &["erase", "list"])), "");
+}

@@ -447,7 +447,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 2,
+        migrations, 3,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
@@ -706,4 +706,303 @@ fn settings_survive_a_reopen() {
     let stored = store.settings().expect("settings")["key_burst"].clone();
     assert_eq!(stored.at(NOW + 10_000), Some("123"));
     assert_eq!(stored.effective_at_ms, NOW + 10_000);
+}
+
+// Erasure requests and tombstones.
+
+fn clocked() -> (SqliteMeta, Arc<AtomicI64>) {
+    let now = Arc::new(AtomicI64::new(1_000));
+    let clock = Arc::clone(&now);
+    (
+        store().with_clock(move || clock.load(Ordering::SeqCst)),
+        now,
+    )
+}
+
+#[test]
+fn a_request_is_recorded_and_tombstones_the_user_at_once() {
+    let store = store();
+    let site = site(&store);
+    let before = store.generation().unwrap();
+    let request = store.request_erasure(site.id, "u_42", "ops").unwrap();
+    assert_eq!(request.state, ErasureState::Requested);
+    assert_eq!(request.user_id.as_deref(), Some("u_42"));
+    assert_eq!(
+        request.user_hash,
+        tombstone_hash(site.id, IdKind::User, "u_42")
+    );
+    assert_eq!(request.requested_by, "ops");
+    assert!(store.generation().unwrap() > before, "nodes must reload");
+
+    let tombstones = store.snapshot().unwrap().tombstones;
+    assert!(tombstones.user_erased(site.id, "u_42"));
+    assert!(!tombstones.user_erased(site.id, "u_43"));
+    assert!(!tombstones.user_erased(site.id + 1, "u_42"), "per site");
+    assert!(
+        !tombstones.anon_erased(site.id, "u_42"),
+        "a user is not a device"
+    );
+}
+
+#[test]
+fn an_unfinished_request_for_the_same_user_is_returned_not_duplicated() {
+    let store = store();
+    let site = site(&store);
+    let first = store.request_erasure(site.id, "u_42", "ops").unwrap();
+    let generation = store.generation().unwrap();
+    let second = store
+        .request_erasure(site.id, "u_42", "someone else")
+        .unwrap();
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.requested_by, "ops");
+    assert_eq!(store.generation().unwrap(), generation);
+    assert_eq!(store.erasure_requests(None).unwrap().len(), 1);
+
+    // Once complete, a new request is a new one.
+    store
+        .advance_erasure(first.id, ErasureState::Hidden, None)
+        .unwrap();
+    store
+        .advance_erasure(first.id, ErasureState::Complete, None)
+        .unwrap();
+    let again = store.request_erasure(site.id, "u_42", "ops").unwrap();
+    assert_ne!(again.id, first.id);
+}
+
+#[test]
+fn a_request_needs_a_site_a_user_id_shape_and_a_requester() {
+    let store = store();
+    let site = site(&store);
+    assert!(matches!(
+        store.request_erasure(site.id + 9, "u_42", "ops"),
+        Err(MetaError::NotFound("site"))
+    ));
+    for bad in ["", "a@b.c", "has space", &"x".repeat(65)] {
+        assert!(
+            matches!(
+                store.request_erasure(site.id, bad, "ops"),
+                Err(MetaError::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    for bad in ["", "  ", "bad\nname"] {
+        assert!(
+            matches!(
+                store.request_erasure(site.id, "u_42", bad),
+                Err(MetaError::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(store.erasure_requests(None).unwrap().is_empty());
+    assert!(store.snapshot().unwrap().tombstones.is_empty());
+}
+
+#[test]
+fn anonymous_ids_found_for_the_user_become_tombstones() {
+    let store = store();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_42", "ops").unwrap();
+    let ids = vec!["a1".to_owned(), "a2".to_owned(), "not valid!".to_owned()];
+    let generation = store.generation().unwrap();
+    assert_eq!(store.add_erasure_anons(request.id, &ids).unwrap(), 2);
+    assert!(store.generation().unwrap() > generation);
+    assert_eq!(
+        store.add_erasure_anons(request.id, &ids).unwrap(),
+        0,
+        "again adds none"
+    );
+    assert_eq!(store.erasure_request(request.id).unwrap().anon_count, 2);
+
+    let tombstones = store.snapshot().unwrap().tombstones;
+    assert!(tombstones.anon_erased(site.id, "a1") && tombstones.anon_erased(site.id, "a2"));
+    assert!(!tombstones.anon_erased(site.id, "a3"));
+    assert!(!tombstones.anon_erased(site.id + 1, "a1"));
+
+    store
+        .advance_erasure(request.id, ErasureState::Hidden, None)
+        .unwrap();
+    assert!(matches!(
+        store.add_erasure_anons(request.id, &ids),
+        Err(MetaError::Conflict(_))
+    ));
+}
+
+#[test]
+fn a_request_moves_forward_only_and_completing_forgets_the_user_id_but_not_its_hash() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_42", "ops").unwrap();
+    assert_eq!(request.requested_at, 1_000);
+    assert!(matches!(
+        store.advance_erasure(request.id, ErasureState::Complete, None),
+        Err(MetaError::Conflict(_))
+    ));
+    now.store(2_000, Ordering::SeqCst);
+    let hidden = store
+        .advance_erasure(request.id, ErasureState::Hidden, Some("events 3"))
+        .unwrap();
+    assert_eq!(
+        (hidden.state, hidden.hidden_at),
+        (ErasureState::Hidden, Some(2_000))
+    );
+    assert_eq!(
+        hidden.user_id.as_deref(),
+        Some("u_42"),
+        "still needed by the job"
+    );
+    now.store(3_000, Ordering::SeqCst);
+    let done = store
+        .advance_erasure(request.id, ErasureState::Complete, Some("verified"))
+        .unwrap();
+    assert_eq!(done.state, ErasureState::Complete);
+    assert_eq!(done.completed_at, Some(3_000));
+    assert_eq!(done.hidden_at, Some(2_000));
+    assert_eq!(done.user_id, None, "the id is forgotten");
+    assert_eq!(done.user_hash, request.user_hash, "the audit hash stays");
+    assert_eq!(done.detail.as_deref(), Some("verified"));
+    for to in [
+        ErasureState::Requested,
+        ErasureState::Hidden,
+        ErasureState::Failed,
+    ] {
+        assert!(matches!(
+            store.advance_erasure(request.id, to, None),
+            Err(MetaError::Conflict(_))
+        ));
+    }
+    assert!(
+        store
+            .snapshot()
+            .unwrap()
+            .tombstones
+            .user_erased(site.id, "u_42"),
+        "the tombstone outlives the request"
+    );
+}
+
+#[test]
+fn a_failed_request_can_be_retried_and_only_a_failed_one() {
+    let store = store();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_42", "ops").unwrap();
+    assert!(matches!(
+        store.retry_erasure(request.id),
+        Err(MetaError::Conflict(_))
+    ));
+    let failed = store
+        .advance_erasure(request.id, ErasureState::Failed, Some("clickhouse down"))
+        .unwrap();
+    assert_eq!(failed.detail.as_deref(), Some("clickhouse down"));
+    let retried = store.retry_erasure(request.id).unwrap();
+    assert_eq!(
+        (retried.state, retried.detail),
+        (ErasureState::Requested, None)
+    );
+    assert!(matches!(
+        store.retry_erasure(999),
+        Err(MetaError::NotFound("erasure request"))
+    ));
+}
+
+#[test]
+fn a_worker_holds_a_request_until_its_lease_runs_out() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    let first = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let second = store.request_erasure(site.id, "u_2", "ops").unwrap();
+    assert!(
+        store
+            .claim_erasure(ErasureState::Hidden, "a", 60)
+            .unwrap()
+            .is_none()
+    );
+
+    let one = store
+        .claim_erasure(ErasureState::Requested, "a", 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.id, first.id, "oldest first");
+    let two = store
+        .claim_erasure(ErasureState::Requested, "b", 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(two.id, second.id, "the first is held");
+    assert!(
+        store
+            .claim_erasure(ErasureState::Requested, "c", 60)
+            .unwrap()
+            .is_none()
+    );
+
+    now.store(1_000 + 61, Ordering::SeqCst);
+    let again = store
+        .claim_erasure(ErasureState::Requested, "c", 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.id, first.id, "a dead worker lets go");
+
+    // Moving a request on releases it.
+    store
+        .advance_erasure(first.id, ErasureState::Hidden, None)
+        .unwrap();
+    let hidden = store
+        .claim_erasure(ErasureState::Hidden, "d", 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(hidden.id, first.id);
+}
+
+#[test]
+fn requests_are_listed_by_state_and_a_hash_is_stable_and_not_the_id() {
+    let store = store();
+    let site = site(&store);
+    let a = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let b = store.request_erasure(site.id, "u_2", "ops").unwrap();
+    store
+        .advance_erasure(b.id, ErasureState::Failed, Some("x"))
+        .unwrap();
+    let ids = |state| {
+        store
+            .erasure_requests(state)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(None), vec![a.id, b.id]);
+    assert_eq!(ids(Some(ErasureState::Requested)), vec![a.id]);
+    assert_eq!(ids(Some(ErasureState::Failed)), vec![b.id]);
+
+    let hash = tombstone_hash(1, IdKind::User, "u_1");
+    assert_eq!(hash.len(), 64);
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!hash.contains("u_1"));
+    assert_eq!(hash, tombstone_hash(1, IdKind::User, "u_1"));
+    assert_ne!(hash, tombstone_hash(2, IdKind::User, "u_1"), "site");
+    assert_ne!(hash, tombstone_hash(1, IdKind::Anon, "u_1"), "kind");
+    assert_ne!(hash, tombstone_hash(1, IdKind::User, "u_2"), "id");
+}
+
+#[test]
+fn tombstones_survive_reopening_the_database() {
+    let dir = std::env::temp_dir().join(format!("dionaea-meta-erasure-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meta.db");
+    let site_id = {
+        let store = SqliteMeta::open(&path).unwrap();
+        let site = site(&store);
+        let request = store.request_erasure(site.id, "u_42", "ops").unwrap();
+        store
+            .add_erasure_anons(request.id, &["a1".to_owned()])
+            .unwrap();
+        site.id
+    };
+    let store = SqliteMeta::open(&path).unwrap();
+    let tombstones = store.snapshot().unwrap().tombstones;
+    assert!(tombstones.user_erased(site_id, "u_42") && tombstones.anon_erased(site_id, "a1"));
+    assert_eq!(tombstones.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
 }
