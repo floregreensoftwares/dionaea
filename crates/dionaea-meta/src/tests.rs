@@ -446,7 +446,10 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
     let migrations: i64 = connection
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(migrations, 1);
+    assert_eq!(
+        migrations, 2,
+        "each migration once, however many times it was opened"
+    );
     let mode: String = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("mode");
@@ -528,4 +531,110 @@ fn keys_issued_in_the_same_second_are_listed_in_the_order_they_were_issued() {
         .map(|k| k.key)
         .collect();
     assert_eq!(listed, issued);
+}
+
+#[test]
+fn settings_are_stored_read_replaced_and_removed() {
+    let store = store();
+    assert!(store.settings().expect("settings").is_empty());
+    store.set_setting("key_burst", "900").expect("set");
+    store.set_setting("max_connections", "50").expect("set");
+    store.set_setting("key_burst", "1000").expect("replace");
+    let settings = store.settings().expect("settings");
+    assert_eq!(
+        settings
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect::<Vec<_>>(),
+        [("key_burst", "1000"), ("max_connections", "50")]
+    );
+    assert!(store.unset_setting("key_burst").expect("unset"));
+    assert!(!store.unset_setting("key_burst").expect("unset again"));
+    assert!(!store.unset_setting("never_set").expect("unset missing"));
+    assert_eq!(store.settings().expect("settings").len(), 1);
+}
+
+#[test]
+fn a_setting_moves_the_generation_only_when_it_changes() {
+    let store = store();
+    let start = store.generation().expect("generation");
+    store.set_setting("key_burst", "900").expect("set");
+    let after_set = store.generation().expect("generation");
+    assert!(after_set > start);
+    store.set_setting("key_burst", "900").expect("same value");
+    assert_eq!(
+        store.generation().expect("generation"),
+        after_set,
+        "nothing changed"
+    );
+    store.set_setting("key_burst", "901").expect("new value");
+    let after_change = store.generation().expect("generation");
+    assert!(after_change > after_set);
+    assert!(!store.unset_setting("missing").expect("unset"));
+    assert_eq!(store.generation().expect("generation"), after_change);
+    assert!(store.unset_setting("key_burst").expect("unset"));
+    assert!(store.generation().expect("generation") > after_change);
+}
+
+#[test]
+fn the_snapshot_carries_the_settings_of_its_generation() {
+    let store = store();
+    store.set_setting("address_burst", "7").expect("set");
+    let snapshot = store.snapshot().expect("snapshot");
+    assert_eq!(
+        snapshot.settings.get("address_burst").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(snapshot.generation, store.generation().expect("generation"));
+}
+
+#[test]
+fn bad_setting_names_and_values_are_refused() {
+    let store = store();
+    for name in [
+        "",
+        "Key",
+        "key-burst",
+        "key burst",
+        "é",
+        &"a".repeat(MAX_SETTING_NAME_LEN + 1),
+    ] {
+        assert!(
+            matches!(store.set_setting(name, "1"), Err(MetaError::Invalid(_))),
+            "{name:?}"
+        );
+    }
+    for value in [
+        "",
+        "tab\there",
+        "new\nline",
+        &"9".repeat(MAX_SETTING_VALUE_LEN + 1),
+    ] {
+        assert!(
+            matches!(
+                store.set_setting("key_burst", value),
+                Err(MetaError::Invalid(_))
+            ),
+            "{value:?}"
+        );
+    }
+    assert!(store.settings().expect("settings").is_empty());
+}
+
+#[test]
+fn settings_survive_a_reopen() {
+    let path = temp_path("settings");
+    {
+        let store = SqliteMeta::open(&path).expect("open");
+        store.set_setting("key_burst", "123").expect("set");
+    }
+    let store = SqliteMeta::open(&path).expect("reopen");
+    assert_eq!(
+        store
+            .settings()
+            .expect("settings")
+            .get("key_burst")
+            .map(String::as_str),
+        Some("123")
+    );
 }

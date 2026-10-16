@@ -13,6 +13,7 @@
 //! stored as they are. Their protection is the guard, the limits and the
 //! origin allow-list kept here.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use dionaea_core::{Change, Diagnostic, Schema};
@@ -28,6 +29,9 @@ pub use sqlite::SqliteMeta;
 pub const MAX_ORIGINS: usize = 32;
 /// Longest organization, site or key label, in characters.
 pub const MAX_LABEL_LEN: usize = 64;
+/// Longest setting name and value, in bytes.
+pub const MAX_SETTING_NAME_LEN: usize = 64;
+pub const MAX_SETTING_VALUE_LEN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Organization {
@@ -92,6 +96,9 @@ pub struct Snapshot {
     pub generation: u64,
     pub keys: Vec<KeyEntry>,
     pub schemas: Vec<SiteSchemas>,
+    /// Operational settings stored by an operator, by name. The meaning of a
+    /// name and its range belong to whoever reads it.
+    pub settings: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -182,6 +189,17 @@ pub trait MetaStore: Send + Sync {
     fn retire_schema_version(&self, site_id: u32, version: u32) -> Result<(), MetaError>;
 
     fn schema_versions(&self, site_id: u32) -> Result<Vec<SchemaVersionInfo>, MetaError>;
+
+    /// The operational settings an operator stored, by name.
+    fn settings(&self) -> Result<BTreeMap<String, String>, MetaError>;
+
+    /// Stores a setting, replacing its value. Only the shape of the name
+    /// (lowercase letters, digits and `_`) and the value (printable, not
+    /// empty) is checked here. Changing the stored value moves the generation.
+    fn set_setting(&self, name: &str, value: &str) -> Result<(), MetaError>;
+
+    /// Removes a stored setting. Returns whether it existed.
+    fn unset_setting(&self, name: &str) -> Result<bool, MetaError>;
 
     /// The live keys and active schema versions of every site.
     fn snapshot(&self) -> Result<Snapshot, MetaError>;

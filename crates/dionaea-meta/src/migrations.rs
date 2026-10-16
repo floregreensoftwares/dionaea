@@ -7,10 +7,11 @@ pub(crate) struct Migration {
     pub(crate) sql: &'static str,
 }
 
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "organizations_sites_keys_schemas",
-    sql: "
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "organizations_sites_keys_schemas",
+        sql: "
         CREATE TABLE organizations (
             id         INTEGER PRIMARY KEY,
             name       TEXT NOT NULL UNIQUE,
@@ -50,4 +51,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
         );
         INSERT INTO state (id, generation) VALUES (1, 0);
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "settings",
+        sql: "
+        CREATE TABLE settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+    ",
+    },
+];

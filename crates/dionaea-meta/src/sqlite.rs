@@ -13,8 +13,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::migrations::MIGRATIONS;
 use crate::{
-    KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MetaError, MetaStore, Organization, Published,
-    SchemaVersionInfo, Site, SiteSchemas, Snapshot, WriteKeyInfo,
+    KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError,
+    MetaStore, Organization, Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot,
+    WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -173,6 +174,18 @@ fn bump(tx: &Transaction<'_>) -> Result<(), MetaError> {
     tx.execute("UPDATE state SET generation = generation + 1", [])
         .map_err(storage)?;
     Ok(())
+}
+
+fn settings_of(tx: &Transaction<'_>) -> Result<BTreeMap<String, String>, MetaError> {
+    let mut statement = tx
+        .prepare("SELECT key, value FROM settings ORDER BY key")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage)?;
+    rows.map(|row| row.map_err(storage)).collect()
 }
 
 fn generation_of(tx: &Transaction<'_>) -> Result<u64, MetaError> {
@@ -641,6 +654,61 @@ impl MetaStore for SqliteMeta {
         })
     }
 
+    fn settings(&self) -> Result<BTreeMap<String, String>, MetaError> {
+        self.read(settings_of)
+    }
+
+    fn set_setting(&self, name: &str, value: &str) -> Result<(), MetaError> {
+        if name.is_empty()
+            || name.len() > MAX_SETTING_NAME_LEN
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(MetaError::Invalid(
+                "a setting name is lowercase letters, digits and underscores".to_owned(),
+            ));
+        }
+        if value.is_empty()
+            || value.len() > MAX_SETTING_VALUE_LEN
+            || value.chars().any(char::is_control)
+        {
+            return Err(MetaError::Invalid(format!(
+                "a setting value is 1 to {MAX_SETTING_VALUE_LEN} printable characters"
+            )));
+        }
+        self.write(|tx, at| {
+            let current: Option<String> = tx
+                .query_row("SELECT value FROM settings WHERE key = ?1", [name], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(storage)?;
+            if current.as_deref() == Some(value) {
+                return Ok(());
+            }
+            tx.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+                params![name, value, at],
+            )
+            .map_err(storage)?;
+            bump(tx)
+        })
+    }
+
+    fn unset_setting(&self, name: &str) -> Result<bool, MetaError> {
+        self.write(|tx, _| {
+            let removed = tx
+                .execute("DELETE FROM settings WHERE key = ?1", [name])
+                .map_err(storage)?;
+            if removed > 0 {
+                bump(tx)?;
+            }
+            Ok(removed > 0)
+        })
+    }
+
     fn snapshot(&self) -> Result<Snapshot, MetaError> {
         self.read(|tx| {
             let generation = generation_of(tx)?;
@@ -723,6 +791,7 @@ impl MetaStore for SqliteMeta {
                 generation,
                 keys,
                 schemas,
+                settings: settings_of(tx)?,
             })
         })
     }
