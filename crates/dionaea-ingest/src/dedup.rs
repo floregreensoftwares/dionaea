@@ -70,9 +70,6 @@ impl Deduper {
     /// When the file cannot be read or written.
     pub fn open(capacity: usize, window_ms: u64, path: &Path, now_ms: u64) -> io::Result<Self> {
         let deduper = Self::new(capacity, window_ms);
-        if capacity == 0 {
-            return Ok(deduper);
-        }
         {
             let mut state = deduper.state.lock().unwrap_or_else(PoisonError::into_inner);
             match File::open(path) {
