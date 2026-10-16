@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -17,7 +18,7 @@ use crate::collect::{self, Collect, Settings};
 use crate::config::{Config, clickhouse_endpoint};
 use crate::net::{self, NetControl, NetCounters};
 use crate::ops::{self, Ops, Status};
-use crate::settings::{self, Tuning};
+use crate::settings::{self, Origin, Tuning};
 
 /// The longest wait between attempts to prepare ClickHouse.
 const MIGRATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -62,11 +63,15 @@ struct Node {
 struct Live {
     /// Defaults, file and environment: what stored settings are applied on.
     base: Arc<Tuning>,
+    /// Where each of those values came from, to say what a stored one overrides.
+    origins: Arc<BTreeMap<&'static str, Origin>>,
     current: Arc<RwLock<Arc<Tuning>>>,
     collect: Arc<Collect>,
     control: Arc<NetControl>,
     batcher: Arc<Mutex<Option<Batcher>>>,
     status: Arc<Status>,
+    /// What was last reported in the log, so a standing condition is said once.
+    reported: Arc<Mutex<Vec<String>>>,
 }
 
 fn batcher_config(tuning: &Tuning) -> BatcherConfig {
@@ -84,24 +89,30 @@ impl Live {
         Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Applies the stored settings found in the cache on top of the base.
-    /// Returns what changed, as `name: before -> after`.
-    fn reload(&self) -> Vec<String> {
+    /// Works out the settings in force at `now_ms` from what the cache holds
+    /// and puts them into force if they differ from the ones in force. Returns
+    /// what changed, as `name: before -> after`, and when the next stored
+    /// change is due.
+    ///
+    /// The result depends only on the stored values and the time, so servers
+    /// that read the same store switch at the same moment.
+    fn sync(&self, now_ms: i64) -> (Vec<String>, Option<i64>) {
         let stored = self.collect.cache.settings();
-        let (next, skipped) = self.base.with_stored(&stored);
-        for (name, reason) in &skipped {
-            warn!(setting = %name, %reason, "a stored setting is ignored");
-        }
+        let due = settings::next_change(&stored, now_ms);
+        let resolved = settings::resolve_at(&stored, now_ms);
+        let (next, skipped) = self.base.with_stored(&resolved);
+
         self.status
             .settings_skipped
             .store(skipped.len() as u64, Ordering::Relaxed);
         self.status
             .settings_stored
-            .store(stored.len() as u64, Ordering::Relaxed);
+            .store(resolved.len() as u64, Ordering::Relaxed);
+        self.report(&resolved, &skipped);
 
         let before = self.tuning();
         if *before == next {
-            return Vec::new();
+            return (Vec::new(), due);
         }
         let changed: Vec<String> = settings::SPECS
             .iter()
@@ -116,7 +127,30 @@ impl Live {
             })
             .collect();
         self.put(next);
-        changed
+        (changed, due)
+    }
+
+    /// Says in the log which stored values are ignored and which override the
+    /// file or the environment, once for as long as that stays true.
+    fn report(&self, resolved: &BTreeMap<String, String>, skipped: &[(String, String)]) {
+        let mut lines: Vec<String> = skipped
+            .iter()
+            .map(|(name, reason)| format!("ignored {name}: {reason}"))
+            .collect();
+        lines.extend(
+            settings::overridden(&self.base, &self.origins, resolved)
+                .into_iter()
+                .map(|(name, from, was)| {
+                    format!("{name}: a stored value overrides {} ({was})", from.as_str())
+                }),
+        );
+        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+        if *reported != lines {
+            for line in lines.iter().filter(|line| !reported.contains(line)) {
+                warn!("{line}");
+            }
+            *reported = lines;
+        }
     }
 
     /// Puts `tuning` into force everywhere.
@@ -137,6 +171,11 @@ impl Live {
     }
 }
 
+/// The time now, in milliseconds since the Unix epoch.
+fn now_ms() -> i64 {
+    i64::try_from(collect::system_clock()).unwrap_or(i64::MAX / 2)
+}
+
 impl Node {
     fn start(
         config: &Config,
@@ -152,17 +191,14 @@ impl Node {
             .map_err(|e| format!("cannot read the metadata: {e}"))?;
 
         // The settings an operator stored apply from the first request.
-        let stored = cache.settings();
-        let (tuning, skipped) = config.tuning.with_stored(&stored);
-        for (name, reason) in &skipped {
-            warn!(setting = %name, %reason, "a stored setting is ignored");
-        }
+        let resolved = settings::resolve_at(&cache.settings(), now_ms());
+        let (tuning, skipped) = config.tuning.with_stored(&resolved);
+        status
+            .settings_stored
+            .store(resolved.len() as u64, Ordering::Relaxed);
         status
             .settings_skipped
             .store(skipped.len() as u64, Ordering::Relaxed);
-        status
-            .settings_stored
-            .store(stored.len() as u64, Ordering::Relaxed);
         control.set(tuning.max_connections, tuning.header_timeout);
 
         let mut spool_config = SpoolConfig::new(&config.spool_dir);
@@ -208,6 +244,8 @@ impl Node {
         let batcher = Arc::new(Mutex::new(None));
         let live = Live {
             base: Arc::new(config.tuning.clone()),
+            origins: Arc::new(config.tuning_origins.clone()),
+            reported: Arc::new(Mutex::new(Vec::new())),
             current: Arc::new(RwLock::new(Arc::new(tuning))),
             collect: Arc::clone(&collect),
             control: Arc::clone(control),
@@ -224,11 +262,20 @@ impl Node {
                     // The journal is made durable every second whatever the
                     // refresh interval is, so a crash loses at most a second of
                     // remembered ids; drop counts are written on their own timer.
+                    // Settings are worked out from the clock on every tick, and
+                    // the tick is short while a stored change is waiting for its
+                    // moment, so servers switch within a fraction of a second.
                     let mut last_refresh = Instant::now();
                     let mut last_flush = Instant::now();
+                    let mut due = None::<i64>;
                     while !stop.load(Ordering::Acquire) {
                         let every = live.tuning().refresh_every;
-                        nap(every.min(Duration::from_secs(1)), &stop);
+                        let tick = if due.is_some() {
+                            Duration::from_millis(100)
+                        } else {
+                            every.min(Duration::from_secs(1))
+                        };
+                        nap(tick, &stop);
                         let collect = &live.collect;
                         if let Err(error) = collect.sync_dedup() {
                             warn!(%error, "cannot write the event id journal");
@@ -239,24 +286,25 @@ impl Node {
                             last_flush = Instant::now();
                             collect.flush_drops();
                         }
-                        if last_refresh.elapsed() < every {
-                            continue;
-                        }
-                        last_refresh = Instant::now();
-                        match collect.cache.refresh(&meta) {
-                            Ok(reloaded) => {
-                                status.metadata_failing.store(false, Ordering::Relaxed);
-                                if reloaded {
-                                    info!("keys and schemas reloaded");
-                                    for change in live.reload() {
-                                        info!(%change, "a setting changed");
+                        if last_refresh.elapsed() >= every {
+                            last_refresh = Instant::now();
+                            match collect.cache.refresh(&meta) {
+                                Ok(reloaded) => {
+                                    status.metadata_failing.store(false, Ordering::Relaxed);
+                                    if reloaded {
+                                        info!("keys, schemas and settings reloaded");
                                     }
                                 }
+                                Err(error) => {
+                                    status.metadata_failing.store(true, Ordering::Relaxed);
+                                    warn!(%error, "cannot refresh keys and schemas");
+                                }
                             }
-                            Err(error) => {
-                                status.metadata_failing.store(true, Ordering::Relaxed);
-                                warn!(%error, "cannot refresh keys and schemas");
-                            }
+                        }
+                        let (changes, next) = live.sync(now_ms());
+                        due = next;
+                        for change in changes {
+                            info!(%change, "a setting changed");
                         }
                     }
                 })

@@ -56,10 +56,15 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "settings",
         sql: "
+        -- A change takes effect at a stated time: until then readers see
+        -- `previous`, after it `value` (null: the setting is not stored). This
+        -- lets every node switch at the same moment.
         CREATE TABLE settings (
-            key        TEXT PRIMARY KEY,
-            value      TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
+            key             TEXT PRIMARY KEY,
+            value           TEXT,
+            previous        TEXT,
+            effective_at_ms INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
         );
     ",
     },

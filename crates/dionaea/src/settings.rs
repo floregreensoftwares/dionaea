@@ -12,6 +12,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use dionaea_meta::StoredSetting;
+
 use crate::config::ConfigError;
 
 /// Every limit and interval of the running server. A value outside its range
@@ -449,6 +451,45 @@ impl Tuning {
     }
 }
 
+/// The stored values in force at `now_ms`: a change scheduled for later is not
+/// in force yet, and a removal that has taken effect is not a value at all.
+pub(crate) fn resolve_at(
+    stored: &BTreeMap<String, StoredSetting>,
+    now_ms: i64,
+) -> BTreeMap<String, String> {
+    stored
+        .iter()
+        .filter_map(|(name, setting)| Some((name.clone(), setting.at(now_ms)?.to_owned())))
+        .collect()
+}
+
+/// When the next stored change takes effect, if one is waiting.
+pub(crate) fn next_change(stored: &BTreeMap<String, StoredSetting>, now_ms: i64) -> Option<i64> {
+    stored
+        .values()
+        .map(|setting| setting.effective_at_ms)
+        .filter(|at| *at > now_ms)
+        .min()
+}
+
+/// The settings a stored value overrides although the file or the environment
+/// gave them a value: name, where that value came from, and what it was.
+pub(crate) fn overridden(
+    base: &Tuning,
+    origins: &BTreeMap<&'static str, Origin>,
+    applied: &BTreeMap<String, String>,
+) -> Vec<(&'static str, Origin, String)> {
+    SPECS
+        .iter()
+        .filter(|spec| applied.contains_key(spec.name))
+        .filter_map(|spec| {
+            let origin = origins.get(spec.name).copied()?;
+            matches!(origin, Origin::File | Origin::Environment)
+                .then(|| (spec.name, origin, base.show(spec)))
+        })
+        .collect()
+}
+
 /// The text of a TOML value used as a setting.
 fn value_text(value: &toml::Value) -> Option<String> {
     match value {
@@ -568,6 +609,82 @@ mod tests {
         );
         let names: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["address_burst", "not_a_setting"]);
+    }
+
+    fn stored(value: Option<&str>, previous: Option<&str>, at: i64) -> StoredSetting {
+        StoredSetting {
+            value: value.map(str::to_owned),
+            previous: previous.map(str::to_owned),
+            effective_at_ms: at,
+        }
+    }
+
+    #[test]
+    fn stored_values_are_in_force_only_from_their_moment() {
+        let map: BTreeMap<String, StoredSetting> = [
+            (
+                "key_burst".to_owned(),
+                stored(Some("900"), Some("300"), 1_000),
+            ),
+            ("address_burst".to_owned(), stored(Some("5"), None, 1_000)),
+            ("tracked_keys".to_owned(), stored(None, Some("77"), 1_000)),
+        ]
+        .into();
+        let before = resolve_at(&map, 999);
+        assert_eq!(before.get("key_burst").map(String::as_str), Some("300"));
+        assert_eq!(before.get("address_burst"), None, "nothing was in force");
+        assert_eq!(before.get("tracked_keys").map(String::as_str), Some("77"));
+        let after = resolve_at(&map, 1_000);
+        assert_eq!(after.get("key_burst").map(String::as_str), Some("900"));
+        assert_eq!(after.get("address_burst").map(String::as_str), Some("5"));
+        assert_eq!(
+            after.get("tracked_keys"),
+            None,
+            "a removal that took effect"
+        );
+    }
+
+    #[test]
+    fn the_next_change_is_the_soonest_one_still_to_come() {
+        let map: BTreeMap<String, StoredSetting> = [
+            ("a".to_owned(), stored(Some("1"), None, 500)),
+            ("b".to_owned(), stored(Some("1"), None, 2_000)),
+            ("c".to_owned(), stored(None, Some("1"), 1_500)),
+        ]
+        .into();
+        assert_eq!(next_change(&map, 100), Some(500));
+        assert_eq!(next_change(&map, 500), Some(1_500), "500 has arrived");
+        assert_eq!(next_change(&map, 1_500), Some(2_000));
+        assert_eq!(next_change(&map, 2_000), None);
+        assert_eq!(next_change(&BTreeMap::new(), 0), None);
+    }
+
+    #[test]
+    fn only_stored_values_that_hide_a_file_or_environment_value_are_reported() {
+        let file: toml::Table = toml::from_str("key_burst = 555\naddress_burst = 66\n").unwrap();
+        let env = |name: &str| (name == "DIONAEA_TRACKED_KEYS").then(|| "9".to_owned());
+        let (base, origins) = resolve(&file, &env).unwrap();
+        let applied: BTreeMap<String, String> = [
+            ("key_burst", "10"),
+            ("tracked_keys", "20"),
+            ("max_connections", "30"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let hidden = overridden(&base, &origins, &applied);
+        let summary: Vec<_> = hidden
+            .iter()
+            .map(|(name, from, was)| (*name, from.as_str(), was.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("key_burst", "file", "555"),
+                ("tracked_keys", "environment", "9")
+            ],
+            "max_connections hid only a default, address_burst was not overridden"
+        );
     }
 
     #[test]

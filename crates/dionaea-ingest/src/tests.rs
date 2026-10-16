@@ -672,16 +672,18 @@ fn settings_stored_in_the_metadata_reach_the_cache_when_the_generation_moves() {
     let cache = Cache::new();
     cache.refresh(&store).expect("refresh");
     assert!(cache.settings().is_empty());
-    store.set_setting("key_burst", "300").expect("set");
+    store
+        .set_setting("key_burst", Some("300"), 1_000, 1_000)
+        .expect("set");
     assert!(
         cache.refresh(&store).expect("refresh"),
         "a setting is a change"
     );
-    assert_eq!(
-        cache.settings().get("key_burst").map(String::as_str),
-        Some("300")
-    );
-    store.unset_setting("key_burst").expect("unset");
+    assert_eq!(cache.settings()["key_burst"].at(1_000), Some("300"));
+    store
+        .set_setting("key_burst", None, 2_000, 2_000)
+        .expect("remove");
     assert!(cache.refresh(&store).expect("refresh"));
-    assert!(cache.settings().is_empty());
+    let removed = cache.settings();
+    assert_eq!(removed.get("key_burst").and_then(|s| s.at(2_000)), None);
 }

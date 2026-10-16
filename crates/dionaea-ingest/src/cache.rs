@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use dionaea_core::Schema;
-use dionaea_meta::{MetaError, MetaStore};
+use dionaea_meta::{MetaError, MetaStore, StoredSetting};
 
 /// Why a write key was not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,7 @@ struct Table {
     generation: u64,
     keys: HashMap<String, KeyEntry>,
     schemas: HashMap<u32, Arc<[(u32, Schema)]>>,
-    settings: BTreeMap<String, String>,
+    settings: BTreeMap<String, StoredSetting>,
 }
 
 /// Keys and schemas, shared by every request.
@@ -70,7 +70,7 @@ impl Cache {
 
     /// The operational settings stored by an operator, as of the generation
     /// the cache holds.
-    pub fn settings(&self) -> BTreeMap<String, String> {
+    pub fn settings(&self) -> BTreeMap<String, StoredSetting> {
         self.current().settings.clone()
     }
 

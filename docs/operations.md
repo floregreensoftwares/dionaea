@@ -75,7 +75,9 @@ the file, the default.
 ```
 dionaea settings list                      # name, value in force, source, range, meaning
 dionaea settings get key_burst             # the value in force, alone
-dionaea settings set key_burst 800         # store a value
+dionaea settings set key_burst 800         # store a value (takes effect after a short delay)
+dionaea settings set key_burst 800 --now   # take effect on each server's next refresh
+dionaea settings set key_burst 800 --after 30   # take effect 30 seconds from now
 dionaea settings unset key_burst           # back to the environment, file or default
 ```
 
@@ -86,15 +88,29 @@ setting). The commands read the same configuration as `serve`
 (`--config`, `DIONAEA_*`, notably `metadata_path`), so they act on the same
 database.
 
-A running server notices a stored change on its next refresh (`refresh_secs`,
-2 seconds by default) and applies it in place: the rate limits and the number of
-tracked keys, the event id memory, the batch size and the cross-node check, the
-connection limit and the header time (a connection already open keeps the time
-it was given), the body time, the event time window, the proxy settings and the
-flush time of drop counts. Nothing is dropped or restarted; a request that is
-being handled finishes under the settings it started with. With several
-replicas sharing one metadata store, each applies the change within its own
-refresh interval.
+A change takes effect at a stated moment, the same for every server that reads
+the store. The default is one refresh interval plus a second from now, long
+enough for every server to have read the change before it is due; `--after N`
+chooses another delay and `--now` skips the wait (each server then switches on
+its own next refresh, so servers may differ for up to `refresh_secs`). Until
+the moment arrives the old value stays in force and `dionaea settings list`
+shows what is coming (`; 900 in 3 s`). Servers check the clock every tenth of a
+second while a change is waiting, so they switch within a fraction of a second
+of each other, as far as their clocks agree; keep them synchronised (NTP).
+
+Once a change is due, a running server applies it in place: the rate limits
+and the number of tracked keys, the event id memory, the batch size and the
+cross-node check, the connection limit and the header time (a connection
+already open keeps the time it was given), the body time, the event time
+window, the proxy settings and the flush time of drop counts. Nothing is
+dropped or restarted; a request that is being handled finishes under the
+settings it started with.
+
+A stored value wins over the environment and the file, so editing the file
+will not change a setting that has a stored value. `dionaea settings list`
+says so (`stored (overrides file: 555)`), and the server logs a warning for each
+such setting. `dionaea settings unset` gives the file or the environment its
+say again.
 
 A stored value that is out of range or no longer a known setting (for example
 after an upgrade removed it, or a hand edit of the database) is ignored with a

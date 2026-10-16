@@ -848,8 +848,11 @@ fn a_connection_limit_stored_while_the_server_runs_applies_to_new_connections() 
 fn settings_stored_before_the_server_starts_apply_from_the_first_request() {
     let dir = dir("stored-first");
     let key = bootstrap(&dir);
-    run_status(&dir, &["settings", "set", "address_burst", "1"]);
-    run_status(&dir, &["settings", "set", "address_rate_per_sec", "0.001"]);
+    run_status(&dir, &["settings", "set", "address_burst", "1", "--now"]);
+    run_status(
+        &dir,
+        &["settings", "set", "address_rate_per_sec", "0.001", "--now"],
+    );
     let server = server_with(&dir, &[]);
     let head = collect_head(&key);
     assert_eq!(server.request(&head, &batch(1, 1)).0, 202);
@@ -862,9 +865,9 @@ fn a_stored_value_that_is_out_of_range_is_ignored_and_reported_not_fatal() {
     let key = bootstrap(&dir);
     // Written behind the command line's back, as a hand edit of the file could.
     let meta = dionaea_meta::SqliteMeta::open(&dir.join("meta.db")).expect("open");
-    dionaea_meta::MetaStore::set_setting(&meta, "key_burst", "0").expect("store");
-    dionaea_meta::MetaStore::set_setting(&meta, "no_such_setting", "1").expect("store");
-    dionaea_meta::MetaStore::set_setting(&meta, "address_burst", "3").expect("store");
+    dionaea_meta::MetaStore::set_setting(&meta, "key_burst", Some("0"), 0, 0).expect("store");
+    dionaea_meta::MetaStore::set_setting(&meta, "no_such_setting", Some("1"), 0, 0).expect("store");
+    dionaea_meta::MetaStore::set_setting(&meta, "address_burst", Some("3"), 0, 0).expect("store");
     drop(meta);
 
     let server = server_with(&dir, &[("ADDRESS_RATE_PER_SEC", "0.001")]);
@@ -905,7 +908,7 @@ fn the_command_line_validates_lists_and_removes_settings() {
     assert_eq!(run_status(&dir, &["settings", "unset", "nope"]).0, 1);
 
     assert_eq!(
-        run_status(&dir, &["settings", "set", "key_burst", "0900"]).0,
+        run_status(&dir, &["settings", "set", "key_burst", "0900", "--now"]).0,
         0
     );
     let (code, value, _) = run_status(&dir, &["settings", "get", "key_burst"]);
@@ -930,9 +933,9 @@ fn the_command_line_validates_lists_and_removes_settings() {
         "{other}"
     );
 
-    let (code, _, err) = run_status(&dir, &["settings", "unset", "key_burst"]);
+    let (code, _, err) = run_status(&dir, &["settings", "unset", "key_burst", "--now"]);
     assert_eq!((code, err.as_str()), (0, ""));
-    let (_, again, _) = run_status(&dir, &["settings", "unset", "key_burst"]);
+    let (_, again, _) = run_status(&dir, &["settings", "unset", "key_burst", "--now"]);
     assert_eq!(again, "");
     let (_, value, _) = run_status(&dir, &["settings", "get", "key_burst"]);
     assert_eq!(value, "400");
@@ -955,12 +958,149 @@ fn the_file_and_the_environment_show_as_the_source_of_a_setting() {
     let text = list(&[("DIONAEA_ADDRESS_BURST", "77")]);
     assert!(text.contains("key_burst\t555\tfile\t"), "{text}");
     assert!(text.contains("address_burst\t77\tenvironment\t"), "{text}");
-    run_status(&dir, &["settings", "set", "key_burst", "10"]);
+    run_status(&dir, &["settings", "set", "key_burst", "10", "--now"]);
     let text = list(&[]);
     assert!(
-        text.contains("key_burst\t10\tstored\t"),
-        "stored wins over the file: {text}"
+        text.contains("key_burst\t10\tstored (overrides file: 555)\t"),
+        "stored wins over the file, and the list says what it hides: {text}"
     );
+}
+
+// Changes that take effect at a stated moment.
+
+#[test]
+fn two_servers_on_one_store_switch_to_a_stored_limit_at_the_same_moment() {
+    let dir = dir("replicas-switch");
+    let key = bootstrap(&dir);
+    let spool_b = dir.join("spool-b");
+    let spool_b = spool_b.to_str().expect("utf-8");
+    let first = server_with(&dir, &[("REFRESH_SECS", "1")]);
+    let second = server_with(&dir, &[("REFRESH_SECS", "1"), ("SPOOL_DIR", spool_b)]);
+
+    let started = Instant::now();
+    assert_eq!(
+        run_status(
+            &dir,
+            &["settings", "set", "address_burst", "1", "--after", "3"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        run_status(
+            &dir,
+            &[
+                "settings",
+                "set",
+                "address_rate_per_sec",
+                "0.001",
+                "--after",
+                "3"
+            ]
+        )
+        .0,
+        0
+    );
+
+    // Each server is probed about twenty times a second until it refuses.
+    let mut refused_at: [Option<Duration>; 2] = [None, None];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut n = 0;
+    while refused_at.iter().any(Option::is_none) {
+        assert!(
+            Instant::now() < deadline,
+            "a server never switched: {refused_at:?}"
+        );
+        for (index, server) in [&first, &second].into_iter().enumerate() {
+            n += 1;
+            let status = server.request(&collect_head(&key), &batch(n, 1)).0;
+            if status == 429 && refused_at[index].is_none() {
+                refused_at[index] = Some(started.elapsed());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let [a, b] = refused_at.map(|t| t.expect("both switched"));
+    assert!(
+        a >= Duration::from_millis(2_000),
+        "not before its time: {a:?}"
+    );
+    assert!(
+        b >= Duration::from_millis(2_000),
+        "not before its time: {b:?}"
+    );
+    let gap = a.abs_diff(b);
+    assert!(
+        gap < Duration::from_millis(1_000),
+        "the servers switched {gap:?} apart ({a:?} and {b:?})"
+    );
+}
+
+#[test]
+fn a_change_waits_for_its_moment_and_the_list_says_so() {
+    let dir = dir("pending");
+    bootstrap(&dir);
+    let value = || run_status(&dir, &["settings", "get", "key_burst"]).1;
+    assert_eq!(value(), "400");
+    assert_eq!(
+        run_status(
+            &dir,
+            &["settings", "set", "key_burst", "900", "--after", "4"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(value(), "400", "the old value stays until then");
+    let (_, list, _) = run_status(&dir, &["settings", "list"]);
+    let line = list
+        .lines()
+        .find(|l| l.starts_with("key_burst\t"))
+        .expect("listed");
+    assert!(
+        line.contains("; 900 in "),
+        "the list shows what is coming: {line}"
+    );
+
+    eventually("the change to take effect", 15, || value() == "900");
+    let (_, list, _) = run_status(&dir, &["settings", "list"]);
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with("key_burst\t900\tstored\t")),
+        "{list}"
+    );
+}
+
+#[test]
+fn a_removal_is_scheduled_like_a_value() {
+    let dir = dir("pending-removal");
+    bootstrap(&dir);
+    run_status(&dir, &["settings", "set", "key_burst", "900", "--now"]);
+    assert_eq!(
+        run_status(&dir, &["settings", "unset", "key_burst", "--after", "3"]).0,
+        0
+    );
+    let (_, list, _) = run_status(&dir, &["settings", "list"]);
+    let line = list
+        .lines()
+        .find(|l| l.starts_with("key_burst\t"))
+        .expect("listed");
+    assert!(line.starts_with("key_burst\t900\tstored"), "{line}");
+    assert!(line.contains("; removed in "), "{line}");
+    eventually("the removal to take effect", 15, || {
+        run_status(&dir, &["settings", "get", "key_burst"]).1 == "400"
+    });
+}
+
+#[test]
+fn now_and_after_exclude_each_other() {
+    let dir = dir("when-args");
+    bootstrap(&dir);
+    let (code, _, err) = run_status(
+        &dir,
+        &["settings", "set", "key_burst", "5", "--now", "--after", "3"],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("cannot be used with"), "{err}");
 }
 
 /// A database of its own on the ClickHouse of `compose.yaml`, dropped when the

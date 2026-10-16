@@ -90,6 +90,30 @@ pub struct SiteSchemas {
     pub versions: Vec<(u32, Schema)>,
 }
 
+/// A setting an operator stored, and when it takes effect. Until then the
+/// `previous` value is the one in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSetting {
+    /// `None`: the setting is removed, so the file, the environment or the
+    /// default applies.
+    pub value: Option<String>,
+    /// What was in force before this change.
+    pub previous: Option<String>,
+    /// Milliseconds since the Unix epoch.
+    pub effective_at_ms: i64,
+}
+
+impl StoredSetting {
+    /// The value in force at `now_ms`.
+    pub fn at(&self, now_ms: i64) -> Option<&str> {
+        if now_ms >= self.effective_at_ms {
+            self.value.as_deref()
+        } else {
+            self.previous.as_deref()
+        }
+    }
+}
+
 /// Everything the ingest path caches, read in one transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -98,7 +122,7 @@ pub struct Snapshot {
     pub schemas: Vec<SiteSchemas>,
     /// Operational settings stored by an operator, by name. The meaning of a
     /// name and its range belong to whoever reads it.
-    pub settings: BTreeMap<String, String>,
+    pub settings: BTreeMap<String, StoredSetting>,
 }
 
 #[derive(Debug)]
@@ -190,16 +214,23 @@ pub trait MetaStore: Send + Sync {
 
     fn schema_versions(&self, site_id: u32) -> Result<Vec<SchemaVersionInfo>, MetaError>;
 
-    /// The operational settings an operator stored, by name.
-    fn settings(&self) -> Result<BTreeMap<String, String>, MetaError>;
+    /// The operational settings an operator stored, by name, with when each
+    /// takes effect.
+    fn settings(&self) -> Result<BTreeMap<String, StoredSetting>, MetaError>;
 
-    /// Stores a setting, replacing its value. Only the shape of the name
+    /// Stores a setting, or with `None` removes it, from `effective_at_ms` on;
+    /// until then the value in force at `now_ms` stays. A second change before
+    /// the first has taken effect replaces it. Only the shape of the name
     /// (lowercase letters, digits and `_`) and the value (printable, not
-    /// empty) is checked here. Changing the stored value moves the generation.
-    fn set_setting(&self, name: &str, value: &str) -> Result<(), MetaError>;
-
-    /// Removes a stored setting. Returns whether it existed.
-    fn unset_setting(&self, name: &str) -> Result<bool, MetaError>;
+    /// empty) is checked here. A change moves the generation, so every node
+    /// that reloads on a new generation sees it before it takes effect.
+    fn set_setting(
+        &self,
+        name: &str,
+        value: Option<&str>,
+        effective_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), MetaError>;
 
     /// The live keys and active schema versions of every site.
     fn snapshot(&self) -> Result<Snapshot, MetaError>;

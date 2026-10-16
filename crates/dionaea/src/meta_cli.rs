@@ -236,48 +236,79 @@ pub(crate) fn schema_retire(
     }
 }
 
-/// The value of every setting in force, with where it came from.
-fn effective(
+/// One setting as the commands show it.
+struct Row {
+    spec: &'static settings::Spec,
+    value: String,
+    source: String,
+}
+
+/// The value of every setting in force at `now_ms`, where it comes from, and
+/// what is about to change.
+fn rows(
     store: &dyn MetaStore,
     base: &Tuning,
     origins: &BTreeMap<&'static str, Origin>,
-) -> Result<Vec<(&'static settings::Spec, String, Origin)>, MetaError> {
+    now_ms: i64,
+) -> Result<Vec<Row>, MetaError> {
     let stored = store.settings()?;
-    let (tuning, skipped) = base.with_stored(&stored);
+    let resolved = settings::resolve_at(&stored, now_ms);
+    let (tuning, skipped) = base.with_stored(&resolved);
+    let overridden = settings::overridden(base, origins, &resolved);
     Ok(settings::SPECS
         .iter()
         .map(|spec| {
-            let applied = stored.contains_key(spec.name)
+            let applied = resolved.contains_key(spec.name)
                 && !skipped.iter().any(|(name, _)| name == spec.name);
-            let origin = if applied {
-                Origin::Stored
+            let mut source = if applied {
+                match overridden.iter().find(|(name, _, _)| *name == spec.name) {
+                    Some((_, from, was)) => {
+                        format!("stored (overrides {}: {was})", from.as_str())
+                    }
+                    None => Origin::Stored.as_str().to_owned(),
+                }
             } else {
-                origins.get(spec.name).copied().unwrap_or(Origin::Default)
+                origins
+                    .get(spec.name)
+                    .copied()
+                    .unwrap_or(Origin::Default)
+                    .as_str()
+                    .to_owned()
             };
-            (spec, tuning.show(spec), origin)
+            if let Some(change) = stored
+                .get(spec.name)
+                .filter(|change| change.effective_at_ms > now_ms)
+            {
+                let seconds = (change.effective_at_ms - now_ms).div_euclid(1000) + 1;
+                let then = change.value.clone().unwrap_or_else(|| "removed".to_owned());
+                source.push_str(&format!("; {then} in {seconds} s"));
+            }
+            Row {
+                spec,
+                value: tuning.show(spec),
+                source,
+            }
         })
         .collect())
 }
 
 /// Lists every setting that can change while the server runs: name, value in
-/// force, where the value comes from, and what it is.
+/// force, where the value comes from, its range and what it is.
 pub(crate) fn settings_list(
     store: &dyn MetaStore,
     base: &Tuning,
     origins: &BTreeMap<&'static str, Origin>,
+    now_ms: i64,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> u8 {
-    match effective(store, base, origins) {
+    match rows(store, base, origins, now_ms) {
         Ok(rows) => {
-            for (spec, value, origin) in rows {
+            for row in rows {
                 let _ = writeln!(
                     out,
-                    "{}\t{value}\t{}\t{}\t{}",
-                    spec.name,
-                    origin.as_str(),
-                    spec.rule,
-                    spec.help
+                    "{}\t{}\t{}\t{}\t{}",
+                    row.spec.name, row.value, row.source, row.spec.rule, row.spec.help
                 );
             }
             OK
@@ -291,14 +322,15 @@ pub(crate) fn settings_get(
     store: &dyn MetaStore,
     base: &Tuning,
     origins: &BTreeMap<&'static str, Origin>,
+    now_ms: i64,
     name: &str,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> u8 {
-    match effective(store, base, origins) {
-        Ok(rows) => match rows.into_iter().find(|(spec, _, _)| spec.name == name) {
-            Some((_, value, _)) => {
-                let _ = writeln!(out, "{value}");
+    match rows(store, base, origins, now_ms) {
+        Ok(rows) => match rows.into_iter().find(|row| row.spec.name == name) {
+            Some(row) => {
+                let _ = writeln!(out, "{}", row.value);
                 OK
             }
             None => {
@@ -316,12 +348,14 @@ fn unknown(name: &str) -> String {
         .unwrap_or_else(|| format!("`{name}` is not a setting"))
 }
 
-/// Stores a setting. A running server applies it within its refresh interval,
-/// without a restart.
+/// Stores a setting to take effect `delay_ms` from `now_ms`. Every server that
+/// reads the store switches at that moment, so the delay should be at least
+/// one refresh interval. A server that is down applies it when it starts.
 pub(crate) fn settings_set(
     store: &dyn MetaStore,
     name: &str,
     value: &str,
+    (now_ms, delay_ms): (i64, i64),
     err: &mut impl Write,
 ) -> u8 {
     let canonical = match settings::canonical(name, value) {
@@ -331,23 +365,49 @@ pub(crate) fn settings_set(
             return REFUSED;
         }
     };
-    match store.set_setting(name, &canonical) {
-        Ok(()) => OK,
+    match store.set_setting(name, Some(&canonical), now_ms + delay_ms, now_ms) {
+        Ok(()) => {
+            if delay_ms > 0 {
+                let _ = writeln!(
+                    err,
+                    "{name} takes effect in {} s",
+                    delay_ms.div_euclid(1000)
+                );
+            }
+            OK
+        }
         Err(error) => report(&error, "", err),
     }
 }
 
-/// Removes a stored setting, so the file, the environment or the default
-/// applies again.
-pub(crate) fn settings_unset(store: &dyn MetaStore, name: &str, err: &mut impl Write) -> u8 {
+/// Removes a stored setting from `delay_ms` on, so the file, the environment
+/// or the default applies again.
+pub(crate) fn settings_unset(
+    store: &dyn MetaStore,
+    name: &str,
+    (now_ms, delay_ms): (i64, i64),
+    err: &mut impl Write,
+) -> u8 {
     if settings::find(name).is_none() {
         let _ = writeln!(err, "error: {}", unknown(name));
         return REFUSED;
     }
-    match store.unset_setting(name) {
-        Ok(true) => OK,
-        Ok(false) => {
-            let _ = writeln!(err, "{name} was not stored");
+    let stored = match store.settings() {
+        Ok(stored) => stored,
+        Err(error) => return report(&error, "", err),
+    };
+    if stored
+        .get(name)
+        .is_none_or(|setting| setting.at(now_ms).is_none() && setting.effective_at_ms <= now_ms)
+    {
+        let _ = writeln!(err, "{name} was not stored");
+        return OK;
+    }
+    match store.set_setting(name, None, now_ms + delay_ms, now_ms) {
+        Ok(()) => {
+            if delay_ms > 0 {
+                let _ = writeln!(err, "{name} is removed in {} s", delay_ms.div_euclid(1000));
+            }
             OK
         }
         Err(error) => report(&error, "", err),

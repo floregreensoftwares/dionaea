@@ -15,7 +15,7 @@ use crate::migrations::MIGRATIONS;
 use crate::{
     KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError,
     MetaStore, Organization, Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot,
-    WriteKeyInfo,
+    StoredSetting, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -176,13 +176,20 @@ fn bump(tx: &Transaction<'_>) -> Result<(), MetaError> {
     Ok(())
 }
 
-fn settings_of(tx: &Transaction<'_>) -> Result<BTreeMap<String, String>, MetaError> {
+fn settings_of(tx: &Transaction<'_>) -> Result<BTreeMap<String, StoredSetting>, MetaError> {
     let mut statement = tx
-        .prepare("SELECT key, value FROM settings ORDER BY key")
+        .prepare("SELECT key, value, previous, effective_at_ms FROM settings ORDER BY key")
         .map_err(storage)?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredSetting {
+                    value: row.get(1)?,
+                    previous: row.get(2)?,
+                    effective_at_ms: row.get(3)?,
+                },
+            ))
         })
         .map_err(storage)?;
     rows.map(|row| row.map_err(storage)).collect()
@@ -654,11 +661,17 @@ impl MetaStore for SqliteMeta {
         })
     }
 
-    fn settings(&self) -> Result<BTreeMap<String, String>, MetaError> {
+    fn settings(&self) -> Result<BTreeMap<String, StoredSetting>, MetaError> {
         self.read(settings_of)
     }
 
-    fn set_setting(&self, name: &str, value: &str) -> Result<(), MetaError> {
+    fn set_setting(
+        &self,
+        name: &str,
+        value: Option<&str>,
+        effective_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), MetaError> {
         if name.is_empty()
             || name.len() > MAX_SETTING_NAME_LEN
             || !name
@@ -669,43 +682,68 @@ impl MetaStore for SqliteMeta {
                 "a setting name is lowercase letters, digits and underscores".to_owned(),
             ));
         }
-        if value.is_empty()
-            || value.len() > MAX_SETTING_VALUE_LEN
-            || value.chars().any(char::is_control)
-        {
+        if value.is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_SETTING_VALUE_LEN
+                || value.chars().any(char::is_control)
+        }) {
             return Err(MetaError::Invalid(format!(
                 "a setting value is 1 to {MAX_SETTING_VALUE_LEN} printable characters"
             )));
         }
         self.write(|tx, at| {
-            let current: Option<String> = tx
-                .query_row("SELECT value FROM settings WHERE key = ?1", [name], |row| {
-                    row.get(0)
-                })
+            let current: Option<StoredSetting> = tx
+                .query_row(
+                    "SELECT value, previous, effective_at_ms FROM settings WHERE key = ?1",
+                    [name],
+                    |row| {
+                        Ok(StoredSetting {
+                            value: row.get(0)?,
+                            previous: row.get(1)?,
+                            effective_at_ms: row.get(2)?,
+                        })
+                    },
+                )
                 .optional()
                 .map_err(storage)?;
-            if current.as_deref() == Some(value) {
-                return Ok(());
-            }
-            tx.execute(
-                "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
-                params![name, value, at],
-            )
-            .map_err(storage)?;
-            bump(tx)
-        })
-    }
-
-    fn unset_setting(&self, name: &str) -> Result<bool, MetaError> {
-        self.write(|tx, _| {
-            let removed = tx
-                .execute("DELETE FROM settings WHERE key = ?1", [name])
+            // What readers see now, so that it stays until the new time.
+            let in_force = current
+                .as_ref()
+                .and_then(|stored| stored.at(now_ms))
+                .map(str::to_owned);
+            let next = StoredSetting {
+                value: value.map(str::to_owned),
+                previous: in_force,
+                effective_at_ms,
+            };
+            // The same value, already in force and asked for now, is no change.
+            let unchanged = match &current {
+                Some(stored) => {
+                    *stored == next
+                        || (stored.value == next.value
+                            && stored.effective_at_ms <= now_ms
+                            && next.effective_at_ms <= now_ms)
+                }
+                None => next.value.is_none(),
+            };
+            if !unchanged {
+                tx.execute(
+                    "INSERT INTO settings (key, value, previous, effective_at_ms, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(key) DO UPDATE SET value = ?2, previous = ?3,
+                         effective_at_ms = ?4, updated_at = ?5",
+                    params![name, next.value, next.previous, next.effective_at_ms, at],
+                )
                 .map_err(storage)?;
-            if removed > 0 {
                 bump(tx)?;
             }
-            Ok(removed > 0)
+            // A removal that has taken effect leaves nothing to remember.
+            tx.execute(
+                "DELETE FROM settings WHERE value IS NULL AND effective_at_ms <= ?1",
+                [now_ms],
+            )
+            .map_err(storage)?;
+            Ok(())
         })
     }
 
