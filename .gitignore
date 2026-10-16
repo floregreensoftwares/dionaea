@@ -27,3 +27,6 @@
 /fuzz/corpus/*/*
 !/fuzz/corpus/*/valid.json
 !/fuzz/corpus/*/example.toml
+
+# Throwaway development certificates
+/.dev-certs/

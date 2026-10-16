@@ -22,6 +22,8 @@ mod rows;
 mod time;
 
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use rows::{DropRow, EventRow};
@@ -37,7 +39,20 @@ pub struct Config {
     pub user: String,
     pub password: String,
     pub database: String,
+    /// Talk TLS (HTTPS) to the server. Without it the connection is plain HTTP.
+    pub tls: Option<TlsConfig>,
     pub timeout: Duration,
+}
+
+/// How to verify the server when talking TLS.#[derive(Debug, Clone, Default)]pub struct TlsConfig {    /// A PEM file with the certificates to trust (the server's CA). Without    /// it the Mozilla root set is trusted.    pub ca_file: Option<PathBuf>,    /// The name the server's certificate must carry. Defaults to the host.    pub server_name: Option<String>,}
+/// How to verify the server when talking TLS.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// A PEM file with the certificates to trust (the server's CA). Without
+    /// it the Mozilla root set is trusted.
+    pub ca_file: Option<PathBuf>,
+    /// The name the server's certificate must carry. Defaults to the host.
+    pub server_name: Option<String>,
 }
 
 impl Config {
@@ -48,6 +63,7 @@ impl Config {
             user: "default".to_owned(),
             password: String::new(),
             database: database.into(),
+            tls: None,
             timeout: Duration::from_secs(30),
         }
     }
@@ -62,6 +78,7 @@ impl fmt::Debug for Config {
             .field("user", &self.user)
             .field("password", &"<hidden>")
             .field("database", &self.database)
+            .field("tls", &self.tls)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -77,6 +94,9 @@ pub enum Error {
     InvalidRow(String),
     /// The database name or the deduplication token has a bad shape.
     InvalidName(String),
+    /// The TLS settings cannot be used (a missing or unreadable CA file, a
+    /// bad server name).
+    Tls(String),
     /// Too many rows for one insert.
     TooManyRows,
 }
@@ -85,6 +105,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(message) => write!(f, "cannot reach ClickHouse: {message}"),
+            Self::Tls(message) => write!(f, "TLS settings: {message}"),
             Self::Server { status, message } => {
                 write!(f, "ClickHouse answered {status}: {message}")
             }
@@ -105,7 +126,7 @@ impl Error {
     /// would never drain.
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::InvalidRow(_) | Self::InvalidName(_) | Self::TooManyRows => true,
+            Self::InvalidRow(_) | Self::InvalidName(_) | Self::TooManyRows | Self::Tls(_) => true,
             Self::Server { status, .. } => {
                 (400..500).contains(status) && !matches!(status, 408 | 429)
             }
@@ -120,10 +141,19 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// A handle to the store. It holds no connection: each call opens one.
-#[derive(Debug, Clone)]
+/// A handle to the store. Clones share the idle connections to the server.
+#[derive(Clone)]
 pub struct Store {
     config: Config,
+    client: Arc<http::Client>,
+}
+
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Store")
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 fn valid_identifier(name: &str) -> bool {
@@ -133,6 +163,36 @@ fn valid_identifier(name: &str) -> bool {
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.len() <= 64
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The two users a running node connects as (see
+/// [`Store::provision_roles`]). The password of each is shown nowhere.
+#[derive(Clone)]
+pub struct Roles {
+    pub ingest_user: String,
+    pub ingest_password: String,
+    pub query_user: String,
+    pub query_password: String,
+}
+
+impl fmt::Debug for Roles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Roles")
+            .field("ingest_user", &self.ingest_user)
+            .field("ingest_password", &"<hidden>")
+            .field("query_user", &self.query_user)
+            .field("query_password", &"<hidden>")
+            .finish()
+    }
+}
+
+/// A password that is safe to put inside a statement: long enough to be a
+/// generated token, and without quotes, backslashes or whitespace.
+fn valid_secret(secret: &str) -> bool {
+    (16..=128).contains(&secret.len())
+        && secret
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '~' | '-'))
 }
 
 /// A host name or address, as it goes into the `Host` header: no whitespace,
@@ -199,22 +259,39 @@ impl Store {
                 "the database is a letter or underscore followed by letters, digits and underscores".to_owned(),
             ));
         }
-        Ok(Self { config })
+        let tls = match &config.tls {
+            None => None,
+            Some(tls) => Some(
+                http::Tls::new(
+                    tls.server_name.as_deref().unwrap_or(&config.host),
+                    tls.ca_file.as_deref(),
+                )
+                .map_err(Error::Tls)?,
+            ),
+        };
+        let client = http::Client::new(
+            &config.host,
+            config.port,
+            &config.user,
+            &config.password,
+            config.timeout,
+            tls,
+        );
+        Ok(Self {
+            config,
+            client: Arc::new(client),
+        })
     }
 
-    fn endpoint(&self) -> http::Endpoint<'_> {
-        http::Endpoint {
-            host: &self.config.host,
-            port: self.config.port,
-            user: &self.config.user,
-            password: &self.config.password,
-            timeout: self.config.timeout,
-        }
+    /// How many connections this handle (and its clones) has opened. Reused
+    /// connections are not counted; tests use it to show that they are reused.
+    pub fn connections_opened(&self) -> u64 {
+        self.client.connects()
     }
 
     /// Sends `body` to ClickHouse at `path` and returns the answer text.
     fn post(&self, path: &str, body: &[u8], redact: bool) -> Result<String, Error> {
-        let response = http::post(&self.endpoint(), path, body)?;
+        let response = self.client.post(path, body)?;
         if response.status != 200 {
             return Err(Error::Server {
                 status: response.status,
@@ -272,7 +349,61 @@ impl Store {
         Ok(done)
     }
 
-    /// The `JSONEachRow` text an insert of these events sends. Exposed so the    /// cost of encoding can be measured apart from the network.    pub fn encode_events(rows: &[EventRow]) -> Result<String, Error> {        encode(rows.iter().map(EventRow::to_json_line), rows.len())    }
+    /// Creates (or updates the password of) the two least-privilege users the
+    /// running node should connect as, and grants them what they need in the
+    /// configured database: the ingest user may only insert into the tables
+    /// events arrive in, the query user may only read. Call it as the
+    /// privileged user that migrates, after [`migrate`](Self::migrate).
+    ///
+    /// Passwords should be random tokens; they are checked for a safe shape
+    /// because they go into a statement, and an error never echoes them.
+    pub fn provision_roles(&self, roles: &Roles) -> Result<(), Error> {
+        for name in [&roles.ingest_user, &roles.query_user] {
+            if !valid_identifier(name) {
+                return Err(Error::InvalidName(
+                    "a user name is a letter or underscore followed by letters, digits and underscores".to_owned(),
+                ));
+            }
+        }
+        for secret in [&roles.ingest_password, &roles.query_password] {
+            if !valid_secret(secret) {
+                return Err(Error::InvalidName(
+                    "a password is 16 to 128 characters of letters, digits, '_', '.', '~' and '-'"
+                        .to_owned(),
+                ));
+            }
+        }
+        let database = &self.config.database;
+        let (ingest, query) = (&roles.ingest_user, &roles.query_user);
+        let statements = [
+            format!(
+                "CREATE USER IF NOT EXISTS {ingest} IDENTIFIED WITH sha256_password BY '{}'",
+                roles.ingest_password
+            ),
+            format!(
+                "ALTER USER {ingest} IDENTIFIED WITH sha256_password BY '{}'",
+                roles.ingest_password
+            ),
+            format!("GRANT INSERT ON {database}.events TO {ingest}"),
+            format!("GRANT INSERT ON {database}.drops_daily TO {ingest}"),
+            format!(
+                "CREATE USER IF NOT EXISTS {query} IDENTIFIED WITH sha256_password BY '{}'",
+                roles.query_password
+            ),
+            format!(
+                "ALTER USER {query} IDENTIFIED WITH sha256_password BY '{}'",
+                roles.query_password
+            ),
+            format!("GRANT SELECT ON {database}.* TO {query}"),
+        ];
+        let path = format!("/?database={}", http::url_encode(database));
+        for statement in &statements {
+            // Redacted: these statements carry secrets.
+            self.post(&path, statement.as_bytes(), true)?;
+        }
+        Ok(())
+    }
+
     /// The `JSONEachRow` text an insert of these events sends. Exposed so the
     /// cost of encoding can be measured apart from the network.
     pub fn encode_events(rows: &[EventRow]) -> Result<String, Error> {

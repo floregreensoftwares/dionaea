@@ -345,3 +345,249 @@ fn a_batch_of_twenty_thousand_events_is_stored_in_one_insert() {
     eprintln!("20000 events inserted in {:?}", started.elapsed());
     assert_eq!(count(&scratch.store, "events"), 20_000);
 }
+
+// Connections, TLS and users, against the real server.
+
+fn user_store(database: &str, user: &str, password: &str) -> Store {
+    let (host, port, _, _) = server();
+    let mut config = Config::new(host, port, database);
+    config.user = user.to_owned();
+    config.password = password.to_owned();
+    Store::new(config).expect("a valid config")
+}
+
+fn tls_store(database: &str, ca: &std::path::Path, server_name: Option<&str>) -> Store {
+    let setting = std::env::var("DIONAEA_TEST_CLICKHOUSE_TLS")
+        .unwrap_or_else(|_| "127.0.0.1:8443".to_owned());
+    let (host, port) = setting
+        .rsplit_once(':')
+        .map(|(h, p)| (h.to_owned(), p.parse().expect("a port")))
+        .expect("host:port");
+    let (_, _, user, password) = server();
+    let mut config = Config::new(host, port, database);
+    config.user = user;
+    config.password = password;
+    config.tls = Some(dionaea_store::TlsConfig {
+        ca_file: Some(ca.to_path_buf()),
+        server_name: Some(server_name.unwrap_or("localhost").to_owned()),
+    });
+    Store::new(config).expect("a valid config")
+}
+
+fn dev_ca() -> std::path::PathBuf {
+    std::env::var("DIONAEA_TEST_CLICKHOUSE_CA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev-certs/ca.pem")
+        })
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn connections_are_reused_against_the_real_server() {
+    let scratch = Scratch::new();
+    for _ in 0..20 {
+        scratch.store.raw_query("SELECT 1").expect("query");
+    }
+    scratch
+        .store
+        .insert_events(&[event(1)], "reuse")
+        .expect("insert");
+    assert_eq!(
+        scratch.store.connections_opened(),
+        1,
+        "twenty-one calls on one connection"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse with HTTPS (compose.tls.yaml)"]
+fn tls_works_against_the_real_server_on_one_connection() {
+    let scratch = Scratch::new();
+    let store = tls_store(&scratch.database, &dev_ca(), None);
+    store.ping().expect("ping over TLS");
+    store
+        .insert_events(&(0..5).map(event).collect::<Vec<_>>(), "tls-1")
+        .expect("insert over TLS");
+    assert_eq!(count(&store, "events"), 5);
+    for _ in 0..10 {
+        store.raw_query("SELECT 1").expect("query");
+    }
+    assert_eq!(
+        store.connections_opened(),
+        1,
+        "one handshake serves every call"
+    );
+    assert_eq!(
+        count(&scratch.store, "events"),
+        5,
+        "the plain and the TLS paths reach the same data"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse with HTTPS (compose.tls.yaml)"]
+fn tls_refuses_a_certificate_it_was_not_told_to_trust_and_a_wrong_name() {
+    let scratch = Scratch::new();
+    // A CA that did not sign the server's certificate.
+    let key = rcgen::KeyPair::generate().expect("key");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let other =
+        std::env::temp_dir().join(format!("dionaea-store-other-ca-{}.pem", std::process::id()));
+    std::fs::write(&other, params.self_signed(&key).expect("ca").pem()).expect("write");
+    let error = tls_store(&scratch.database, &other, None)
+        .ping()
+        .expect_err("an untrusted server");
+    assert!(matches!(error, Error::Io(_)), "{error:?}");
+
+    // The right CA, but the name the certificate must carry is another one.
+    let error = tls_store(&scratch.database, &dev_ca(), Some("other.example"))
+        .ping()
+        .expect_err("a wrong name");
+    assert!(matches!(error, Error::Io(_)), "{error:?}");
+}
+
+fn roles(tag: &str) -> dionaea_store::Roles {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    dionaea_store::Roles {
+        ingest_user: format!("ing_{tag}_{}", std::process::id()),
+        ingest_password: format!("{nanos:032x}"),
+        query_user: format!("qry_{tag}_{}", std::process::id()),
+        query_password: format!("{:032x}", nanos ^ 0xdead_beef),
+    }
+}
+
+/// Drops the users when the test ends.
+struct UsersGuard<'a>(&'a Store, Vec<String>);
+
+impl Drop for UsersGuard<'_> {
+    fn drop(&mut self) {
+        for user in &self.1 {
+            let _ = self.0.raw_query(&format!("DROP USER IF EXISTS {user}"));
+        }
+    }
+}
+
+fn denied(error: &Error) -> bool {
+    matches!(error, Error::Server { status: 403, .. })
+        || matches!(error, Error::Server { message, .. } if message.contains("497"))
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
+    let scratch = Scratch::new();
+    let roles = roles("a");
+    let _cleanup = UsersGuard(
+        &scratch.admin,
+        vec![roles.ingest_user.clone(), roles.query_user.clone()],
+    );
+    scratch.store.provision_roles(&roles).expect("provision");
+
+    let ingest = user_store(
+        &scratch.database,
+        &roles.ingest_user,
+        &roles.ingest_password,
+    );
+    ingest
+        .insert_events(&(0..4).map(event).collect::<Vec<_>>(), "role-1")
+        .expect("the ingest user inserts");
+    ingest
+        .insert_drops(
+            &[DropRow {
+                site_id: 7,
+                event_name: "e".to_owned(),
+                reason: "r".to_owned(),
+                at_ms: 1_760_000_000_000,
+                count: 2,
+            }],
+            "role-d",
+        )
+        .expect("and counts drops");
+    for sql in [
+        "SELECT count() FROM events",
+        "SELECT * FROM drops_daily",
+        "ALTER TABLE events DELETE WHERE 1",
+        "DROP TABLE events",
+        "TRUNCATE TABLE events",
+        "CREATE TABLE evil (x UInt8) ENGINE = Memory",
+        "INSERT INTO _migrations (version, name) VALUES (99, 'x')",
+        "CREATE USER eve",
+    ] {
+        let error = ingest.raw_query(sql).expect_err(sql);
+        assert!(denied(&error), "{sql}: {error:?}");
+    }
+
+    let query = user_store(&scratch.database, &roles.query_user, &roles.query_password);
+    assert_eq!(
+        count(&query, "events"),
+        4,
+        "the query user reads what was inserted"
+    );
+    let error = query
+        .insert_events(&[event(50)], "role-2")
+        .expect_err("the query user cannot insert");
+    assert!(denied(&error), "{error:?}");
+    assert!(
+        error.to_string().contains("ACCESS_DENIED"),
+        "the redacted summary still names the error: {error}"
+    );
+    for sql in [
+        "ALTER TABLE events DELETE WHERE 1",
+        "DROP TABLE events",
+        "CREATE TABLE evil (x UInt8) ENGINE = Memory",
+        "INSERT INTO _migrations (version, name) VALUES (99, 'x')",
+    ] {
+        let error = query.raw_query(sql).expect_err(sql);
+        assert!(denied(&error), "{sql}: {error:?}");
+    }
+
+    // Neither user could change anything: the data is as the ingest user left it.
+    assert_eq!(count(&scratch.store, "events"), 4);
+    assert_eq!(count(&scratch.store, "_migrations"), 1);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn provisioning_again_rotates_the_passwords() {
+    let scratch = Scratch::new();
+    let first = roles("b");
+    let _cleanup = UsersGuard(
+        &scratch.admin,
+        vec![first.ingest_user.clone(), first.query_user.clone()],
+    );
+    scratch.store.provision_roles(&first).expect("provision");
+    user_store(
+        &scratch.database,
+        &first.ingest_user,
+        &first.ingest_password,
+    )
+    .ping()
+    .expect("the first password works");
+
+    let mut second = first.clone();
+    second.ingest_password = format!("{:032x}", 0x1234_5678_9abc_def0_u128);
+    scratch
+        .store
+        .provision_roles(&second)
+        .expect("provision again");
+    let error = user_store(
+        &scratch.database,
+        &first.ingest_user,
+        &first.ingest_password,
+    )
+    .ping()
+    .expect_err("the old password is dead");
+    assert!(matches!(error, Error::Server { .. }), "{error:?}");
+    user_store(
+        &scratch.database,
+        &second.ingest_user,
+        &second.ingest_password,
+    )
+    .ping()
+    .expect("the new password works");
+}
