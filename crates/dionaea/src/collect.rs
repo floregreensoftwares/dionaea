@@ -5,28 +5,34 @@
 //! maps them to status codes.
 //!
 //! Nothing here logs or stores the client address, the key or the payload: the
-//! address only keys a token bucket, and requests are counted by outcome.
+//! address keys a token bucket and a country lookup, and requests are counted
+//! by outcome.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_MAX_AGE, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN, RETRY_AFTER, VARY,
+    ACCESS_CONTROL_MAX_AGE, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN, RETRY_AFTER, USER_AGENT, VARY,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::routing::any;
 use dionaea_core::MAX_BODY_LEN;
 use dionaea_ingest::{
-    Admission, Cache, Limits, Processed, RateLimiter, Refusal, RetryAfter, enqueue, process,
+    Admission, Cache, Context, CountryLookup, Deduper, Enrichment, Limits, Processed, RateLimiter,
+    Refusal, RetryAfter, enqueue, process_with,
 };
 use dionaea_meta::is_write_key_shape;
 use dionaea_spool::{Spool, SpoolError};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
+
+use crate::config::Tuning;
 
 /// The header the SDKs send the write key in.
 pub(crate) const KEY_HEADER: &str = "x-dionaea-key";
@@ -49,6 +55,12 @@ pub(crate) struct Settings {
     pub(crate) address_burst: f64,
     /// How many keys and addresses each limiter tracks.
     pub(crate) tracked: usize,
+    /// Reverse proxies in front of the server, and the header they append the
+    /// client address to. With 0 hops the socket peer is the client.
+    pub(crate) trusted_proxy_hops: u8,
+    pub(crate) client_address_header: String,
+    pub(crate) dedup_capacity: usize,
+    pub(crate) dedup_window: Duration,
 }
 
 impl Default for Settings {
@@ -62,6 +74,33 @@ impl Default for Settings {
             address_rate_per_sec: 50.0,
             address_burst: 100.0,
             tracked: 100_000,
+            trusted_proxy_hops: 0,
+            client_address_header: "x-forwarded-for".to_owned(),
+            dedup_capacity: 1_000_000,
+            dedup_window: Duration::from_secs(600),
+        }
+    }
+}
+
+impl Settings {
+    pub(crate) fn from_tuning(tuning: &Tuning) -> Self {
+        let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            limits: Limits {
+                max_past_ms: millis(tuning.max_event_age),
+                max_future_ms: millis(tuning.max_event_future),
+            },
+            body_timeout: tuning.body_timeout,
+            retry_after_busy: tuning.retry_after_secs,
+            key_rate_per_sec: tuning.key_rate_per_sec,
+            key_burst: tuning.key_burst,
+            address_rate_per_sec: tuning.address_rate_per_sec,
+            address_burst: tuning.address_burst,
+            tracked: tuning.tracked_keys,
+            trusted_proxy_hops: tuning.trusted_proxy_hops,
+            client_address_header: tuning.client_address_header.clone(),
+            dedup_capacity: tuning.dedup_capacity,
+            dedup_window: tuning.dedup_window,
         }
     }
 }
@@ -78,6 +117,31 @@ pub(crate) struct Counters {
     pub(crate) too_large: AtomicU64,
     pub(crate) rate_limited: AtomicU64,
     pub(crate) unavailable: AtomicU64,
+    /// Events dropped, by reason. The reasons are a fixed small set, so this
+    /// never grows with what senders send.
+    drops: Mutex<BTreeMap<&'static str, u64>>,
+}
+
+impl Counters {
+    fn add_drops(&self, processed: &Processed, invalid: u64) {
+        let mut drops = self.drops.lock().unwrap_or_else(PoisonError::into_inner);
+        for drop in &processed.drops {
+            *drops.entry(drop.reason.as_str()).or_default() += drop.count;
+        }
+        if invalid > 0 {
+            *drops.entry(dionaea_ingest::INVALID_ROW).or_default() += invalid;
+        }
+    }
+
+    /// Events dropped so far, by reason.
+    pub(crate) fn drops_by_reason(&self) -> Vec<(&'static str, u64)> {
+        self.drops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(reason, count)| (*reason, *count))
+            .collect()
+    }
 }
 
 /// What the endpoint needs, shared by every request.
@@ -86,6 +150,8 @@ pub(crate) struct Collect {
     pub(crate) spool: Spool,
     key_limiter: RateLimiter<String>,
     address_limiter: RateLimiter<IpAddr>,
+    deduper: Deduper,
+    geo: Option<Arc<dyn CountryLookup>>,
     settings: Settings,
     clock: Box<Clock>,
     pub(crate) counters: Counters,
@@ -104,6 +170,7 @@ impl Collect {
         settings: Settings,
         clock: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
+        let window = u64::try_from(settings.dedup_window.as_millis()).unwrap_or(u64::MAX);
         Self {
             key_limiter: RateLimiter::new(
                 settings.key_rate_per_sec,
@@ -115,6 +182,8 @@ impl Collect {
                 settings.address_burst,
                 settings.tracked,
             ),
+            deduper: Deduper::new(settings.dedup_capacity, window),
+            geo: None,
             cache,
             spool,
             settings,
@@ -122,12 +191,31 @@ impl Collect {
             counters: Counters::default(),
         }
     }
+
+    /// Uses `lookup` to give events a country.
+    #[must_use]
+    pub(crate) fn with_country_lookup(mut self, lookup: Arc<dyn CountryLookup>) -> Self {
+        self.geo = Some(lookup);
+        self
+    }
+
+    /// How many event ids are remembered for the duplicate check.
+    pub(crate) fn remembered_ids(&self) -> usize {
+        self.deduper.len()
+    }
 }
 
 pub(crate) fn routes(collect: Arc<Collect>) -> Router {
     Router::new()
         .route("/v1/collect", any(handle))
         .with_state(collect)
+}
+
+/// Milliseconds since the Unix epoch.
+pub(crate) fn system_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// What an address is limited as: an IPv6 client by its /64, since one host
@@ -148,11 +236,29 @@ fn address_bucket(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Milliseconds since the Unix epoch.
-pub(crate) fn system_clock() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// The client's address. With no trusted proxy it is the socket peer. With
+/// `hops` proxies in front, each appends the address it saw to the header, so
+/// the client is the `hops`-th entry from the right; anything to its left was
+/// written by the client and is ignored. A header that is missing, too short
+/// or not an address falls back to the peer.
+fn client_address(headers: &HeaderMap, peer: IpAddr, hops: u8, header: &str) -> IpAddr {
+    if hops == 0 {
+        return peer;
+    }
+    let entries: Vec<&str> = headers
+        .get_all(header)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .collect();
+    let hops = usize::from(hops);
+    entries
+        .len()
+        .checked_sub(hops)
+        .and_then(|index| entries.get(index))
+        .and_then(|entry| entry.parse::<IpAddr>().ok())
+        .unwrap_or(peer)
 }
 
 fn json(status: StatusCode, body: &str) -> Response<Body> {
@@ -219,6 +325,24 @@ fn is_json_type(headers: &HeaderMap) -> bool {
         })
 }
 
+/// How reading the body ended.
+enum BodyRead {
+    Complete(axum::body::Bytes),
+    TooLarge,
+    Unreadable,
+    TimedOut,
+}
+
+async fn read_body(body: Body, timeout: Duration) -> BodyRead {
+    let limited = Limited::new(body, MAX_BODY_LEN);
+    match tokio::time::timeout(timeout, limited.collect()).await {
+        Ok(Ok(collected)) => BodyRead::Complete(collected.to_bytes()),
+        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => BodyRead::TooLarge,
+        Ok(Err(_)) => BodyRead::Unreadable,
+        Err(_) => BodyRead::TimedOut,
+    }
+}
+
 async fn handle(
     State(collect): State<Arc<Collect>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -248,10 +372,13 @@ async fn handle(
         }
     };
     let now = (collect.clock)();
-    if let Err(RetryAfter(seconds)) = collect
-        .address_limiter
-        .check(address_bucket(peer.ip()), now)
-    {
+    let client = client_address(
+        &parts.headers,
+        peer.ip(),
+        collect.settings.trusted_proxy_hops,
+        &collect.settings.client_address_header,
+    );
+    if let Err(RetryAfter(seconds)) = collect.address_limiter.check(address_bucket(client), now) {
         counters.rate_limited.fetch_add(1, Ordering::Relaxed);
         return with_retry_after(
             error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
@@ -321,28 +448,36 @@ async fn handle(
             origin,
         );
     }
-    let bytes =
-        match tokio::time::timeout(collect.settings.body_timeout, to_bytes(body, MAX_BODY_LEN))
-            .await
-        {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(_)) => {
-                counters.too_large.fetch_add(1, Ordering::Relaxed);
-                return with_cors(
-                    error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
-                    origin,
-                );
-            }
-            Err(_) => {
-                counters.bad_request.fetch_add(1, Ordering::Relaxed);
-                return with_cors(error(StatusCode::REQUEST_TIMEOUT, "body_timeout"), origin);
-            }
-        };
+    let bytes = match read_body(body, collect.settings.body_timeout).await {
+        BodyRead::Complete(bytes) => bytes,
+        BodyRead::TooLarge => {
+            counters.too_large.fetch_add(1, Ordering::Relaxed);
+            return with_cors(
+                error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
+                origin,
+            );
+        }
+        BodyRead::Unreadable => {
+            counters.bad_request.fetch_add(1, Ordering::Relaxed);
+            return with_cors(error(StatusCode::BAD_REQUEST, "body_unreadable"), origin);
+        }
+        BodyRead::TimedOut => {
+            counters.bad_request.fetch_add(1, Ordering::Relaxed);
+            return with_cors(error(StatusCode::REQUEST_TIMEOUT, "body_timeout"), origin);
+        }
+    };
+
+    // What the request says about its sender. The address is used for the
+    // country and goes no further.
+    let user_agent = parts.headers.get(USER_AGENT).and_then(|v| v.to_str().ok());
+    let enrichment = Enrichment::of_request(user_agent, Some(client), collect.geo.as_deref());
 
     // Decoding, the guard and the durable write block the thread (CPU and an
     // fsync wait), so they run off the async workers.
     let work = Arc::clone(&collect);
-    let outcome = tokio::task::spawn_blocking(move || store(&work, &admission, &bytes, now)).await;
+    let outcome =
+        tokio::task::spawn_blocking(move || store(&work, &admission, &bytes, now, &enrichment))
+            .await;
     let response = match outcome {
         Ok(Outcome::Stored { accepted, dropped }) => {
             counters.accepted.fetch_add(1, Ordering::Relaxed);
@@ -378,19 +513,40 @@ enum Outcome {
     Unavailable,
 }
 
-fn store(collect: &Collect, admission: &Admission, body: &[u8], now: u64) -> Outcome {
-    let processed: Processed = match process(admission, body, now, &collect.settings.limits) {
-        Ok(processed) => processed,
-        Err(error) => return Outcome::Refused(error.as_str()),
+fn store(
+    collect: &Collect,
+    admission: &Admission,
+    body: &[u8],
+    now: u64,
+    enrichment: &Enrichment,
+) -> Outcome {
+    let context = Context {
+        enrichment: Some(enrichment),
+        deduper: Some(&collect.deduper),
     };
+    let processed: Processed =
+        match process_with(admission, body, now, &collect.settings.limits, &context) {
+            Ok(processed) => processed,
+            Err(error) => return Outcome::Refused(error.as_str()),
+        };
     let dropped: u64 = processed.drops.iter().map(|d| d.count).sum();
     match enqueue(&collect.spool, &processed, admission.site_id, now) {
-        Ok(stored) => Outcome::Stored {
-            accepted: stored.events,
-            // Events that passed the guard but could not become a row are
-            // dropped too.
-            dropped: dropped + stored.invalid as u64,
-        },
+        Ok(stored) => {
+            // Only now are the events durable, so only now may a retry of
+            // them be taken for a duplicate.
+            collect
+                .deduper
+                .remember(processed.accepted.iter().map(|a| a.event_key), now);
+            collect
+                .counters
+                .add_drops(&processed, stored.invalid as u64);
+            Outcome::Stored {
+                accepted: stored.events,
+                // Events that passed the guard but could not become a row are
+                // dropped too.
+                dropped: dropped + stored.invalid as u64,
+            }
+        }
         Err(SpoolError::Full | SpoolError::Busy | SpoolError::Closed | SpoolError::Io(_)) => {
             Outcome::Unavailable
         }
@@ -817,6 +973,80 @@ mod tests {
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
         assert_eq!(answer["error"], "body_timeout");
         assert_eq!(spooled(&w), 0);
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn the_client_address_is_the_socket_peer_unless_proxies_are_trusted() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let forwarded = headers(&[("x-forwarded-for", "1.1.1.1, 9.9.9.9")]);
+        assert_eq!(client_address(&forwarded, peer, 0, "x-forwarded-for"), peer);
+        let nine: IpAddr = "9.9.9.9".parse().unwrap();
+        assert_eq!(client_address(&forwarded, peer, 1, "x-forwarded-for"), nine);
+        let one: IpAddr = "1.1.1.1".parse().unwrap();
+        assert_eq!(client_address(&forwarded, peer, 2, "x-forwarded-for"), one);
+    }
+
+    #[test]
+    fn a_forwarded_header_that_cannot_be_trusted_falls_back_to_the_peer() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        for (pairs, hops) in [
+            (vec![], 1),
+            (vec![("x-forwarded-for", "9.9.9.9")], 2),
+            (vec![("x-forwarded-for", "not-an-address")], 1),
+            (vec![("x-forwarded-for", "")], 1),
+            (vec![("x-other", "9.9.9.9")], 1),
+        ] {
+            let map = headers(&pairs);
+            assert_eq!(
+                client_address(&map, peer, hops, "x-forwarded-for"),
+                peer,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn several_header_lines_count_as_one_list_in_order() {
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let map = headers(&[
+            ("x-forwarded-for", "1.1.1.1"),
+            ("x-forwarded-for", "2.2.2.2, 3.3.3.3"),
+        ]);
+        let third: IpAddr = "3.3.3.3".parse().unwrap();
+        assert_eq!(client_address(&map, peer, 1, "x-forwarded-for"), third);
+        let ipv6 = headers(&[("x-forwarded-for", "2001:db8::7")]);
+        assert_eq!(
+            client_address(&ipv6, peer, 1, "x-forwarded-for"),
+            "2001:db8::7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_fails_while_arriving_is_not_called_too_large() {
+        let failing = Body::from_stream(futures_util::stream::iter(vec![
+            Ok(axum::body::Bytes::from_static(b"{")),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+        assert!(matches!(
+            read_body(failing, Duration::from_secs(5)).await,
+            BodyRead::Unreadable
+        ));
+        let big = Body::from(vec![b' '; MAX_BODY_LEN + 1]);
+        assert!(matches!(
+            read_body(big, Duration::from_secs(5)).await,
+            BodyRead::TooLarge
+        ));
     }
 
     #[tokio::test]

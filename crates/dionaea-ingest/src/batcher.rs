@@ -169,6 +169,11 @@ impl Batcher {
         &self.stats
     }
 
+    /// A handle to the counters that outlives the batcher, for the metrics.
+    pub fn stats_handle(&self) -> Arc<BatcherStats> {
+        Arc::clone(&self.stats)
+    }
+
     /// Stops after the insert in progress (or the wait after a failure) and
     /// waits for the thread. Records not yet confirmed stay in the spool.
     pub fn stop(mut self) {

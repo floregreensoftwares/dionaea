@@ -1,6 +1,8 @@
 mod collect;
 mod config;
 mod meta_cli;
+mod net;
+mod ops;
 mod schema_cli;
 mod server;
 
