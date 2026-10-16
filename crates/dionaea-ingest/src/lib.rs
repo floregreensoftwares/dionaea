@@ -10,6 +10,7 @@ mod cache;
 mod dedup;
 mod drops;
 mod enrich;
+mod identify;
 mod limit;
 mod pipeline;
 mod sink;
@@ -19,12 +20,16 @@ pub use cache::{Admission, Cache, Refusal};
 pub use dedup::Deduper;
 pub use drops::DropAggregator;
 pub use enrich::{CountryLookup, Enrichment, MaxMind, UserAgent, parse_user_agent};
+pub use identify::{IDENTIFY_EVENT, Identified, Traits, process_identify};
 pub use limit::{RateLimiter, RetryAfter};
 pub use pipeline::{
     Accepted, Context, DropCount, Limits, Processed, Reason, UNDECLARED_EVENT, UNPARSED_EVENT,
     process, process_with,
 };
-pub use sink::{CHUNK_BYTES, Enqueued, INVALID_ROW, enqueue, enqueue_drop_rows, enqueue_identity};
+pub use sink::{
+    CHUNK_BYTES, Enqueued, INVALID_ROW, enqueue, enqueue_drop_rows, enqueue_identified,
+    enqueue_identity,
+};
 
 #[cfg(test)]
 mod tests;
@@ -34,3 +39,6 @@ mod batch_tests;
 
 #[cfg(test)]
 mod enrich_tests;
+
+#[cfg(test)]
+mod identify_tests;

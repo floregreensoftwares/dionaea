@@ -15,6 +15,9 @@ use dionaea_spool::{Config as SpoolConfig, Spool};
 const SCHEMA: &str =
     "[events.checkout.fields.items]\nkind = \"count\"\nmax = 100\nrequired = true\n";
 
+/// The events schema plus two identity traits.
+const SCHEMA_WITH_TRAITS: &str = "[events.checkout.fields.items]\nkind = \"count\"\nmax = 100\nrequired = true\n\n[traits.plan]\nkind = \"id\"\n\n[traits.seats]\nkind = \"count\"\nmax = 1000\n";
+
 fn dir(test: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("serve")
@@ -172,9 +175,13 @@ fn batch(n: u32, items: u32) -> String {
 }
 
 fn bootstrap(dir: &Path) -> String {
+    bootstrap_with(dir, SCHEMA)
+}
+
+fn bootstrap_with(dir: &Path, schema_text: &str) -> String {
     run(dir, &["site", "create", "shop"]);
     let schema = dir.join("schema.toml");
-    std::fs::write(&schema, SCHEMA).expect("write the schema");
+    std::fs::write(&schema, schema_text).expect("write the schema");
     run(
         dir,
         &[
@@ -1357,6 +1364,28 @@ fn the_logs_never_hold_a_key_an_address_or_what_a_client_sent() {
         &batch(3, 1),
         "wk_markerwrongkey0000000000",
     );
+    // Identify carries a user id and traits, which are just as private.
+    let identify = r#"{"sent_at":1,"sdk":"marker-sdk","anon_id":"marker-anon","user_id":"marker-user","traits":{"marker-trait":"marker-value"}}"#;
+    server.request(
+        &format!(
+            "POST /v1/identify HTTP/1.1
+X-Dionaea-Key: {key}
+Content-Type: application/json
+X-Forwarded-For: 203.0.113.77
+User-Agent: MarkerAgent/9"
+        ),
+        identify,
+    );
+    server.request(
+        &format!(
+            "POST /v1/identify HTTP/1.1
+X-Dionaea-Key: {key}
+Content-Type: application/json
+X-Forwarded-For: 203.0.113.77
+User-Agent: MarkerAgent/9"
+        ),
+        "{marker-not-json",
+    );
     server.ops("/metrics");
 
     // The capture keeps working after start: ClickHouse is down here, and the
@@ -1747,4 +1776,152 @@ fn repeated_kills_while_sending_lose_no_acknowledged_event() {
         "duplicates stay within one batch per restart"
     );
     drop(server);
+}
+
+fn identify_head(key: &str) -> String {
+    format!("POST /v1/identify HTTP/1.1\r\nX-Dionaea-Key: {key}\r\nContent-Type: application/json")
+}
+
+fn identify_body(anon: &str, user: &str, traits: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_millis();
+    format!(
+        "{{\"sent_at\":{now},\"sdk\":\"test/1.0\",\"anon_id\":\"{anon}\",\"user_id\":\"{user}\",\"traits\":{traits}}}"
+    )
+}
+
+#[test]
+fn an_acknowledged_identify_is_in_the_spool_after_the_server_is_killed() {
+    let dir = dir("identify-durable");
+    let key = bootstrap_with(&dir, SCHEMA_WITH_TRAITS);
+    let server = Server::start(&dir);
+
+    let (status, response) = server.request(
+        &identify_head(&key),
+        &identify_body(
+            "a1",
+            "u_42",
+            "{\"plan\":\"pro\",\"seats\":4,\"email\":\"x\"}",
+        ),
+    );
+    assert_eq!(status, 202, "{response}");
+    assert!(
+        response.contains("{\"accepted\":1,\"stripped\":1}"),
+        "{response}"
+    );
+    let (status, response) =
+        server.request(&identify_head(&key), &identify_body("a1", "a@b.c", "{}"));
+    assert_eq!(status, 400, "an email address is not a user id: {response}");
+    assert_eq!(server.request("GET /v1/identify HTTP/1.1", "").0, 405);
+
+    let metrics = server.ops("/metrics").1;
+    assert_eq!(
+        metric(&metrics, "dionaea_identifies_total{result=\"linked\"}"),
+        1
+    );
+    assert_eq!(
+        metric(&metrics, "dionaea_identify_traits_stripped_total"),
+        1
+    );
+
+    drop(server);
+    let mut config = SpoolConfig::new(dir.join("spool"));
+    config.sync = false;
+    let spool = Spool::open(config).expect("reopen the spool");
+    let records = spool.read(100, usize::MAX).expect("read");
+    assert_eq!(records.len(), 1, "the refused request wrote nothing");
+    let text = String::from_utf8_lossy(&records[0].payload).into_owned();
+    for expected in [
+        "\"anon_id\":\"a1\"",
+        "\"user_id\":\"u_42\"",
+        "\"plan\":\"pro\"",
+    ] {
+        assert!(text.contains(expected), "{expected} in {text}");
+    }
+    assert!(!text.contains("email"), "an undeclared trait is not kept");
+}
+
+/// Identify against the whole product: the link and the traits reach
+/// ClickHouse, the anonymous id's events show under the user, and a retry or
+/// a later identify keeps one current row.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn identify_links_an_anonymous_id_to_a_user_and_keeps_the_latest_traits() {
+    let database = ScratchDatabase::new("identify");
+    let dir = dir("identify");
+    let key = {
+        let run_here = |args: &[&str]| {
+            let output = in_clickhouse(&dir, &database.name)
+                .args(args)
+                .output()
+                .expect("run the binary");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_here(&["site", "create", "shop"]);
+        let schema = dir.join("schema.toml");
+        std::fs::write(&schema, SCHEMA_WITH_TRAITS).expect("write the schema");
+        run_here(&[
+            "schema",
+            "push",
+            "--site",
+            "1",
+            schema.to_str().expect("utf-8"),
+        ]);
+        run_here(&["key", "issue", "--site", "1"])
+    };
+    let server = Server::start_with(in_clickhouse(&dir, &database.name));
+
+    // Events of two devices; only a1 is identified.
+    assert_eq!(server.request(&collect_head(&key), &batch(1, 1)).0, 202);
+    let other = batch(2, 1).replace("\"anon_id\":\"a1\"", "\"anon_id\":\"a2\"");
+    assert_eq!(server.request(&collect_head(&key), &other).0, 202);
+    let first = identify_body("a1", "u_42", "{\"plan\":\"free\",\"seats\":1}");
+    assert_eq!(server.request(&identify_head(&key), &first).0, 202);
+    // The same request again, as an SDK retry.
+    assert_eq!(server.request(&identify_head(&key), &first).0, 202);
+
+    database.wait_for("the events", "SELECT count() FROM events", 2);
+    database.wait_for(
+        "the link",
+        "SELECT count() FROM identity_alias FINAL WHERE anon_id = 'a1' AND user_id = 'u_42'",
+        1,
+    );
+    let of_user = "SELECT count() FROM events WHERE (site_id, anon_id) IN \
+        (SELECT site_id, anon_id FROM identity_alias FINAL WHERE user_id = 'u_42')";
+    assert_eq!(database.number(of_user), 1, "only the identified device");
+
+    // Later traits replace the earlier ones; an identify with no declared
+    // trait leaves them alone.
+    std::thread::sleep(Duration::from_millis(20));
+    let second = identify_body("a1", "u_42", "{\"plan\":\"pro\",\"seats\":5}");
+    assert_eq!(server.request(&identify_head(&key), &second).0, 202);
+    let none = identify_body("a1", "u_42", "{\"nothing_declared\":1}");
+    assert_eq!(server.request(&identify_head(&key), &none).0, 202);
+    let current = "SELECT concat(traits_str['plan'], ',', toString(traits_num['seats'])) \
+        FROM user_traits FINAL WHERE user_id = 'u_42'";
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while database.text(current) != "pro,5" {
+        assert!(
+            Instant::now() < deadline,
+            "traits never became pro,5: {}",
+            database.text(current)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        database.text(current),
+        "pro,5",
+        "the empty identify changed nothing"
+    );
+    assert_eq!(
+        database.number("SELECT count() FROM identity_alias FINAL"),
+        1,
+        "one pair however often it was sent"
+    );
+    let metrics = server.ops("/metrics").1;
+    assert!(metric(&metrics, "dionaea_batcher_rows_total{table=\"identity\"}") >= 2);
 }
