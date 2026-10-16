@@ -44,7 +44,6 @@ pub struct Config {
     pub timeout: Duration,
 }
 
-/// How to verify the server when talking TLS.#[derive(Debug, Clone, Default)]pub struct TlsConfig {    /// A PEM file with the certificates to trust (the server's CA). Without    /// it the Mozilla root set is trusted.    pub ca_file: Option<PathBuf>,    /// The name the server's certificate must carry. Defaults to the host.    pub server_name: Option<String>,}
 /// How to verify the server when talking TLS.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
