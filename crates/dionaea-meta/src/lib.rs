@@ -26,8 +26,8 @@ mod sqlite;
 mod tests;
 
 pub use erasure::{
-    ErasureRequest, ErasureState, ErasureSummary, HashKey, IdKind, MAX_KEY_LEN, MIN_KEY_LEN,
-    TombstoneBatch, Tombstones,
+    ErasureRequest, ErasureState, ErasureSummary, HashKey, HashKeys, IdKind, MAX_KEY_LEN,
+    MIN_KEY_LEN, TombstoneBatch, Tombstones,
 };
 pub use sqlite::SqliteMeta;
 
@@ -291,8 +291,9 @@ pub trait MetaStore: Send + Sync {
     /// Puts a failed request back to `requested`.
     fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError>;
 
-    /// The key that keys the tombstone hashes, if one is configured.
-    fn erasure_key(&self) -> Option<HashKey>;
+    /// The keys that key the tombstone hashes: the one new tombstones use and
+    /// the earlier ones older tombstones were made with.
+    fn erasure_keys(&self) -> HashKeys;
 
     /// The tombstones made after position `after` (0 for all), oldest first,
     /// at most `limit`. They are never removed, so a node that remembers the

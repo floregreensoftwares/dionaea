@@ -11,10 +11,16 @@
 //! The hash is HMAC-SHA-256, keyed with a secret the operator configures
 //! (the same on every node), over a fixed prefix, the kind, the site and the
 //! identifier. Someone who holds only the metadata file cannot test whether a
-//! guessable identifier (`u_42`) was erased. The key is never stored; a check
-//! value derived from it is, so a node started with another key refuses to
-//! run instead of silently missing every tombstone. There is no rotation:
-//! the identifiers are gone, so the hashes cannot be recomputed.
+//! guessable identifier (`u_42`) was erased. The key is never stored; each
+//! tombstone records a check value derived from the key that made it, so a
+//! node that lacks one of those keys refuses to run instead of silently
+//! missing every tombstone made with it.
+//!
+//! The key can be replaced: the new one is configured as the current key and
+//! the old ones stay configured as previous keys. New tombstones use the
+//! current key and every key is tried when a tombstone is looked up. What
+//! cannot be done is to stop depending on an old key: the identifiers are
+//! gone, so the hashes made with it cannot be recomputed.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -167,6 +173,42 @@ impl fmt::Debug for HashKey {
 pub const MIN_KEY_LEN: usize = 32;
 pub const MAX_KEY_LEN: usize = 512;
 
+/// The key that makes new tombstones and the earlier ones that older
+/// tombstones were made with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HashKeys {
+    current: Option<HashKey>,
+    previous: Vec<HashKey>,
+}
+
+impl HashKeys {
+    /// No key: erasure is unavailable until one is configured.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn new(current: HashKey, previous: Vec<HashKey>) -> Self {
+        Self {
+            current: Some(current),
+            previous,
+        }
+    }
+
+    /// The key new tombstones are made with.
+    pub fn current(&self) -> Option<&HashKey> {
+        self.current.as_ref()
+    }
+
+    /// Every key, the current one first.
+    pub fn all(&self) -> impl Iterator<Item = &HashKey> {
+        self.current.iter().chain(self.previous.iter())
+    }
+
+    pub(crate) fn knows(&self, check: &str) -> bool {
+        self.all().any(|key| key.check() == check)
+    }
+}
+
 impl HashKey {
     /// A key from the operator's secret: 32 to 512 bytes of printable text,
     /// random enough that it cannot be guessed (`openssl rand -hex 32`).
@@ -203,7 +245,7 @@ impl HashKey {
     }
 
     /// The value stored to recognise this key later, never the key.
-    pub(crate) fn check(&self) -> String {
+    pub fn check(&self) -> String {
         hex(&hmac_sha256(&self.0, &[b"dionaea/erasure/key-check"]))
     }
 
@@ -242,8 +284,8 @@ struct Inner {
     users: HashSet<(u32, u128)>,
     anons: HashSet<(u32, u128)>,
     last: u64,
-    /// The key the hashes were made with, once the store has said which.
-    key: Option<HashKey>,
+    /// The keys the hashes were made with, once the store has said which.
+    keys: HashKeys,
 }
 
 /// Every tombstone, for the ingest path to consult without a query. They are
@@ -273,7 +315,7 @@ impl Tombstones {
         self.inner
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .key = store.erasure_key();
+            .keys = store.erasure_keys();
         loop {
             let after = self.read().last;
             let batch = store.tombstones_since(after, BATCH)?;
@@ -318,24 +360,22 @@ impl Tombstones {
     /// Whether this user of the site was erased or is being erased.
     pub fn user_erased(&self, site_id: u32, user_id: &str) -> bool {
         let inner = self.read();
-        let Some(key) = &inner.key else {
-            return false;
-        };
         !inner.users.is_empty()
-            && inner
-                .users
-                .contains(&(site_id, key.short_of(site_id, IdKind::User, user_id)))
+            && inner.keys.all().any(|key| {
+                inner
+                    .users
+                    .contains(&(site_id, key.short_of(site_id, IdKind::User, user_id)))
+            })
     }
 
     /// Whether this device of the site belonged to an erased user.
     pub fn anon_erased(&self, site_id: u32, anon_id: &str) -> bool {
         let inner = self.read();
-        let Some(key) = &inner.key else {
-            return false;
-        };
         !inner.anons.is_empty()
-            && inner
-                .anons
-                .contains(&(site_id, key.short_of(site_id, IdKind::Anon, anon_id)))
+            && inner.keys.all().any(|key| {
+                inner
+                    .anons
+                    .contains(&(site_id, key.short_of(site_id, IdKind::Anon, anon_id)))
+            })
     }
 }

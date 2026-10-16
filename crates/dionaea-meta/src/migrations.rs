@@ -131,9 +131,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "erasure_key_check",
         sql: "
-        -- A value derived from the key that keys the tombstone hashes, never
-        -- the key: a server started with another key must not run.
-        ALTER TABLE state ADD COLUMN erasure_key_check TEXT;
+        -- A value derived from the key that made each tombstone, never the key:
+        -- a server that does not have every key the tombstones were made with
+        -- must not run.
+        ALTER TABLE erasure_tombstones ADD COLUMN key_check TEXT NOT NULL DEFAULT '';
     ",
     },
     Migration {

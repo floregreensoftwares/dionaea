@@ -334,3 +334,68 @@ fn the_key_may_come_from_a_file_but_not_from_both() {
     );
     assert_eq!(again.status.code(), Some(0), "{}", err(&again));
 }
+
+#[test]
+fn the_key_can_be_replaced_when_the_old_one_is_kept_as_a_previous_key() {
+    let dir = dir("erase-rotate");
+    let db = dir.join("meta.db");
+    let old = "0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        run_keyed(&db, &["site", "create", "shop"], None)
+            .status
+            .code(),
+        Some(0)
+    );
+    let first = run_keyed(
+        &db,
+        &["erase", "request", "--site", "1", "--user", "u_1"],
+        Some(old),
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", err(&first));
+
+    let run_rotated = |previous: Option<&str>, user: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dionaea"));
+        command
+            .args(["erase", "request", "--site", "1", "--user", user])
+            .env("DIONAEA_METADATA_PATH", &db)
+            .env("DIONAEA_ERASURE_KEY", OTHER_KEY)
+            .env_remove("DIONAEA_ERASURE_KEY_FILE")
+            .env_remove("DIONAEA_ERASURE_PREVIOUS_KEYS");
+        if let Some(previous) = previous {
+            command.env("DIONAEA_ERASURE_PREVIOUS_KEYS", previous);
+        }
+        command.output().expect("run the binary")
+    };
+    let alone = run_rotated(None, "u_2");
+    assert_eq!(alone.status.code(), Some(1), "{}", err(&alone));
+    let message = err(&alone);
+    assert!(
+        message.contains("not configured") && message.contains("erasure_previous_keys"),
+        "{message}"
+    );
+    assert!(!message.contains(old) && !message.contains(OTHER_KEY));
+
+    let rotated = run_rotated(Some(old), "u_2");
+    assert_eq!(rotated.status.code(), Some(0), "{}", err(&rotated));
+    assert_eq!(
+        out(&run_keyed(&db, &["erase", "list"], None))
+            .lines()
+            .count(),
+        2
+    );
+
+    // A previous key with no current key is an error that says so.
+    let mut orphan = Command::new(env!("CARGO_BIN_EXE_dionaea"));
+    orphan
+        .args(["erase", "list"])
+        .env("DIONAEA_METADATA_PATH", &db)
+        .env_remove("DIONAEA_ERASURE_KEY")
+        .env("DIONAEA_ERASURE_PREVIOUS_KEYS", old);
+    let orphan = orphan.output().expect("run the binary");
+    assert_eq!(orphan.status.code(), Some(2));
+    assert!(
+        err(&orphan).contains("set the current key"),
+        "{}",
+        err(&orphan)
+    );
+}
