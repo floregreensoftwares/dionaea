@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -8,6 +9,7 @@ const ENV_PREFIX: &str = "DIONAEA_";
 pub(crate) struct Config {
     pub(crate) listen: SocketAddr,
     pub(crate) clickhouse_url: String,
+    pub(crate) metadata_path: PathBuf,
     pub(crate) log_level: String,
     pub(crate) log_format: LogFormat,
 }
@@ -41,6 +43,7 @@ impl std::error::Error for ConfigError {}
 struct FileConfig {
     listen: Option<String>,
     clickhouse_url: Option<String>,
+    metadata_path: Option<PathBuf>,
     log_level: Option<String>,
     log_format: Option<LogFormat>,
 }
@@ -77,6 +80,11 @@ impl Config {
             reason,
         })?;
 
+        let metadata_path = var("METADATA_PATH")
+            .map(PathBuf::from)
+            .or(file.metadata_path)
+            .unwrap_or_else(|| PathBuf::from("dionaea.db"));
+
         let log_level = var("LOG_LEVEL")
             .or(file.log_level)
             .unwrap_or_else(|| "info".to_owned());
@@ -98,6 +106,7 @@ impl Config {
         Ok(Self {
             listen,
             clickhouse_url,
+            metadata_path,
             log_level,
             log_format,
         })
@@ -136,6 +145,7 @@ mod tests {
         let config = Config::resolve(None, no_env).unwrap();
         assert_eq!(config.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(config.clickhouse_url, "http://127.0.0.1:8123");
+        assert_eq!(config.metadata_path, PathBuf::from("dionaea.db"));
         assert_eq!(config.log_level, "info");
         assert_eq!(config.log_format, LogFormat::Json);
     }
@@ -154,6 +164,17 @@ mod tests {
         let env = |name: &str| (name == "DIONAEA_LISTEN").then(|| "127.0.0.1:7000".to_owned());
         let config = Config::resolve(Some(file), env).unwrap();
         assert_eq!(config.listen, "127.0.0.1:7000".parse().unwrap());
+    }
+
+    #[test]
+    fn the_metadata_path_comes_from_the_file_and_the_environment() {
+        let file = "metadata_path = \"/data/meta.db\"
+";
+        let config = Config::resolve(Some(file), no_env).unwrap();
+        assert_eq!(config.metadata_path, PathBuf::from("/data/meta.db"));
+        let env = |name: &str| (name == "DIONAEA_METADATA_PATH").then(|| "other.db".to_owned());
+        let config = Config::resolve(Some(file), env).unwrap();
+        assert_eq!(config.metadata_path, PathBuf::from("other.db"));
     }
 
     #[test]

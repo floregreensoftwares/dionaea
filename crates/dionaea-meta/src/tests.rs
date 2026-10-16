@@ -72,6 +72,13 @@ fn organizations_and_sites_are_unique_by_name() {
         Err(MetaError::NotFound("organization"))
     ));
     assert_eq!(store.sites().expect("sites"), vec![shop, same_name]);
+    let names: Vec<String> = store
+        .organizations()
+        .expect("organizations")
+        .into_iter()
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(names, ["Acme", "Other"]);
 }
 
 #[test]
@@ -500,4 +507,25 @@ fn the_trait_object_works() {
     let store: Box<dyn MetaStore> = Box::new(store());
     store.ping().expect("ping");
     assert_eq!(store.generation().expect("generation"), 0);
+}
+
+#[test]
+fn keys_issued_in_the_same_second_are_listed_in_the_order_they_were_issued() {
+    let store = store().with_clock(|| 1_000);
+    let site = site(&store);
+    let issued: Vec<String> = (0..8)
+        .map(|n| {
+            store
+                .issue_write_key(site.id, &format!("k{n}"), &[])
+                .expect("key")
+                .key
+        })
+        .collect();
+    let listed: Vec<String> = store
+        .write_keys(site.id)
+        .expect("keys")
+        .into_iter()
+        .map(|k| k.key)
+        .collect();
+    assert_eq!(listed, issued);
 }

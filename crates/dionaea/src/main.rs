@@ -1,5 +1,6 @@
 mod clickhouse;
 mod config;
+mod meta_cli;
 mod schema_cli;
 mod server;
 
@@ -9,6 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use config::{Config, LogFormat};
+use dionaea_meta::{MetaStore, SqliteMeta};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -31,6 +33,16 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
+    /// Create and list sites
+    Site {
+        #[command(subcommand)]
+        command: SiteCommand,
+    },
+    /// Issue, list and revoke write keys
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -41,6 +53,87 @@ enum SchemaCommand {
     Diff { old: PathBuf, new: PathBuf },
     /// Print the JSON Schema of the schema file format, for editor completion
     JsonSchema,
+    /// Publish a schema file as the next version of a site; exits 1 when it is refused
+    Push {
+        /// Id of the site (see `dionaea site list`)
+        #[arg(long)]
+        site: u32,
+        /// Only list what would change; store nothing
+        #[arg(long)]
+        dry_run: bool,
+        file: PathBuf,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List the published versions of a site
+    Versions {
+        #[arg(long)]
+        site: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Stop accepting events under a published version (never the last active one)
+    Retire {
+        #[arg(long)]
+        site: u32,
+        version: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(clap::Args)]
+struct StoreArgs {
+    /// TOML configuration file; `DIONAEA_*` variables override it
+    #[arg(long, short)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum SiteCommand {
+    /// Create a site; prints its id and name
+    Create {
+        name: String,
+        /// Organization to create the site in (made if missing)
+        #[arg(long)]
+        organization: Option<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List sites as id, name and organization
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Issue a write key for a site; prints the key
+    Issue {
+        #[arg(long)]
+        site: u32,
+        #[arg(long, default_value = "default")]
+        label: String,
+        /// A web origin allowed to use the key, such as https://example.com; repeatable
+        #[arg(long = "origin")]
+        origins: Vec<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List the keys of a site as key, state, label and origins
+    List {
+        #[arg(long)]
+        site: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Revoke a write key
+    Revoke {
+        key: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
 }
 
 fn main() -> ExitCode {
@@ -48,10 +141,18 @@ fn main() -> ExitCode {
     match command {
         Command::Serve { config } => serve(config),
         Command::Schema { command } => schema(command),
+        Command::Site { command } => site(command),
+        Command::Key { command } => key(command),
     }
 }
 
 fn schema(command: SchemaCommand) -> ExitCode {
+    if matches!(
+        command,
+        SchemaCommand::Push { .. } | SchemaCommand::Versions { .. } | SchemaCommand::Retire { .. }
+    ) {
+        return schema_store(command);
+    }
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     let read = |path: &PathBuf, err: &mut dyn Write| {
         schema_cli::read_schema_file(path).inspect_err(|message| {
@@ -66,6 +167,11 @@ fn schema(command: SchemaCommand) -> ExitCode {
             Err(_) => schema_cli::UNUSABLE,
         },
         SchemaCommand::JsonSchema => schema_cli::json_schema(&mut out),
+        SchemaCommand::Push { .. }
+        | SchemaCommand::Versions { .. }
+        | SchemaCommand::Retire { .. } => {
+            unreachable!("handled above")
+        }
         SchemaCommand::Diff { old, new } => match (read(&old, &mut err), read(&new, &mut err)) {
             (Ok(old_source), Ok(new_source)) => schema_cli::compare(
                 (&old.display().to_string(), &old_source),
@@ -122,5 +228,103 @@ fn init_logging(config: &Config) {
     match config.log_format {
         LogFormat::Json => builder.json().init(),
         LogFormat::Text => builder.init(),
+    }
+}
+
+/// Opens the metadata store named by the configuration and runs `work` on it.
+fn with_store(
+    args: &StoreArgs,
+    work: impl FnOnce(&dyn MetaStore, &mut std::io::StdoutLock<'_>, &mut std::io::StderrLock<'_>) -> u8,
+) -> ExitCode {
+    let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+    let config = match load_config(args.config.clone()) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return ExitCode::from(meta_cli::UNUSABLE);
+        }
+    };
+    let store = match SqliteMeta::open(&config.metadata_path) {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "error: cannot open {}: {error}",
+                config.metadata_path.display()
+            );
+            return ExitCode::from(meta_cli::UNUSABLE);
+        }
+    };
+    ExitCode::from(work(&store, &mut out, &mut err))
+}
+
+fn site(command: SiteCommand) -> ExitCode {
+    match command {
+        SiteCommand::Create {
+            name,
+            organization,
+            store,
+        } => with_store(&store, |meta, out, err| {
+            meta_cli::site_create(meta, &name, organization.as_deref(), out, err)
+        }),
+        SiteCommand::List { store } => {
+            with_store(&store, |meta, out, err| meta_cli::site_list(meta, out, err))
+        }
+    }
+}
+
+fn key(command: KeyCommand) -> ExitCode {
+    match command {
+        KeyCommand::Issue {
+            site,
+            label,
+            origins,
+            store,
+        } => with_store(&store, |meta, out, err| {
+            meta_cli::key_issue(meta, site, &label, &origins, out, err)
+        }),
+        KeyCommand::List { site, store } => with_store(&store, |meta, out, err| {
+            meta_cli::key_list(meta, site, out, err)
+        }),
+        KeyCommand::Revoke { key, store } => {
+            with_store(&store, |meta, _, err| meta_cli::key_revoke(meta, &key, err))
+        }
+    }
+}
+
+/// `schema push`, `versions` and `retire`: the schema commands that need the store.
+fn schema_store(command: SchemaCommand) -> ExitCode {
+    match command {
+        SchemaCommand::Push {
+            site,
+            dry_run,
+            file,
+            store,
+        } => {
+            let source = match schema_cli::read_schema_file(&file) {
+                Ok(source) => source,
+                Err(message) => {
+                    let _ = writeln!(std::io::stderr(), "error: {message}");
+                    return ExitCode::from(meta_cli::UNUSABLE);
+                }
+            };
+            let label = file.display().to_string();
+            with_store(&store, |meta, out, err| {
+                meta_cli::schema_push(meta, site, (&label, &source), dry_run, out, err)
+            })
+        }
+        SchemaCommand::Versions { site, store } => with_store(&store, |meta, out, err| {
+            meta_cli::schema_versions(meta, site, out, err)
+        }),
+        SchemaCommand::Retire {
+            site,
+            version,
+            store,
+        } => with_store(&store, |meta, _, err| {
+            meta_cli::schema_retire(meta, site, version, err)
+        }),
+        SchemaCommand::Check { .. } | SchemaCommand::Diff { .. } | SchemaCommand::JsonSchema => {
+            unreachable!("handled by `schema`")
+        }
     }
 }
