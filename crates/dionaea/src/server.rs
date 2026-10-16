@@ -177,13 +177,20 @@ impl Live {
     }
 }
 
-/// A name for this server in the metadata store's leases: the process id and
-/// the start time, so two servers on different machines do not share one.
+/// A name for this server in the metadata store's leases: the process id, the
+/// start time and 64 random bits, so two servers do not share one even on
+/// different machines.
 fn worker_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!("{}-{started:x}", std::process::id())
+    // The standard library seeds every `RandomState` from the system.
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("{}-{started:x}-{random:x}", std::process::id())
 }
 
 /// The time now, in milliseconds since the Unix epoch.

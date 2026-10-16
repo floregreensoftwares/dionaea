@@ -132,6 +132,7 @@ pub(crate) struct Job {
     eraser: Arc<dyn Eraser>,
     worker: String,
     stats: Arc<JobStats>,
+    heartbeat: Duration,
 }
 
 /// The rows per table, as text for a request's report.
@@ -155,7 +156,15 @@ impl Job {
             eraser,
             worker: worker.into(),
             stats,
+            heartbeat: HEARTBEAT,
         }
+    }
+
+    /// How often the lease is renewed while work runs; for tests.
+    #[cfg(test)]
+    fn with_heartbeat(mut self, every: Duration) -> Self {
+        self.heartbeat = every;
+        self
     }
 
     /// What to do with a step that failed: delay the request when the cause
@@ -235,31 +244,45 @@ impl Job {
             return;
         }
         let done = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
         thread::scope(|scope| {
-            scope.spawn(|| self.heartbeat(&done));
-            while self.hide_next(timing, now_secs, wait) {}
-            self.finish_due(timing, now_secs);
+            let beat = scope.spawn(|| self.heartbeat(&done, &lost));
+            // A server that lost the lease finishes the statement it is in and
+            // starts nothing more.
+            loop {
+                if lost.load(Ordering::Acquire) || !self.hide_next(timing, now_secs, wait) {
+                    break;
+                }
+            }
+            if !lost.load(Ordering::Acquire) {
+                self.finish_due(timing, now_secs);
+            }
             done.store(true, Ordering::Release);
+            beat.thread().unpark();
         });
+        if lost.load(Ordering::Acquire) {
+            self.stats.leader.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Renews the lease while the work runs, so a long statement does not let
-    /// another server in.
-    fn heartbeat(&self, done: &AtomicBool) {
-        let mut waited = Duration::ZERO;
-        while !done.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(50));
-            waited += Duration::from_millis(50);
-            if waited >= HEARTBEAT {
-                waited = Duration::ZERO;
-                match self
-                    .meta
-                    .try_lease(LEADER_LEASE, &self.worker, LEADER_LEASE_SECS)
-                {
-                    Ok(true) => {}
-                    Ok(false) => warn!("the erasure lease was taken over while work was running"),
-                    Err(error) => warn!(%error, "cannot renew the erasure lease"),
+    /// another server in. Sets `lost` if another server holds it by now.
+    fn heartbeat(&self, done: &AtomicBool, lost: &AtomicBool) {
+        loop {
+            thread::park_timeout(self.heartbeat);
+            if done.load(Ordering::Acquire) {
+                return;
+            }
+            match self
+                .meta
+                .try_lease(LEADER_LEASE, &self.worker, LEADER_LEASE_SECS)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("the erasure lease was taken over while work was running");
+                    lost.store(true, Ordering::Release);
                 }
+                Err(error) => warn!(%error, "cannot renew the erasure lease"),
             }
         }
     }
@@ -977,5 +1000,49 @@ mod tests {
         let summary = w.stats.summary();
         assert_eq!((summary.requested, summary.hidden), (0, 2));
         assert_eq!(summary.oldest_open_at, Some(1_000));
+    }
+
+    #[test]
+    fn a_server_that_loses_the_lease_mid_round_starts_nothing_more() {
+        let w = world(two_users());
+        let job = Job::new(
+            Arc::clone(&w.meta) as Arc<dyn MetaStore>,
+            Arc::clone(&w.fake) as Arc<dyn Eraser>,
+            "slow",
+            Arc::clone(&w.stats),
+        )
+        .with_heartbeat(Duration::from_millis(20));
+        let (other, other_stats) = second_server(&w);
+        let first = w.meta.request_erasure(w.site, "u1", "ops").unwrap();
+
+        let second = std::cell::Cell::new(None);
+        // Far enough ahead that a request made during the round is due.
+        job.run_round(TIMING, 10_000, &|_| {
+            if second.get().is_none() {
+                // The server stalls past its lease and another takes it...
+                w.now.store(1_000 + LEADER_LEASE_SECS, Ordering::SeqCst);
+                round(&other, &w);
+                // ...then a request arrives that only the old leader could
+                // still pick up in this round.
+                second.set(Some(
+                    w.meta.request_erasure(w.site, "u2", "ops").unwrap().id,
+                ));
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            true
+        });
+        assert!(other_stats.leader.load(Ordering::Relaxed));
+        assert!(!w.stats.leader.load(Ordering::Relaxed), "it knows it lost");
+        assert_eq!(
+            w.meta.erasure_request(first.id).unwrap().state,
+            ErasureState::Hidden,
+            "the one in progress was finished"
+        );
+        assert_eq!(
+            w.meta.erasure_request(second.get().unwrap()).unwrap().state,
+            ErasureState::Requested,
+            "and nothing was started after the lease was lost"
+        );
+        assert_eq!(w.stats.hidden.load(Ordering::Relaxed), 1);
     }
 }
