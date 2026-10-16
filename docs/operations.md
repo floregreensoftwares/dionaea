@@ -214,7 +214,7 @@ A request is recorded in the metadata store and from that moment every server dr
 
 1. finds every anonymous id linked to the user in `identity_alias` and keeps a permanent hash of each (and of the user id) so the device stays blocked when it keeps sending;
 2. waits for every server to have loaded the hashes, then deletes the user's rows and the rows of those devices from `events`, `identity_alias` and `user_traits` with a lightweight delete. Queries stop returning them at once; the request is `hidden`;
-3. after `erase_finish_after_secs`, deletes once more (a slow server may have inserted some), rewrites the tables without the deleted rows (`APPLY DELETED MASK`, one rewrite for all the requests due together) and counts directly, marked rows included, that none is left. Then the request is `complete`; if any remains it is `failed` with the counts.
+3. after `erase_finish_after_secs`, deletes once more (a slow server may have inserted some), rewrites the data without the deleted rows (`APPLY DELETED MASK`, one rewrite for all the requests due together, and only of the monthly partitions of `events` that still hold a deleted row of theirs; the small tables of links and traits are rewritten whole) and counts directly, marked rows included, that none is left. Then the request is `complete`; if any remains it is `failed` with the counts.
 
 Rows that were already in a server's spool are left out when they are inserted, so a replay cannot bring the user back.
 

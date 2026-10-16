@@ -3,7 +3,9 @@
 //! Erasure has two steps in ClickHouse. A lightweight `DELETE` marks rows in
 //! a hidden column, so every query stops returning them within moments but
 //! the data is still in the parts. `ALTER TABLE ... APPLY DELETED MASK`
-//! rewrites the parts without those rows, which removes the data from disk.
+//! rewrites the parts without those rows, which removes the data from disk;
+//! [`Store::rewrites_needed`] says which partitions hold marked rows of a user
+//! so that only those are rewritten, and [`Store::apply_rewrites`] does it.
 //! [`Store::count_user_rows`] can count with or without the marked rows, so
 //! both steps are verified by a direct count.
 //!
@@ -21,6 +23,9 @@ pub struct IdentifierTable {
     pub anon_column: Option<&'static str>,
     /// The column with the user id, if the table has one.
     pub user_column: Option<&'static str>,
+    /// The expression the table is partitioned by, if it is. Only the
+    /// partitions that hold marked rows are rewritten.
+    pub partition: Option<&'static str>,
 }
 
 /// Every table that holds an anonymous id, a user id or a session id. All of
@@ -30,16 +35,19 @@ pub const IDENTIFIER_TABLES: &[IdentifierTable] = &[
         name: "events",
         anon_column: Some("anon_id"),
         user_column: None,
+        partition: Some("toYYYYMM(ts)"),
     },
     IdentifierTable {
         name: "identity_alias",
         anon_column: Some("anon_id"),
         user_column: Some("user_id"),
+        partition: None,
     },
     IdentifierTable {
         name: "user_traits",
         anon_column: None,
         user_column: Some("user_id"),
+        partition: None,
     },
 ];
 
@@ -54,6 +62,16 @@ const MAX_LINKED_ANON_IDS: usize = 1_000_000;
 pub struct TableCount {
     pub table: &'static str,
     pub rows: u64,
+}
+
+/// A table, or one partition of it, whose marked rows must be removed from
+/// disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rewrite {
+    pub table: &'static str,
+    /// The partition, for a table that is partitioned; `None` rewrites the
+    /// whole table (an unpartitioned one).
+    pub partition: Option<u32>,
 }
 
 /// An identifier is put into a statement as a string literal, so it must be
@@ -170,8 +188,8 @@ impl Store {
 
     /// Deletes the user's rows and those of the anonymous ids with a
     /// lightweight `DELETE`, and returns when ClickHouse has marked them
-    /// (queries no longer see them). The data is still on disk until
-    /// [`remove_deleted_rows`](Self::remove_deleted_rows).
+    /// (queries no longer see them). The data may still be on disk until
+    /// [`apply_rewrites`](Self::apply_rewrites).
     pub fn delete_user_rows(
         &self,
         site_id: u32,
@@ -189,14 +207,79 @@ impl Store {
         Ok(())
     }
 
-    /// Rewrites the parts of every identifier table without the rows marked
-    /// deleted, so that the data is gone from disk, and returns when the
-    /// rewrite is done. It reads and writes the touched parts: run it once a
-    /// day, not per request.
-    pub fn remove_deleted_rows(&self) -> Result<(), Error> {
+    /// What must be rewritten so that the marked rows of the user and the
+    /// anonymous ids are gone from disk: for each partitioned table the
+    /// partitions that still hold such a row, for the others the table if it
+    /// does. Nothing for a table whose marked rows are already gone (some
+    /// versions rewrite the parts when they delete).
+    pub fn rewrites_needed(
+        &self,
+        site_id: u32,
+        user_id: &str,
+        anon_ids: &[String],
+    ) -> Result<Vec<Rewrite>, Error> {
+        let mut needed = Vec::new();
         for table in IDENTIFIER_TABLES {
+            let mut partitions = std::collections::BTreeSet::new();
+            let mut any = false;
+            for condition in conditions(table, site_id, user_id, anon_ids)? {
+                match table.partition {
+                    Some(expression) => {
+                        let answer = self.execute(&format!(
+                            "SELECT DISTINCT {expression} FROM {} WHERE {condition}
+                             SETTINGS apply_deleted_mask = 0 FORMAT TabSeparated",
+                            table.name
+                        ))?;
+                        for line in answer.lines() {
+                            let partition = line.trim().parse::<u32>().map_err(|_| {
+                                Error::InvalidRow("a partition that is not a number".to_owned())
+                            })?;
+                            partitions.insert(partition);
+                        }
+                    }
+                    None => {
+                        let answer = self.execute(&format!(
+                            "SELECT count() FROM {} WHERE {condition}
+                             SETTINGS apply_deleted_mask = 0",
+                            table.name
+                        ))?;
+                        any |= answer.trim() != "0";
+                    }
+                }
+            }
+            if table.partition.is_some() {
+                needed.extend(partitions.into_iter().map(|partition| Rewrite {
+                    table: table.name,
+                    partition: Some(partition),
+                }));
+            } else if any {
+                needed.push(Rewrite {
+                    table: table.name,
+                    partition: None,
+                });
+            }
+        }
+        Ok(needed)
+    }
+
+    /// Rewrites those parts without the rows marked deleted, so that the data
+    /// is gone from disk, and returns when the rewrite is done. The same
+    /// partition asked for twice is rewritten once. It reads and writes the
+    /// parts it touches: run it once a day, not per request.
+    pub fn apply_rewrites(&self, rewrites: &[Rewrite]) -> Result<(), Error> {
+        let unique: std::collections::BTreeSet<&Rewrite> = rewrites.iter().collect();
+        for rewrite in unique {
+            if !IDENTIFIER_TABLES
+                .iter()
+                .any(|table| table.name == rewrite.table)
+            {
+                return Err(Error::InvalidName("not an identifier table".to_owned()));
+            }
+            let scope = rewrite
+                .partition
+                .map_or_else(String::new, |p| format!(" IN PARTITION {p}"));
             self.execute_with(
-                &format!("ALTER TABLE {} APPLY DELETED MASK", table.name),
+                &format!("ALTER TABLE {} APPLY DELETED MASK{scope}", rewrite.table),
                 "mutations_sync=2",
             )?;
         }
