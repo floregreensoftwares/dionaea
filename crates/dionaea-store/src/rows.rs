@@ -52,7 +52,7 @@ fn check_time(ms: u64, what: &str) -> Result<(), Error> {
 }
 
 /// The canonical 36-character form of a UUID.
-fn is_uuid(text: &str) -> bool {
+pub(crate) fn is_uuid(text: &str) -> bool {
     text.len() == 36
         && text.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
@@ -110,6 +110,19 @@ fn string_field(out: &mut String, name: &str, value: &str) {
 
 fn number_field(out: &mut String, name: &str, value: impl std::fmt::Display) {
     let _ = write!(out, "\"{name}\":{value},");
+}
+
+/// The site and event id of a line written by [`EventRow::to_json_line`],
+/// without parsing the rest. Both are the first two fields and neither can
+/// hold anything the sender chose (a number, and a checked UUID), so this
+/// cannot be fooled by the content of the line.
+pub fn event_key(line: &str) -> Option<(u32, &str)> {
+    let rest = line.strip_prefix("{\"site_id\":")?;
+    let (site, rest) = rest.split_once(',')?;
+    let rest = rest.strip_prefix("\"event_id\":\"")?;
+    let id = rest.get(..36)?;
+    (rest[36..].starts_with('"') && is_uuid(id)).then_some(())?;
+    Some((site.parse().ok()?, id))
 }
 
 impl EventRow {

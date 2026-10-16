@@ -11,14 +11,15 @@ pub(crate) struct Migration {
     pub(crate) statements: &'static [&'static str],
 }
 
-pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "events and drops",
-    statements: &[
-        // `non_replicated_deduplication_window` is 0 by default, which would
-        // make a retried insert with the same deduplication token store the
-        // batch twice. The window keeps the hashes of the last 1000 blocks.
-        "CREATE TABLE IF NOT EXISTS events (
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "events and drops",
+        statements: &[
+            // `non_replicated_deduplication_window` is 0 by default, which would
+            // make a retried insert with the same deduplication token store the
+            // batch twice. The window keeps the hashes of the last 1000 blocks.
+            "CREATE TABLE IF NOT EXISTS events (
             site_id        UInt32,
             event_id       UUID,
             ts             DateTime64(3, 'UTC'),
@@ -43,8 +44,8 @@ pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
         ORDER BY (site_id, toDate(ts), name, anon_id, ts)
         TTL toDateTime(ts) + INTERVAL 13 MONTH
         SETTINGS non_replicated_deduplication_window = 1000",
-        // Rollups never hold identifiers, so erasure leaves them untouched.
-        "CREATE TABLE IF NOT EXISTS drops_daily (
+            // Rollups never hold identifiers, so erasure leaves them untouched.
+            "CREATE TABLE IF NOT EXISTS drops_daily (
             site_id    UInt32,
             day        Date,
             event_name LowCardinality(String),
@@ -54,8 +55,28 @@ pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
         ENGINE = SummingMergeTree
         ORDER BY (site_id, day, event_name, reason)
         SETTINGS non_replicated_deduplication_window = 1000",
-    ],
-}];
+        ],
+    },
+    Migration {
+        version: 2,
+        name: "recent event ids",
+        statements: &[
+            // The ids of events stored in the last day, so that every node
+            // can recognise an event another node already stored. It holds
+            // no user, device or session identifier, only random event ids,
+            // and is dropped by the TTL.
+            "CREATE TABLE IF NOT EXISTS event_ids (
+                site_id  UInt32,
+                event_id UUID,
+                seen_at  DateTime64(3, 'UTC')
+            )
+            ENGINE = MergeTree
+            ORDER BY (site_id, event_id)
+            TTL toDateTime(seen_at) + INTERVAL 1 DAY
+            SETTINGS non_replicated_deduplication_window = 1000",
+        ],
+    },
+];
 
 #[cfg(test)]
 mod tests {
