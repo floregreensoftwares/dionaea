@@ -19,6 +19,7 @@ dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
 dionaea-meta = { version = "0.0.0", path = "../dionaea-meta" }
 dionaea-spool = { version = "0.0.0", path = "../dionaea-spool" }
 dionaea-store = { version = "0.0.0", path = "../dionaea-store" }
+maxminddb = "0.32.0"
 
 [dev-dependencies]
 serde_json = "1.0.154"

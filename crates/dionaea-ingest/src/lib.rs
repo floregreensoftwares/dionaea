@@ -7,20 +7,28 @@
 
 mod batcher;
 mod cache;
+mod dedup;
+mod enrich;
 mod limit;
 mod pipeline;
 mod sink;
 
 pub use batcher::{Batcher, BatcherConfig, BatcherStats, Destination};
 pub use cache::{Admission, Cache, Refusal};
+pub use dedup::Deduper;
+pub use enrich::{CountryLookup, Enrichment, MaxMind, UserAgent, parse_user_agent};
 pub use limit::{RateLimiter, RetryAfter};
 pub use pipeline::{
-    Accepted, DropCount, Limits, Processed, Reason, UNDECLARED_EVENT, UNPARSED_EVENT, process,
+    Accepted, Context, DropCount, Limits, Processed, Reason, UNDECLARED_EVENT, UNPARSED_EVENT,
+    process, process_with,
 };
-pub use sink::{Enqueued, INVALID_ROW, enqueue};
+pub use sink::{CHUNK_BYTES, Enqueued, INVALID_ROW, enqueue};
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod batch_tests;
+
+#[cfg(test)]
+mod enrich_tests;
