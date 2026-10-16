@@ -135,6 +135,8 @@ jobs:
           docker compose -f compose.yaml -f compose.tls.yaml up -d --wait
       - name: Run the tests that need it
         run: cargo test -p dionaea-store --test clickhouse --locked -- --ignored
+      - name: Run the ingest path tests against it
+        run: cargo test -p dionaea-ingest --test clickhouse --locked -- --ignored
       - name: Stop ClickHouse
         if: always()
         run: docker compose -f compose.yaml -f compose.tls.yaml down -v
