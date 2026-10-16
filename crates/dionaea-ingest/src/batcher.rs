@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -160,6 +160,7 @@ impl BatcherStats {
 /// A running batcher thread.
 #[derive(Debug)]
 pub struct Batcher {
+    config: Arc<RwLock<BatcherConfig>>,
     stop: Arc<AtomicBool>,
     stats: Arc<BatcherStats>,
     thread: Option<JoinHandle<()>>,
@@ -178,8 +179,10 @@ impl Batcher {
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(BatcherStats::default());
+        let config = Arc::new(RwLock::new(config));
         let thread = {
-            let (stop, stats) = (Arc::clone(&stop), Arc::clone(&stats));
+            let (stop, stats, config) =
+                (Arc::clone(&stop), Arc::clone(&stats), Arc::clone(&config));
             thread::Builder::new()
                 .name("dionaea-batcher".to_owned())
                 .spawn(move || {
@@ -190,10 +193,16 @@ impl Batcher {
                 })?
         };
         Ok(Self {
+            config,
             stop,
             stats,
             thread: Some(thread),
         })
+    }
+
+    /// Changes the grouping and the cross-node check from the next batch.
+    pub fn reconfigure(&self, config: BatcherConfig) {
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = config;
     }
 
     pub fn stats(&self) -> &BatcherStats {
@@ -245,13 +254,20 @@ fn pause(total: Duration, stop: &AtomicBool) {
 fn run(
     spool: &Spool,
     destination: &dyn Destination,
-    config: &BatcherConfig,
+    shared: &RwLock<BatcherConfig>,
     stop: &AtomicBool,
     stats: &BatcherStats,
 ) {
-    let mut backoff = config.backoff_min;
+    let current = || {
+        shared
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
+    let mut backoff = current().backoff_min;
     let mut last_insert = None::<Instant>;
     while !stopped(stop) {
+        let config = &current();
         let records = match spool.read(config.max_records, config.max_bytes) {
             Ok(records) => records,
             Err(error) => {

@@ -2,7 +2,7 @@
 //! request never queries the metadata store. [`Cache::refresh`] compares one
 //! number with the store and reloads only when it changed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use dionaea_core::Schema;
@@ -49,6 +49,7 @@ struct Table {
     generation: u64,
     keys: HashMap<String, KeyEntry>,
     schemas: HashMap<u32, Arc<[(u32, Schema)]>>,
+    settings: BTreeMap<String, String>,
 }
 
 /// Keys and schemas, shared by every request.
@@ -65,6 +66,12 @@ impl Cache {
 
     fn current(&self) -> Arc<Table> {
         Arc::clone(&self.table.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The operational settings stored by an operator, as of the generation
+    /// the cache holds.
+    pub fn settings(&self) -> BTreeMap<String, String> {
+        self.current().settings.clone()
     }
 
     /// The generation of the data the cache holds.
@@ -86,6 +93,7 @@ impl Cache {
             generation: snapshot.generation,
             keys: HashMap::with_capacity(snapshot.keys.len()),
             schemas: HashMap::with_capacity(snapshot.schemas.len()),
+            settings: snapshot.settings,
         };
         for key in snapshot.keys {
             table.keys.insert(

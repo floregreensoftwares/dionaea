@@ -18,8 +18,17 @@ struct Bucket {
     at_ms: u64,
 }
 
+#[derive(Debug)]
+struct State<K> {
+    rate_per_ms: f64,
+    burst: f64,
+    max_keys: usize,
+    buckets: HashMap<K, Bucket>,
+}
+
 /// Allows `rate_per_sec` requests per second on average per key, with bursts
-/// of up to `burst`.
+/// of up to `burst`. The rate, the burst and the number of keys can be changed
+/// while it is in use ([`reconfigure`](Self::reconfigure)).
 ///
 /// Bounded memory has a price: under a flood of distinct keys an arbitrary
 /// bucket can be evicted, which resets that key to a full burst. Apply it to
@@ -27,10 +36,15 @@ struct Bucket {
 /// network-level limit, never to unchecked strings from the request.
 #[derive(Debug)]
 pub struct RateLimiter<K> {
-    rate_per_ms: f64,
-    burst: f64,
-    max_keys: usize,
-    buckets: Mutex<HashMap<K, Bucket>>,
+    state: Mutex<State<K>>,
+}
+
+fn valid(rate_per_sec: f64, burst: f64, max_keys: usize) -> bool {
+    rate_per_sec.is_finite()
+        && rate_per_sec > 0.0
+        && burst.is_finite()
+        && burst >= 1.0
+        && max_keys > 0
 }
 
 impl<K: Hash + Eq> RateLimiter<K> {
@@ -42,59 +56,102 @@ impl<K: Hash + Eq> RateLimiter<K> {
     ///
     /// If `rate_per_sec` is not positive, `burst` is below 1 or `max_keys` is 0.
     pub fn new(rate_per_sec: f64, burst: f64, max_keys: usize) -> Self {
-        assert!(rate_per_sec > 0.0 && burst >= 1.0 && max_keys > 0);
+        assert!(valid(rate_per_sec, burst, max_keys));
         Self {
-            rate_per_ms: rate_per_sec / 1000.0,
-            burst,
-            max_keys,
-            buckets: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                rate_per_ms: rate_per_sec / 1000.0,
+                burst,
+                max_keys,
+                buckets: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Changes the limits from now on. Buckets keep their tokens, capped by
+    /// the new burst; if there are more keys than the new bound, arbitrary ones
+    /// are forgotten at once. Values that [`new`](Self::new) would refuse are
+    /// ignored.
+    pub fn reconfigure(&self, rate_per_sec: f64, burst: f64, max_keys: usize) {
+        if !valid(rate_per_sec, burst, max_keys) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.rate_per_ms = rate_per_sec / 1000.0;
+        state.burst = burst;
+        state.max_keys = max_keys;
+        for bucket in state.buckets.values_mut() {
+            bucket.tokens = bucket.tokens.min(burst);
+        }
+        let mut remaining = state.buckets.len().saturating_sub(max_keys);
+        if remaining > 0 {
+            state.buckets.retain(|_, _| {
+                if remaining > 0 {
+                    remaining -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 
     /// Takes one token for `key` at time `now_ms`, or says when to retry.
     pub fn check(&self, key: K, now_ms: u64) -> Result<(), RetryAfter> {
-        let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
-        if !buckets.contains_key(&key) && buckets.len() >= self.max_keys {
-            self.make_room(&mut buckets, now_ms);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let State {
+            rate_per_ms,
+            burst,
+            max_keys,
+            buckets,
+        } = &mut *state;
+        if !buckets.contains_key(&key) && buckets.len() >= *max_keys {
+            make_room(buckets, *max_keys, *rate_per_ms, *burst, now_ms);
         }
         let bucket = buckets.entry(key).or_insert(Bucket {
-            tokens: self.burst,
+            tokens: *burst,
             at_ms: now_ms,
         });
         // A clock that steps back refills nothing rather than panicking.
         let elapsed = now_ms.saturating_sub(bucket.at_ms);
-        bucket.tokens = (bucket.tokens + elapsed as f64 * self.rate_per_ms).min(self.burst);
+        bucket.tokens = (bucket.tokens + elapsed as f64 * *rate_per_ms).min(*burst);
         bucket.at_ms = bucket.at_ms.max(now_ms);
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
             Ok(())
         } else {
-            let wait_ms = (1.0 - bucket.tokens) / self.rate_per_ms;
+            let wait_ms = (1.0 - bucket.tokens) / *rate_per_ms;
             Err(RetryAfter((wait_ms / 1000.0).ceil().max(1.0) as u64))
-        }
-    }
-
-    fn make_room(&self, buckets: &mut HashMap<K, Bucket>, now_ms: u64) {
-        buckets.retain(|_, b| {
-            let refilled = b.tokens + now_ms.saturating_sub(b.at_ms) as f64 * self.rate_per_ms;
-            refilled < self.burst
-        });
-        if buckets.len() >= self.max_keys {
-            let mut evict = true;
-            buckets.retain(|_, _| !std::mem::take(&mut evict));
         }
     }
 
     /// How many keys are tracked.
     pub fn len(&self) -> usize {
-        self.buckets
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .buckets
             .len()
     }
 
     /// Whether no key is tracked.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+fn make_room<K: Hash + Eq>(
+    buckets: &mut HashMap<K, Bucket>,
+    max_keys: usize,
+    rate_per_ms: f64,
+    burst: f64,
+    now_ms: u64,
+) {
+    buckets.retain(|_, b| {
+        let refilled = b.tokens + now_ms.saturating_sub(b.at_ms) as f64 * rate_per_ms;
+        refilled < burst
+    });
+    if buckets.len() >= max_keys {
+        let mut evict = true;
+        buckets.retain(|_, _| !std::mem::take(&mut evict));
     }
 }
