@@ -363,6 +363,7 @@ impl Node {
                             grace: tuning.erase_grace.max(tuning.refresh_every * 2),
                             finish_after: tuning.erase_finish_after,
                             max_attempts: tuning.erase_max_attempts,
+                            failed_keep: tuning.erase_failed_keep,
                         };
                         let wait = |grace: Duration| {
                             nap(grace, &stop);

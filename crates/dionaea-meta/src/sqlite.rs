@@ -836,6 +836,10 @@ impl MetaStore for SqliteMeta {
         self.hash_key.clone()
     }
 
+    fn purge_failed_erasures(&self, failed_before: i64) -> Result<u64, MetaError> {
+        self.write(|tx, _| erasure_sql::purge_failed(tx, failed_before))
+    }
+
     fn erasure_summary(&self) -> Result<ErasureSummary, MetaError> {
         let at = (self.clock)();
         self.read(|tx| erasure_sql::summary(tx, at))

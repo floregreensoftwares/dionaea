@@ -71,6 +71,9 @@ pub(crate) struct Tuning {
     /// How many times in a row trouble that retrying may fix may stop an
     /// erasure request before it fails.
     pub(crate) erase_max_attempts: u32,
+    /// How long a failed erasure request keeps the user id and devices in the
+    /// clear so that it can be retried; after that they are forgotten.
+    pub(crate) erase_failed_keep: Duration,
 }
 
 /// Where a setting's value came from.
@@ -391,6 +394,16 @@ pub(crate) static SPECS: &[Spec] = &[
         |t, v| t.erase_max_attempts = v,
         |t| t.erase_max_attempts.to_string()
     ),
+    spec!(
+        "erase_failed_keep_days",
+        "30",
+        "from 1 to 3650 days",
+        "how long a failed erasure request keeps the user id and devices in the clear before forgetting them",
+        u64,
+        |v| (1..=3650).contains(v),
+        |t, v| t.erase_failed_keep = Duration::from_secs(v * 86_400),
+        |t| (t.erase_failed_keep.as_secs() / 86_400).to_string()
+    ),
 ];
 
 /// The setting called `name`.
@@ -449,6 +462,7 @@ impl Tuning {
             erase_grace: Duration::ZERO,
             erase_finish_after: Duration::ZERO,
             erase_max_attempts: 1,
+            erase_failed_keep: Duration::ZERO,
         }
     }
 
