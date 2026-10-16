@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use dionaea_ingest::{Batcher, BatcherConfig, Cache, Destination, Limits, enqueue, process};
+use dionaea_ingest::{
+    Batcher, BatcherConfig, Cache, Destination, Limits, enqueue, enqueue_identity, process,
+};
 use dionaea_meta::{MetaStore, SqliteMeta};
 use dionaea_spool::{Config as SpoolConfig, Spool};
-use dionaea_store::{Config, Store};
+use dionaea_store::{AliasRow, Config, Store, TraitsRow};
 use serde_json::json;
 
 const NOW: u64 = 1_760_000_000_000;
@@ -309,4 +311,60 @@ fn a_retry_that_reaches_another_node_is_stored_once() {
     );
     assert_eq!(scratch.number("SELECT count() FROM events"), 3);
     assert_eq!(scratch.number("SELECT count() FROM event_ids"), 3);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_linked_anonymous_id_shows_under_its_user_as_soon_as_the_rows_are_stored() {
+    let scratch = Scratch::new();
+    let (cache, key) = site();
+    let (spool, _dir) = spool("identity");
+    collect(
+        &cache,
+        &key,
+        &spool,
+        &[
+            event(1, "checkout", json!({"items": 1})),
+            event(2, "checkout", json!({"items": 2})),
+        ],
+    );
+    let admission = cache.admit(&key, None).expect("admitted");
+    enqueue_identity(
+        &spool,
+        &AliasRow {
+            site_id: admission.site_id,
+            anon_id: "anon1".to_owned(),
+            user_id: "u1".to_owned(),
+            linked_ms: NOW,
+        },
+        Some(&TraitsRow {
+            site_id: admission.site_id,
+            user_id: "u1".to_owned(),
+            traits_str: vec![("plan".to_owned(), "pro".to_owned())],
+            traits_num: vec![("seats".to_owned(), 3.0)],
+            updated_ms: NOW,
+        }),
+        &[],
+    )
+    .expect("durable");
+
+    let batcher = Batcher::start(
+        spool.clone(),
+        Arc::new(scratch.store()) as Arc<dyn Destination>,
+        fast(),
+    )
+    .expect("thread");
+    wait_for("the rows", || {
+        batcher.stats().event_rows() == 2 && batcher.stats().identity_rows() == 2
+    });
+    batcher.stop();
+
+    // The events of the user, found through the link: only anon1's.
+    let of_user = "SELECT count() FROM events WHERE (site_id, anon_id) IN         (SELECT site_id, anon_id FROM identity_alias FINAL WHERE user_id = 'u1')";
+    assert_eq!(scratch.number(of_user), 1);
+    let traits = scratch
+        .store()
+        .raw_query("SELECT traits_str['plan'], traits_num['seats'] FROM user_traits FINAL WHERE user_id = 'u1' FORMAT TabSeparated")
+        .expect("traits");
+    assert_eq!(traits.trim(), "pro	3");
 }

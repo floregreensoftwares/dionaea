@@ -76,6 +76,38 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             SETTINGS non_replicated_deduplication_window = 1000",
         ],
     },
+    Migration {
+        version: 3,
+        name: "identity",
+        statements: &[
+            // Which user an anonymous id was linked to. One row per pair, so a
+            // device that signed in as two people keeps both links: erasing
+            // either person reaches the events of the whole device. The
+            // latest link of an anonymous id is the one queries use.
+            "CREATE TABLE IF NOT EXISTS identity_alias (
+                site_id   UInt32,
+                anon_id   String,
+                user_id   String,
+                linked_at DateTime64(3, 'UTC'),
+                INDEX by_user user_id TYPE bloom_filter GRANULARITY 4
+            )
+            ENGINE = ReplacingMergeTree(linked_at)
+            ORDER BY (site_id, anon_id, user_id)
+            SETTINGS non_replicated_deduplication_window = 1000",
+            // The declared traits of a user as of the latest identify that
+            // carried any.
+            "CREATE TABLE IF NOT EXISTS user_traits (
+                site_id    UInt32,
+                user_id    String,
+                traits_str Map(LowCardinality(String), String),
+                traits_num Map(LowCardinality(String), Float64),
+                updated_at DateTime64(3, 'UTC')
+            )
+            ENGINE = ReplacingMergeTree(updated_at)
+            ORDER BY (site_id, user_id)
+            SETTINGS non_replicated_deduplication_window = 1000",
+        ],
+    },
 ];
 
 #[cfg(test)]

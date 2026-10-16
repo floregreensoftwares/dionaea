@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use dionaea_core::DropReason;
 use dionaea_spool::{Config as SpoolConfig, Spool};
-use dionaea_store::Error;
+use dionaea_store::{AliasRow, Error, TraitsRow};
 
 use super::*;
 use crate::sink;
@@ -102,6 +102,8 @@ struct Fake {
     attempts: Mutex<Vec<String>>,
     stored_events: Mutex<Vec<String>>,
     stored_drops: Mutex<Vec<String>>,
+    stored_aliases: Mutex<Vec<String>>,
+    stored_traits: Mutex<Vec<String>>,
     /// The ids other nodes (and this one) recorded as stored.
     known: Mutex<HashSet<(u32, String)>>,
     lookups_to_fail: AtomicUsize,
@@ -208,6 +210,14 @@ impl Destination for Fake {
 
     fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
         self.insert(lines, token, &self.stored_drops)
+    }
+
+    fn insert_alias_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert(lines, token, &self.stored_aliases)
+    }
+
+    fn insert_traits_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert(lines, token, &self.stored_traits)
     }
 }
 
@@ -335,7 +345,7 @@ fn a_full_spool_is_reported_to_the_caller() {
 #[test]
 fn decode_refuses_anything_this_version_did_not_write() {
     assert!(sink::decode(b"").is_none());
-    assert!(sink::decode(&[2, 0, 0, 0, 0]).is_none(), "another version");
+    assert!(sink::decode(&[9, 0, 0, 0, 0]).is_none(), "another version");
     assert!(sink::decode(&[1, 0, 0]).is_none(), "a short header");
     assert!(
         sink::decode(&[1, 9, 0, 0, 0, b'a']).is_none(),
@@ -344,8 +354,31 @@ fn decode_refuses_anything_this_version_did_not_write() {
     assert!(sink::decode(&[1, 1, 0, 0, 0, 0xFF]).is_none(), "not UTF-8");
     assert_eq!(
         sink::decode(&[1, 2, 0, 0, 0, b'a', b'\n', b'd']).map(|l| (l.events, l.drops)),
-        Some(("a\n", "d"))
+        Some(("a\n", "d")),
+        "records of the first version are still read"
     );
+    let header = |a: u32, b: u32, c: u32| {
+        let mut bytes = vec![2];
+        for n in [a, b, c] {
+            bytes.extend_from_slice(&n.to_le_bytes());
+        }
+        bytes
+    };
+    let mut record = header(1, 2, 3);
+    record.extend_from_slice(b"eaabbbd");
+    let lines = sink::decode(&record).expect("a record");
+    assert_eq!(
+        (lines.events, lines.aliases, lines.traits, lines.drops),
+        ("e", "aa", "bbb", "d")
+    );
+    assert!(
+        sink::decode(&header(1, 2, 3)).is_none(),
+        "lengths past the end"
+    );
+    assert!(sink::decode(&[2, 1, 0, 0, 0]).is_none(), "a short header");
+    let mut long = header(0, 0, u32::MAX);
+    long.push(b'x');
+    assert!(sink::decode(&long).is_none(), "a huge length does not wrap");
 }
 
 // The batcher.
@@ -886,4 +919,143 @@ fn the_size_of_a_batch_follows_the_configuration_in_force() {
         batcher.stats().batches()
     );
     batcher.stop();
+}
+
+// Identity.
+
+fn link(anon: &str, user: &str) -> AliasRow {
+    AliasRow {
+        site_id: 7,
+        anon_id: anon.to_owned(),
+        user_id: user.to_owned(),
+        linked_ms: NOW,
+    }
+}
+
+fn traits_of(user: &str, plan: &str) -> TraitsRow {
+    TraitsRow {
+        site_id: 7,
+        user_id: user.to_owned(),
+        traits_str: vec![("plan".to_owned(), plan.to_owned())],
+        traits_num: vec![("seats".to_owned(), 2.0)],
+        updated_ms: NOW,
+    }
+}
+
+#[test]
+fn an_identify_request_is_one_record_with_its_link_traits_and_drops() {
+    let dir = spool_dir("identity-record");
+    let spool = open(&dir);
+    let drops = [dionaea_store::DropRow {
+        site_id: 7,
+        event_name: "(identify)".to_owned(),
+        reason: "invalid_field".to_owned(),
+        at_ms: NOW,
+        count: 2,
+    }];
+    sink::enqueue_identity(
+        &spool,
+        &link("a1", "u1"),
+        Some(&traits_of("u1", "pro")),
+        &drops,
+    )
+    .unwrap();
+    sink::enqueue_identity(&spool, &link("a2", "u2"), None, &[]).unwrap();
+    let records = spool.read(10, 1 << 20).unwrap();
+    assert_eq!(records.len(), 2);
+    let first = sink::decode(&records[0].payload).expect("a record");
+    assert_eq!(first.events, "");
+    assert!(first.aliases.contains("\"anon_id\":\"a1\"") && first.aliases.contains("u1"));
+    assert!(first.traits.contains("\"plan\":\"pro\""));
+    assert_eq!(first.drops.lines().count(), 1);
+    let second = sink::decode(&records[1].payload).expect("a record");
+    assert_eq!(
+        (second.traits, second.drops),
+        ("", ""),
+        "no traits, no drops"
+    );
+    assert_eq!(second.aliases.lines().count(), 1);
+}
+
+#[test]
+fn links_and_traits_reach_the_destination_each_under_its_own_token() {
+    let dir = spool_dir("identity-deliver");
+    let spool = open(&dir);
+    enqueue(&spool, &request(vec![accepted(1, 1)], 0), 7, NOW).unwrap();
+    sink::enqueue_identity(
+        &spool,
+        &link("a1", "u1"),
+        Some(&traits_of("u1", "pro")),
+        &[],
+    )
+    .unwrap();
+    sink::enqueue_identity(&spool, &link("a2", "u1"), None, &[]).unwrap();
+    let fake = Arc::new(Fake::default());
+    let batcher = start(&spool, &fake);
+    // Two links and one set of traits.
+    wait_for("the identity rows", || batcher.stats().identity_rows() == 3);
+    wait_for("the event", || batcher.stats().event_rows() == 1);
+    batcher.stop();
+    assert_eq!(fake.stored_aliases.lock().unwrap().len(), 2);
+    assert_eq!(fake.stored_traits.lock().unwrap().len(), 1);
+    let attempts = fake.attempts();
+    for suffix in ["-e", "-a", "-t"] {
+        assert!(
+            attempts.iter().any(|t| t.ends_with(suffix)),
+            "a token for {suffix}: {attempts:?}"
+        );
+    }
+    drop(spool);
+    assert_eq!(pending(&dir), 0);
+}
+
+#[test]
+fn an_outage_repeats_a_link_under_one_token_and_stores_it_once() {
+    let dir = spool_dir("identity-retry");
+    let spool = open(&dir);
+    sink::enqueue_identity(
+        &spool,
+        &link("a1", "u1"),
+        Some(&traits_of("u1", "pro")),
+        &[],
+    )
+    .unwrap();
+    let fake = Arc::new(Fake::default());
+    fake.transient_failures.store(4, Ordering::SeqCst);
+    let batcher = start(&spool, &fake);
+    wait_for("the link", || batcher.stats().identity_rows() == 2);
+    batcher.stop();
+    assert_eq!(fake.stored_aliases.lock().unwrap().len(), 1);
+    assert_eq!(fake.stored_traits.lock().unwrap().len(), 1);
+    let attempts = fake.attempts();
+    let aliases: Vec<_> = attempts.iter().filter(|t| t.ends_with("-a")).collect();
+    assert!(aliases.windows(2).all(|w| w[0] == w[1]), "{attempts:?}");
+}
+
+#[test]
+fn rejected_traits_never_repeat_the_link_stored_with_them() {
+    let dir = spool_dir("identity-poison");
+    let spool = open(&dir);
+    sink::enqueue_identity(
+        &spool,
+        &link("a1", "u1"),
+        Some(&traits_of("u1", POISON)),
+        &[],
+    )
+    .unwrap();
+    let fake = Arc::new(Fake::default());
+    let batcher = start(&spool, &fake);
+    wait_for("the link", || batcher.stats().identity_rows() == 1);
+    wait_for("the skip", || batcher.stats().skipped_records() == 1);
+    batcher.stop();
+    assert_eq!(fake.stored_aliases.lock().unwrap().len(), 1);
+    assert!(fake.stored_traits.lock().unwrap().is_empty());
+    let attempts = fake.attempts();
+    assert_eq!(
+        attempts.iter().filter(|t| t.ends_with("-a")).count(),
+        1,
+        "the link is inserted once: {attempts:?}"
+    );
+    drop(spool);
+    assert_eq!(pending(&dir), 0, "the poison does not block the spool");
 }

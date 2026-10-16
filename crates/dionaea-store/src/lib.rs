@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use rows::{DropRow, EventRow, event_key};
+pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key};
 
 /// Most rows one insert call accepts.
 pub const MAX_ROWS_PER_INSERT: usize = 100_000;
@@ -388,6 +388,8 @@ impl Store {
             ),
             format!("GRANT INSERT ON {database}.events TO {ingest}"),
             format!("GRANT INSERT ON {database}.drops_daily TO {ingest}"),
+            format!("GRANT INSERT ON {database}.identity_alias TO {ingest}"),
+            format!("GRANT INSERT ON {database}.user_traits TO {ingest}"),
             // The ids of recent events, so a node can tell that another stored
             // an event it is about to insert. Only that table is readable.
             format!("GRANT INSERT, SELECT ON {database}.event_ids TO {ingest}"),
@@ -418,6 +420,26 @@ impl Store {
     /// The `JSONEachRow` text an insert of these drop counts sends.
     pub fn encode_drops(rows: &[DropRow]) -> Result<String, Error> {
         encode(rows.iter().map(DropRow::to_json_line), rows.len())
+    }
+
+    /// The `JSONEachRow` text an insert of these identity links sends.
+    pub fn encode_aliases(rows: &[AliasRow]) -> Result<String, Error> {
+        encode(rows.iter().map(AliasRow::to_json_line), rows.len())
+    }
+
+    /// The `JSONEachRow` text an insert of these user traits sends.
+    pub fn encode_traits(rows: &[TraitsRow]) -> Result<String, Error> {
+        encode(rows.iter().map(TraitsRow::to_json_line), rows.len())
+    }
+
+    /// Inserts lines produced by [`encode_aliases`](Self::encode_aliases).
+    pub fn insert_alias_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert("identity_alias", lines, token)
+    }
+
+    /// Inserts lines produced by [`encode_traits`](Self::encode_traits).
+    pub fn insert_traits_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert("user_traits", lines, token)
     }
 
     /// Inserts lines already produced by [`encode_events`](Self::encode_events)

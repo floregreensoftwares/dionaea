@@ -44,6 +44,25 @@ pub struct DropRow {
     pub count: u64,
 }
 
+/// An anonymous id linked to a user, for `identity_alias`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasRow {
+    pub site_id: u32,
+    pub anon_id: String,
+    pub user_id: String,
+    pub linked_ms: u64,
+}
+
+/// The traits of a user, for `user_traits`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitsRow {
+    pub site_id: u32,
+    pub user_id: String,
+    pub traits_str: Vec<(String, String)>,
+    pub traits_num: Vec<(String, f64)>,
+    pub updated_ms: u64,
+}
+
 fn check_time(ms: u64, what: &str) -> Result<(), Error> {
     if ms > time::MAX_MS {
         return Err(Error::InvalidRow(format!("{what} is beyond the year 2299")));
@@ -211,6 +230,62 @@ impl DropRow {
     }
 }
 
+impl AliasRow {
+    pub(crate) fn to_json_line(&self) -> Result<String, Error> {
+        check_time(self.linked_ms, "the link time")?;
+        let mut out = String::with_capacity(128);
+        out.push('{');
+        number_field(&mut out, "site_id", self.site_id);
+        string_field(&mut out, "anon_id", &self.anon_id);
+        string_field(&mut out, "user_id", &self.user_id);
+        out.push_str("\"linked_at\":");
+        push_string(&mut out, &time::format_datetime(self.linked_ms));
+        out.push('}');
+        Ok(out)
+    }
+}
+
+impl TraitsRow {
+    pub(crate) fn to_json_line(&self) -> Result<String, Error> {
+        check_time(self.updated_ms, "the update time")?;
+        if has_repeat(self.traits_str.iter().map(|(key, _)| key.as_str()))
+            || has_repeat(self.traits_num.iter().map(|(key, _)| key.as_str()))
+        {
+            return Err(Error::InvalidRow("a trait name is repeated".to_owned()));
+        }
+        let mut out = String::with_capacity(256);
+        out.push('{');
+        number_field(&mut out, "site_id", self.site_id);
+        string_field(&mut out, "user_id", &self.user_id);
+        out.push_str("\"traits_str\":{");
+        for (index, (key, value)) in self.traits_str.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_string(&mut out, key);
+            out.push(':');
+            push_string(&mut out, value);
+        }
+        out.push_str("},\"traits_num\":{");
+        for (index, (key, value)) in self.traits_num.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(Error::InvalidRow(format!(
+                    "trait `{key}` is not a finite number"
+                )));
+            }
+            if index > 0 {
+                out.push(',');
+            }
+            push_string(&mut out, key);
+            let _ = write!(out, ":{value}");
+        }
+        out.push_str("},\"updated_at\":");
+        push_string(&mut out, &time::format_datetime(self.updated_ms));
+        out.push('}');
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +433,56 @@ mod tests {
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["day"], "2025-10-09");
         assert_eq!(value["count"], 12);
+    }
+
+    #[test]
+    fn an_alias_becomes_one_json_line() {
+        let row = AliasRow {
+            site_id: 7,
+            anon_id: "a\"1".to_owned(),
+            user_id: "u_42".to_owned(),
+            linked_ms: 1_760_000_000_123,
+        };
+        let value: Value = serde_json::from_str(&row.to_json_line().unwrap()).unwrap();
+        assert_eq!(value["anon_id"], "a\"1");
+        assert_eq!(value["user_id"], "u_42");
+        assert_eq!(value["linked_at"], "2025-10-09 08:53:20.123");
+        assert_eq!(value.as_object().unwrap().len(), 4);
+        let late = AliasRow {
+            linked_ms: time::MAX_MS + 1,
+            ..row
+        };
+        assert!(late.to_json_line().is_err());
+    }
+
+    #[test]
+    fn traits_become_one_json_line_and_bad_ones_are_refused() {
+        let row = TraitsRow {
+            site_id: 7,
+            user_id: "u_42".to_owned(),
+            traits_str: vec![("plan".to_owned(), "pro \"x\"\n".to_owned())],
+            traits_num: vec![("seats".to_owned(), 3.0)],
+            updated_ms: 1_760_000_000_123,
+        };
+        let line = row.to_json_line().unwrap();
+        assert!(!line.contains('\n'), "one row per line");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["traits_str"]["plan"], "pro \"x\"\n");
+        assert_eq!(value["traits_num"]["seats"], 3.0);
+        assert_eq!(value["updated_at"], "2025-10-09 08:53:20.123");
+
+        let mut repeated = row.clone();
+        repeated.traits_num.push(("seats".to_owned(), 4.0));
+        assert!(repeated.to_json_line().is_err());
+        let mut infinite = row.clone();
+        infinite.traits_num = vec![("seats".to_owned(), f64::INFINITY)];
+        assert!(infinite.to_json_line().is_err());
+        let empty = TraitsRow {
+            traits_str: vec![],
+            traits_num: vec![],
+            ..row
+        };
+        let value: Value = serde_json::from_str(&empty.to_json_line().unwrap()).unwrap();
+        assert_eq!(value["traits_str"], serde_json::json!({}));
     }
 }

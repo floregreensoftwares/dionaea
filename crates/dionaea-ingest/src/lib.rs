@@ -24,7 +24,7 @@ pub use pipeline::{
     Accepted, Context, DropCount, Limits, Processed, Reason, UNDECLARED_EVENT, UNPARSED_EVENT,
     process, process_with,
 };
-pub use sink::{CHUNK_BYTES, Enqueued, INVALID_ROW, enqueue, enqueue_drop_rows};
+pub use sink::{CHUNK_BYTES, Enqueued, INVALID_ROW, enqueue, enqueue_drop_rows, enqueue_identity};
 
 #[cfg(test)]
 mod tests;
