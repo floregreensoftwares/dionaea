@@ -409,6 +409,23 @@ impl Store {
         encode(rows.iter().map(EventRow::to_json_line), rows.len())
     }
 
+    /// The `JSONEachRow` text an insert of these drop counts sends.
+    pub fn encode_drops(rows: &[DropRow]) -> Result<String, Error> {
+        encode(rows.iter().map(DropRow::to_json_line), rows.len())
+    }
+
+    /// Inserts lines already produced by [`encode_events`](Self::encode_events)
+    /// (a spool can hold them and join several batches into one insert). The
+    /// lines are sent as they are: they must come from `encode_events`.
+    pub fn insert_event_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert("events", lines, token)
+    }
+
+    /// The same for lines produced by [`encode_drops`](Self::encode_drops).
+    pub fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert("drops_daily", lines, token)
+    }
+
     /// Inserts a batch of events. A second call with the same `token` stores
     /// nothing (see the crate documentation).
     pub fn insert_events(&self, rows: &[EventRow], token: &str) -> Result<(), Error> {

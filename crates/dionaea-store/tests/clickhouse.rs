@@ -591,3 +591,52 @@ fn provisioning_again_rotates_the_passwords() {
     .ping()
     .expect("the new password works");
 }
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn lines_encoded_earlier_insert_the_same_rows_and_dedupe_by_token() {
+    let scratch = Scratch::new();
+    let events: Vec<EventRow> = (0..6).map(event).collect();
+    let drops = [DropRow {
+        site_id: 7,
+        event_name: "e".to_owned(),
+        reason: "r".to_owned(),
+        at_ms: 1_760_000_000_000,
+        count: 3,
+    }];
+    // Lines built apart (as a spool record would hold them) and joined.
+    let first = Store::encode_events(&events[..3]).expect("encode");
+    let second = Store::encode_events(&events[3..]).expect("encode");
+    let joined = format!("{first}{second}");
+    scratch
+        .store
+        .insert_event_lines(&joined, "lines-1")
+        .expect("insert");
+    scratch
+        .store
+        .insert_event_lines(&joined, "lines-1")
+        .expect("retry");
+    assert_eq!(
+        count(&scratch.store, "events"),
+        6,
+        "the retry stored nothing"
+    );
+
+    let drop_lines = Store::encode_drops(&drops).expect("encode");
+    scratch
+        .store
+        .insert_drop_lines(&drop_lines, "lines-d")
+        .expect("insert");
+    scratch
+        .store
+        .insert_drop_lines(&drop_lines, "lines-d")
+        .expect("retry");
+    assert_eq!(
+        scratch
+            .store
+            .raw_query("SELECT sum(count) FROM drops_daily")
+            .expect("query")
+            .trim(),
+        "3"
+    );
+}
