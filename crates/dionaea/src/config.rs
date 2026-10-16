@@ -7,6 +7,9 @@ use serde::Deserialize;
 
 const ENV_PREFIX: &str = "DIONAEA_";
 
+/// A spool smaller than this could not hold a few of the largest requests.
+const MIN_SPOOL_QUOTA: u64 = 32 << 20;
+
 /// A secret that never shows in `Debug` output, so it cannot reach a log.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub(crate) struct Secret(pub(crate) String);
@@ -270,8 +273,8 @@ impl Config {
             "spool_quota_bytes",
             file.spool_quota_bytes,
             1 << 30,
-            |v| *v >= (1 << 20),
-            "at least 1048576 (1 MiB)",
+            |v| *v >= MIN_SPOOL_QUOTA,
+            "at least 33554432 (32 MiB)",
         )?;
         let metadata_path = source
             .path("METADATA_PATH", file.metadata_path)
@@ -603,16 +606,16 @@ mod tests {
         assert_eq!(config.clickhouse_user, "default");
         assert_eq!(config.clickhouse_database, "dionaea");
 
-        let file = "spool_dir = \"/var/spool/d\"\nspool_quota_bytes = 5000000\nclickhouse_user = \"ingest\"\n";
-        let config = Config::resolve(Some(file), with("SPOOL_QUOTA_BYTES", "7000000")).unwrap();
+        let file = "spool_dir = \"/var/spool/d\"\nspool_quota_bytes = 50000000\nclickhouse_user = \"ingest\"\n";
+        let config = Config::resolve(Some(file), with("SPOOL_QUOTA_BYTES", "70000000")).unwrap();
         assert_eq!(config.spool_dir, PathBuf::from("/var/spool/d"));
-        assert_eq!(config.spool_quota_bytes, 7_000_000);
+        assert_eq!(config.spool_quota_bytes, 70_000_000);
         assert_eq!(config.clickhouse_user, "ingest");
     }
 
     #[test]
     fn a_bad_or_tiny_spool_quota_is_a_typed_error() {
-        for value in ["abc", "-1", "1000"] {
+        for value in ["abc", "-1", "1000", "33554431"] {
             assert_eq!(
                 invalid_key(Config::resolve(None, with("SPOOL_QUOTA_BYTES", value))),
                 "spool_quota_bytes",

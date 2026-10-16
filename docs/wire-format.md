@@ -126,7 +126,7 @@ The schema guard then adds `unknown_event`, `too_many_properties` (for traits),
 
 | Status | Body | When |
 |---|---|---|
-| 202 | `{"accepted":n,"dropped":m}` | The events are durable. `n` were kept and `m` were dropped (invalid, undeclared or out of the time window) |
+| 202 | `{"accepted":n,"dropped":m}` | The events are durable. `n` were kept and `m` were dropped (invalid, undeclared, out of the time window, sent again, or sent by a known automated client) |
 | 400 | `{"error":"<reason>"}` | The envelope is invalid (`not_json`, `not_an_object`, `invalid_field`, `too_many_events`) or the key was given twice with different values (`conflicting_keys`) |
 | 401 | `{"error":"unknown_key"}` | No key, a key of the wrong shape, an unknown key or a revoked one |
 | 403 | `{"error":"origin_not_allowed"}` | The key lists origins and the request's is not one |

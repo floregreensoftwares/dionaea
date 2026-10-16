@@ -24,6 +24,9 @@ use tracing::warn;
 
 /// How long open connections get to finish their request at shutdown.
 const DRAIN: Duration = Duration::from_secs(10);
+/// The most a connection may buffer while reading a request head. hyper's
+/// default is far larger, and it is paid per connection.
+const MAX_HEADER_BUFFER: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NetLimits {
@@ -92,6 +95,7 @@ pub(crate) async fn serve(
         builder
             .timer(TokioTimer::new())
             .header_read_timeout(limits.header_timeout)
+            .max_buf_size(MAX_HEADER_BUFFER)
             .keep_alive(true);
         let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
         let counters = Arc::clone(&counters);

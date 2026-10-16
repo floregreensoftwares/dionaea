@@ -27,7 +27,7 @@ been prepared. Labels come from fixed sets, never from request content.
 |---|---|---|
 | `metadata_path` | `dionaea.db` | The SQLite file with sites, keys and schemas; set it to an absolute path |
 | `spool_dir` | `spool` | The on-disk queue between the endpoint and ClickHouse; keep it on a disk that survives restarts |
-| `spool_quota_bytes` | 1 GiB | The most disk the spool uses. When it is full the endpoint answers 503 with `Retry-After` |
+| `spool_quota_bytes` | 1 GiB | The most disk the spool uses (at least 32 MiB). When it is full the endpoint answers 503 with `Retry-After` |
 | `clickhouse_url` | `http://127.0.0.1:8123` | `http://host[:port]` or `https://host[:port]` |
 | `clickhouse_user`, `clickhouse_password`, `clickhouse_database` | `default`, empty, `dionaea` | The password is never printed |
 | `clickhouse_ca_file` | none | PEM file with the certificates to trust for `https://`; without it the public roots are trusted |
@@ -55,7 +55,7 @@ the status listed in `wire-format.md`.
 | `max_event_future_secs` | 3600 | 0 to 86400 | Furthest ahead an event may be |
 | `refresh_secs` | 2 | 1 to 3600 | How often keys and schemas are checked for changes; a revoked key stops working within this time |
 | `batch_max_records`, `batch_max_bytes`, `batch_min_interval_ms` | 1000, 8 MiB, 200 | 1 to 1000, 64 KiB to 64 MiB, 0 to 60000 | How events are grouped into ClickHouse inserts |
-| `dedup_capacity`, `dedup_window_secs` | 1000000, 600 | 0 to 100000000 (0 is off), 1 to 86400 | Event ids remembered to drop an event sent again |
+| `dedup_capacity`, `dedup_window_secs` | 1000000, 600 (about 80 MB at the default capacity) | 0 to 100000000 (0 is off), 1 to 86400 | Event ids remembered to drop an event sent again |
 
 ## Behind a reverse proxy
 
