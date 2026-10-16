@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dionaea_spool::{Config as SpoolConfig, Spool};
@@ -59,6 +60,7 @@ struct Server {
     child: Child,
     address: String,
     ops: String,
+    logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl Server {
@@ -74,11 +76,13 @@ impl Server {
             .spawn()
             .expect("start the server");
         let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+        let mut early = Vec::new();
         let (address, ops) = loop {
             let line = lines
                 .next()
                 .expect("the server logs before it exits")
                 .expect("a line");
+            early.push(line.clone());
             if line.contains("\"message\":\"listening\"") {
                 let value: serde_json::Value = serde_json::from_str(&line).expect("json log");
                 let field = |name: &str| {
@@ -90,13 +94,26 @@ impl Server {
                 break (field("listen"), field("ops"));
             }
         };
-        // Keep draining so the server never blocks writing its logs.
-        std::thread::spawn(move || for _ in lines {});
+        // Keep draining so the server never blocks writing its logs, and keep
+        // what it wrote for tests that read it.
+        let logs = Arc::new(Mutex::new(early));
+        let kept = Arc::clone(&logs);
+        std::thread::spawn(move || {
+            for line in lines.map_while(Result::ok) {
+                kept.lock().expect("logs").push(line);
+            }
+        });
         Self {
             child,
             address,
             ops,
+            logs,
         }
+    }
+
+    /// Every log line written so far.
+    fn logs(&self) -> Vec<String> {
+        self.logs.lock().expect("logs").clone()
     }
 
     /// Sends one request and returns (status, headers and body as text).
@@ -1298,4 +1315,436 @@ fn the_country_and_browser_of_a_client_are_stored_and_its_address_is_not() {
         !everything.contains("216.160.83.56"),
         "the address is not stored: {everything}"
     );
+}
+
+#[test]
+fn the_logs_never_hold_a_key_an_address_or_what_a_client_sent() {
+    let dir = dir("logs");
+    let key = bootstrap(&dir);
+    let server = server_with(&dir, &[("LOG_LEVEL", "trace"), ("TRUSTED_PROXY_HOPS", "1")]);
+    let from = |forwarded: &str, agent: &str, body: &str, key: &str| {
+        server.request(
+            &format!(
+                "{}\r\nX-Forwarded-For: {forwarded}\r\nUser-Agent: {agent}\r\nOrigin: https://marker-origin.example\r\nReferer: https://marker-referer.example/path",
+                collect_head(key)
+            ),
+            body,
+        )
+    };
+    let hostile = |name: &str, prop: &str| {
+        format!(
+            "{{\"sent_at\":1,\"sdk\":\"marker-sdk\",\"events\":[{{\"event_id\":\"01890000-0000-7000-8000-000000000001\",\"ts\":1,\"name\":\"{name}\",\"anon_id\":\"marker-anon\",\"props\":{{\"items\":1,\"free\":\"{prop}\"}}}}]}}"
+        )
+    };
+
+    from(
+        "203.0.113.77",
+        "MarkerAgent/9",
+        &hostile("checkout", "marker-free-text"),
+        &key,
+    );
+    from(
+        "2001:db8:1234:5678::77",
+        "MarkerAgent/9",
+        &hostile("marker-undeclared-event", "marker-free-text"),
+        &key,
+    );
+    from("203.0.113.77", "Googlebot/2.1", &batch(2, 1), &key);
+    from("203.0.113.77", "MarkerAgent/9", "{marker-not-json", &key);
+    from(
+        "203.0.113.77",
+        "MarkerAgent/9",
+        &batch(3, 1),
+        "wk_markerwrongkey0000000000",
+    );
+    server.ops("/metrics");
+
+    // The capture keeps working after start: ClickHouse is down here, and the
+    // server says so.
+    eventually("a log line after start", 20, || {
+        server
+            .logs()
+            .iter()
+            .any(|line| line.contains("clickhouse is not ready"))
+    });
+    let logs = server.logs();
+    for forbidden in [
+        key.as_str(),
+        "wk_markerwrongkey",
+        "203.0.113.77",
+        "2001:db8",
+        "marker-",
+        "MarkerAgent",
+        "Googlebot",
+    ] {
+        let hits: Vec<_> = logs
+            .iter()
+            .filter(|line| line.contains(forbidden))
+            .collect();
+        assert!(hits.is_empty(), "`{forbidden}` is in the logs: {hits:?}");
+    }
+}
+
+/// The most memory the server may hold at its peak under this test's load.
+const MEMORY_BOUND_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The peak resident memory of a process.
+fn peak_resident_bytes(pid: u32) -> u64 {
+    if cfg!(windows) {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {pid}).PeakWorkingSet64"),
+            ])
+            .output()
+            .expect("run powershell");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("a byte count")
+    } else {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
+        let kib: u64 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .expect("VmHWM");
+        kib * 1024
+    }
+}
+
+fn big_batch(n: u32) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_millis();
+    let events: Vec<String> = (0..100)
+        .map(|i| {
+            format!(
+                "{{\"event_id\":\"01890000-0000-7000-8000-{:012}\",\"ts\":{now},\"name\":\"checkout\",\"anon_id\":\"a{i}\",\"props\":{{\"items\":{i}}}}}",
+                u64::from(n) * 100 + i
+            )
+        })
+        .collect();
+    format!(
+        "{{\"sent_at\":{now},\"sdk\":\"test/1.0\",\"events\":[{}]}}",
+        events.join(",")
+    )
+}
+
+#[test]
+#[ignore = "sustained load for about 20 seconds"]
+fn the_server_stays_inside_its_memory_bound_under_sustained_load_with_clickhouse_down() {
+    let dir = dir("load");
+    let key = bootstrap(&dir);
+    let server = server_with(
+        &dir,
+        &[
+            ("KEY_RATE_PER_SEC", "100000"),
+            ("KEY_BURST", "100000"),
+            ("ADDRESS_RATE_PER_SEC", "100000"),
+            ("ADDRESS_BURST", "100000"),
+            ("MAX_CONNECTIONS", "64"),
+            ("SPOOL_QUOTA_BYTES", "33554432"),
+        ],
+    );
+    let stop = Instant::now() + Duration::from_secs(20);
+    let counts: Vec<std::collections::BTreeMap<u16, u64>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..48u32)
+            .map(|worker| {
+                let (server, key) = (&server, &key);
+                scope.spawn(move || {
+                    let mut counts = std::collections::BTreeMap::new();
+                    let mut n = worker * 1_000_000;
+                    while Instant::now() < stop {
+                        n += 1;
+                        let (status, _) = server.request(&collect_head(key), &big_batch(n));
+                        *counts.entry(status).or_insert(0u64) += 1;
+                    }
+                    counts
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| w.join().expect("worker"))
+            .collect()
+    });
+    let mut total = std::collections::BTreeMap::<u16, u64>::new();
+    for (status, n) in counts.iter().flatten() {
+        *total.entry(*status).or_insert(0) += n;
+    }
+    eprintln!("answers under load: {total:?}");
+
+    assert!(total.get(&202).copied().unwrap_or(0) > 100, "{total:?}");
+    assert!(
+        total.get(&503).copied().unwrap_or(0) > 0,
+        "the quota was reached, so the full spool was exercised: {total:?}"
+    );
+    for status in total.keys() {
+        assert!(
+            [0, 202, 503].contains(status),
+            "only acknowledgements, refusals and closed connections: {total:?}"
+        );
+    }
+    assert_eq!(server.ops("/healthz").0, 200, "alive after the load");
+    let (_, metrics) = server.ops("/metrics");
+    let spooled = metric(&metrics, "dionaea_spool_bytes ");
+    assert!(spooled <= 33_554_432 + 4 * 1024 * 1024, "{spooled}");
+
+    let peak = peak_resident_bytes(server.child.id());
+    eprintln!("peak resident memory: {} MiB", peak / (1024 * 1024));
+    assert!(
+        peak < MEMORY_BOUND_BYTES,
+        "peak {} MiB exceeds the bound of {} MiB",
+        peak / (1024 * 1024),
+        MEMORY_BOUND_BYTES / (1024 * 1024)
+    );
+}
+
+/// A TCP relay to ClickHouse that can be cut and restored, so an outage is
+/// the same on every platform: new connections are closed at once and the
+/// open ones are shut down.
+struct Relay {
+    address: String,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    open: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Relay {
+    fn start(upstream: &'static str) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the relay");
+        let address = listener.local_addr().expect("address").to_string();
+        let up = Arc::new(AtomicBool::new(true));
+        let open = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
+        let (flag, streams) = (Arc::clone(&up), Arc::clone(&open));
+        std::thread::spawn(move || {
+            for client in listener.incoming().map_while(Result::ok) {
+                if !flag.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                {
+                    let mut open = streams.lock().expect("streams");
+                    open.push(client.try_clone().expect("clone"));
+                    open.push(server.try_clone().expect("clone"));
+                }
+                for (mut from, mut to) in [
+                    (
+                        client.try_clone().expect("clone"),
+                        server.try_clone().expect("clone"),
+                    ),
+                    (server, client),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Self { address, up, open }
+    }
+
+    fn cut(&self) {
+        self.up.store(false, std::sync::atomic::Ordering::SeqCst);
+        for stream in self.open.lock().expect("streams").drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn restore(&self) {
+        self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// ClickHouse becomes unreachable while the server runs: every request is
+/// still acknowledged and stays in the spool, the server stays ready, and when
+/// ClickHouse is back each acknowledged event is stored once.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn an_outage_of_clickhouse_loses_nothing_and_never_stops_the_server_answering() {
+    let database = ScratchDatabase::new("outage");
+    let dir = dir("outage");
+    let key = {
+        let run_here = |args: &[&str]| {
+            let output = in_clickhouse(&dir, &database.name)
+                .args(args)
+                .output()
+                .expect("run the binary");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_here(&["site", "create", "shop"]);
+        let schema = dir.join("schema.toml");
+        std::fs::write(&schema, SCHEMA).expect("write the schema");
+        run_here(&[
+            "schema",
+            "push",
+            "--site",
+            "1",
+            schema.to_str().expect("utf-8"),
+        ]);
+        run_here(&["key", "issue", "--site", "1"])
+    };
+    let relay = Relay::start("127.0.0.1:8123");
+    let server = Server::start_with(command_for(
+        &dir,
+        &format!("http://{}", relay.address),
+        Some(&database.name),
+    ));
+    eventually("ClickHouse prepared", 60, || {
+        metric(&server.ops("/metrics").1, "dionaea_clickhouse_ready ") == 1
+    });
+
+    let send = |from: u32, to: u32| {
+        for n in from..to {
+            assert_eq!(server.request(&collect_head(&key), &batch(n, 1)).0, 202);
+        }
+    };
+    send(0, 20);
+    database.wait_for(
+        "the first events",
+        "SELECT uniqExact(event_id) FROM events",
+        20,
+    );
+
+    relay.cut();
+    send(20, 80);
+    eventually("the batcher noticing the outage", 60, || {
+        metric(&server.ops("/metrics").1, "dionaea_batcher_failing ") == 1
+    });
+    assert_eq!(server.ops("/readyz").0, 200, "an outage is not unreadiness");
+    assert_eq!(server.ops("/healthz").0, 200);
+    send(80, 90);
+    assert_eq!(
+        database.number("SELECT uniqExact(event_id) FROM events"),
+        20,
+        "nothing reached ClickHouse while it was cut"
+    );
+
+    relay.restore();
+    database.wait_for("every event", "SELECT uniqExact(event_id) FROM events", 90);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        database.number("SELECT count() FROM events"),
+        90,
+        "each acknowledged event stored once"
+    );
+    eventually("the batcher recovering", 30, || {
+        metric(&server.ops("/metrics").1, "dionaea_batcher_failing ") == 0
+    });
+}
+
+/// The server is killed again and again at different moments while a client
+/// keeps sending: during appends, during the wait for the sync, between the
+/// insert and the commit. Every event that was acknowledged is in ClickHouse
+/// at the end, and duplicates stay within the documented bound.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn repeated_kills_while_sending_lose_no_acknowledged_event() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const KILLS: u32 = 6;
+    let database = ScratchDatabase::new("kills");
+    let dir = dir("kills");
+    let key = {
+        let run_here = |args: &[&str]| {
+            let output = in_clickhouse(&dir, &database.name)
+                .args(args)
+                .output()
+                .expect("run the binary");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_here(&["site", "create", "shop"]);
+        let schema = dir.join("schema.toml");
+        std::fs::write(&schema, SCHEMA).expect("write the schema");
+        run_here(&[
+            "schema",
+            "push",
+            "--site",
+            "1",
+            schema.to_str().expect("utf-8"),
+        ]);
+        run_here(&["key", "issue", "--site", "1"])
+    };
+
+    let mut acknowledged = std::collections::BTreeSet::new();
+    let mut next = 0u32;
+    for round in 0..KILLS {
+        let server = Server::start_with(in_clickhouse(&dir, &database.name));
+        let stop = AtomicBool::new(false);
+        let address = server.address.clone();
+        let (last, acked) = std::thread::scope(|scope| {
+            let (stop, key, address) = (&stop, &key, &address);
+            let sender = scope.spawn(move || {
+                let mut acked = Vec::new();
+                let mut n = next;
+                while !stop.load(Ordering::SeqCst) {
+                    let head = collect_head(key);
+                    if Server::request_to(address, &head, &batch(n, 1)).0 == 202 {
+                        acked.push(n);
+                    }
+                    n += 1;
+                }
+                (n, acked)
+            });
+            // 300 ms to 1.5 s, different every round, so the kill lands in
+            // different places of the append, sync, insert and commit cycle.
+            std::thread::sleep(Duration::from_millis(300 + u64::from(round) * 240));
+            let mut server = server;
+            let _ = server.child.kill();
+            let _ = server.child.wait();
+            stop.store(true, Ordering::SeqCst);
+            sender.join().expect("sender")
+        });
+        next = last;
+        acknowledged.extend(acked);
+    }
+    assert!(acknowledged.len() > 50, "the sender got events through");
+
+    let server = Server::start_with(in_clickhouse(&dir, &database.name));
+    let stored = |database: &ScratchDatabase| -> std::collections::BTreeSet<u32> {
+        database
+            .text("SELECT event_id FROM events FORMAT TSV")
+            .lines()
+            .filter_map(|line| line.rsplit('-').next()?.parse().ok())
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let have = stored(&database);
+        if acknowledged.is_subset(&have) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} acknowledged events never arrived",
+            acknowledged.difference(&have).count()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let rows = database.number("SELECT count() FROM events");
+    let unique = database.number("SELECT uniqExact(event_id) FROM events");
+    eprintln!(
+        "acknowledged {}, stored {unique} distinct in {rows} rows",
+        acknowledged.len()
+    );
+    assert_eq!(
+        stored(&database).len() as u64,
+        unique,
+        "every stored id was read back"
+    );
+    assert!(
+        rows - unique <= u64::from(KILLS + 1) * 1000,
+        "duplicates stay within one batch per restart"
+    );
+    drop(server);
 }
