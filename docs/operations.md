@@ -167,3 +167,14 @@ moment, before either has recorded it, is stored twice. An SDK retry follows a
 timeout, so the usual gap between the copies is far longer than a batch
 interval. The ingest database user needs `SELECT` on `event_ids`; `dionaea`
 grants it when it creates the users.
+
+## What is checked about failures and memory
+
+These run in CI (`cargo test -p dionaea --test serve -- --ignored`, with ClickHouse for the last two):
+
+- **Logs.** A server at `trace` level handles requests with a key, a client address (IPv4 and IPv6, through a trusted proxy hop), a user agent, an origin and hostile bodies. None of those appear in what it logs.
+- **Memory.** Forty-eight concurrent senders post 100-event bodies for twenty seconds with ClickHouse unreachable and a 32 MiB spool quota. The spool fills, requests are then refused with 503, and the process stays under a peak resident size of 256 MiB (a ceiling, not a measurement of the typical case: a debug build peaks near 50 MiB there). The queue between the sockets and the spool is bounded by the connection cap, and the spool by its quota.
+- **Outage.** ClickHouse is cut while the server runs: every request is still acknowledged, `/readyz` stays 200, the batcher reports failing, nothing reaches the tables, and after the connection is restored every acknowledged event is stored exactly once.
+- **Kills.** The server is killed six times at different moments while a client sends without pause. Every event acknowledged before a kill is in the tables at the end; events sent but not acknowledged may or may not be.
+
+Not covered: a disk that fails or fills under the spool, a ClickHouse that answers slowly rather than not at all, and load heavier than one machine's loopback can produce.
