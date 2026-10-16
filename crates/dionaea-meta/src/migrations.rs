@@ -1,0 +1,53 @@
+//! Numbered migrations, applied in order, each in its own transaction and
+//! recorded in `_migrations`.
+
+pub(crate) struct Migration {
+    pub(crate) version: u32,
+    pub(crate) name: &'static str,
+    pub(crate) sql: &'static str,
+}
+
+pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "organizations_sites_keys_schemas",
+    sql: "
+        CREATE TABLE organizations (
+            id         INTEGER PRIMARY KEY,
+            name       TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE sites (
+            id         INTEGER PRIMARY KEY,
+            org_id     INTEGER NOT NULL REFERENCES organizations(id),
+            name       TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE (org_id, name)
+        );
+        CREATE TABLE write_keys (
+            key        TEXT PRIMARY KEY,
+            site_id    INTEGER NOT NULL REFERENCES sites(id),
+            label      TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE INDEX write_keys_by_site ON write_keys (site_id);
+        CREATE TABLE key_origins (
+            key    TEXT NOT NULL REFERENCES write_keys(key),
+            origin TEXT NOT NULL,
+            PRIMARY KEY (key, origin)
+        );
+        CREATE TABLE schema_versions (
+            site_id    INTEGER NOT NULL REFERENCES sites(id),
+            version    INTEGER NOT NULL,
+            source     TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            retired_at INTEGER,
+            PRIMARY KEY (site_id, version)
+        );
+        CREATE TABLE state (
+            id         INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL
+        );
+        INSERT INTO state (id, generation) VALUES (1, 0);
+    ",
+}];
