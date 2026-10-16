@@ -6,13 +6,15 @@
 //! no version accepts is dropped with the reason from the newest version.
 //! Nothing here keeps a payload: a drop is only a name, a reason and a count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use dionaea_core::{
     DropReason, FieldValue, RequestError, WireEvent, decode_batch, reserved_event_names,
 };
 
 use crate::cache::Admission;
+use crate::dedup::Deduper;
+use crate::enrich::Enrichment;
 
 /// The event name counted for a drop whose name the site never declared, so a
 /// sender cannot mint counter keys by inventing names.
@@ -49,6 +51,10 @@ pub enum Reason {
     Guard(DropReason),
     /// The event time, corrected for the device's clock, is outside [`Limits`].
     TimestampOutOfRange,
+    /// The same event id was already stored (a retried event).
+    Duplicate,
+    /// The sender is an automated client.
+    Bot,
 }
 
 impl Reason {
@@ -57,6 +63,8 @@ impl Reason {
         match self {
             Self::Guard(reason) => reason.as_str(),
             Self::TimestampOutOfRange => "timestamp_out_of_range",
+            Self::Duplicate => "duplicate_event",
+            Self::Bot => "bot",
         }
     }
 }
@@ -68,6 +76,8 @@ pub struct Accepted {
     pub site_id: u32,
     /// The canonical text of the event's UUID.
     pub event_id: String,
+    /// The same id as 128 bits, for [`Deduper::remember`].
+    pub event_key: u128,
     /// Event time corrected for the device's clock, in milliseconds.
     pub ts_ms: u64,
     pub received_ms: u64,
@@ -83,6 +93,13 @@ pub struct Accepted {
     pub numbers: Vec<(String, f64)>,
     pub app_version: Option<String>,
     pub sdk: String,
+    /// From the request: country, platform, OS, browser, device class (empty
+    /// when unknown).
+    pub country: String,
+    pub platform: String,
+    pub os: String,
+    pub browser: String,
+    pub device_class: String,
 }
 
 /// How many events were dropped for one reason under one event name.
@@ -100,6 +117,16 @@ pub struct Processed {
     pub drops: Vec<DropCount>,
 }
 
+/// What a request brings besides its body: who sent it and what to remember.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Context<'a> {
+    pub enrichment: Option<&'a Enrichment>,
+    /// Recent event ids; an id found here is dropped as a duplicate. Remember
+    /// the ids of [`Processed::accepted`] with [`Deduper::remember`] once the
+    /// request is durable.
+    pub deduper: Option<&'a Deduper>,
+}
+
 /// Decodes `body` and checks every event. A body that is not a valid batch is
 /// refused whole; an invalid event is dropped alone.
 pub fn process(
@@ -108,6 +135,17 @@ pub fn process(
     received_ms: u64,
     limits: &Limits,
 ) -> Result<Processed, RequestError> {
+    process_with(admission, body, received_ms, limits, &Context::default())
+}
+
+/// [`process`] with the sender's enrichment and the duplicate check.
+pub fn process_with(
+    admission: &Admission,
+    body: &[u8],
+    received_ms: u64,
+    limits: &Limits,
+    context: &Context<'_>,
+) -> Result<Processed, RequestError> {
     let batch = decode_batch(body)?;
     let offset = i128::from(received_ms) - i128::from(batch.sent_at);
     let mut accepted = Vec::with_capacity(batch.events.len());
@@ -115,6 +153,22 @@ pub fn process(
     let mut count_drop = |name: &str, reason: Reason| {
         *drops.entry((name.to_owned(), reason)).or_default() += 1;
     };
+    let enrichment = context.enrichment.cloned().unwrap_or_default();
+    let mut seen: HashSet<u128> = HashSet::new();
+
+    if enrichment.bot {
+        // Automated clients are not guarded: every event is counted and gone.
+        for _ in &batch.rejected {
+            count_drop(UNPARSED_EVENT, Reason::Bot);
+        }
+        for event in &batch.events {
+            count_drop(&counted_name(admission, &event.name), Reason::Bot);
+        }
+        return Ok(Processed {
+            accepted,
+            drops: into_counts(drops),
+        });
+    }
 
     for rejected in &batch.rejected {
         count_drop(UNPARSED_EVENT, Reason::Guard(rejected.reason));
@@ -132,37 +186,60 @@ pub fn process(
         }
         // In range, so it is not negative and fits.
         let ts_ms = u64::try_from(ts).unwrap_or(0);
-        match guard(admission, &event) {
-            Ok((schema_version, strings, numbers)) => accepted.push(Accepted {
-                site_id: admission.site_id,
-                event_id: event.event_id.to_string(),
-                ts_ms,
-                received_ms,
-                name: event.name,
-                schema_version,
-                anon_id: event.anon_id,
-                session_id: event.session_id,
-                screen: event.screen,
-                strings,
-                numbers,
-                app_version: batch.release.clone(),
-                sdk: batch.sdk.clone(),
-            }),
-            Err(reason) => count_drop(&counted_name(admission, &event.name), Reason::Guard(reason)),
+        let (schema_version, strings, numbers) = match guard(admission, &event) {
+            Ok(fields) => fields,
+            Err(reason) => {
+                count_drop(&counted_name(admission, &event.name), Reason::Guard(reason));
+                continue;
+            }
+        };
+        let key = event.event_id.as_u128();
+        let repeated = !seen.insert(key)
+            || context
+                .deduper
+                .is_some_and(|deduper| deduper.contains(key, received_ms));
+        if repeated {
+            count_drop(&event.name, Reason::Duplicate);
+            continue;
         }
+        accepted.push(Accepted {
+            site_id: admission.site_id,
+            event_id: event.event_id.to_string(),
+            event_key: key,
+            ts_ms,
+            received_ms,
+            name: event.name,
+            schema_version,
+            anon_id: event.anon_id,
+            session_id: event.session_id,
+            screen: event.screen,
+            strings,
+            numbers,
+            app_version: batch.release.clone(),
+            sdk: batch.sdk.clone(),
+            country: enrichment.country.clone(),
+            platform: enrichment.platform.clone(),
+            os: enrichment.os.clone(),
+            browser: enrichment.browser.clone(),
+            device_class: enrichment.device_class.clone(),
+        });
     }
 
     Ok(Processed {
         accepted,
-        drops: drops
-            .into_iter()
-            .map(|((event_name, reason), count)| DropCount {
-                event_name,
-                reason,
-                count,
-            })
-            .collect(),
+        drops: into_counts(drops),
     })
+}
+
+fn into_counts(drops: BTreeMap<(String, Reason), u64>) -> Vec<DropCount> {
+    drops
+        .into_iter()
+        .map(|((event_name, reason), count)| DropCount {
+            event_name,
+            reason,
+            count,
+        })
+        .collect()
 }
 
 type Fields = (u32, Vec<(String, String)>, Vec<(String, f64)>);

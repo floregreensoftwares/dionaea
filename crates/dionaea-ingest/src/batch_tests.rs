@@ -31,6 +31,7 @@ fn spool_dir(tag: &str) -> PathBuf {
 fn open(dir: &PathBuf) -> Spool {
     let mut config = SpoolConfig::new(dir);
     config.sync = false;
+    config.max_record_bytes = 4 << 20;
     Spool::open(config).expect("spool")
 }
 
@@ -49,6 +50,12 @@ fn accepted(n: u32, extra: usize) -> Accepted {
         numbers: vec![("items".to_owned(), 3.0)],
         app_version: Some("1.0".to_owned()),
         sdk: "t/1".to_owned(),
+        event_key: u128::from(n),
+        country: String::new(),
+        platform: String::new(),
+        os: String::new(),
+        browser: String::new(),
+        device_class: String::new(),
     }
 }
 
@@ -235,9 +242,9 @@ fn an_event_that_cannot_be_a_row_is_counted_as_an_invalid_row_drop() {
 fn a_large_request_is_split_by_events_and_the_drops_ride_in_the_first_record() {
     let dir = spool_dir("chunks");
     let spool = open(&dir);
-    let events: Vec<_> = (0..40).map(|n| accepted(n, 30_000)).collect();
+    let events: Vec<_> = (0..150).map(|n| accepted(n, 30_000)).collect();
     let done = enqueue(&spool, &request(events, 5), 7, NOW).unwrap();
-    assert_eq!(done.events, 40);
+    assert_eq!(done.events, 150);
     assert!(done.records >= 2, "{done:?}");
     let records = spool.read(100, usize::MAX).unwrap();
     assert_eq!(records.len(), done.records);
@@ -250,7 +257,7 @@ fn a_large_request_is_split_by_events_and_the_drops_ride_in_the_first_record() {
             .iter()
             .map(|l| l.events.lines().count())
             .sum::<usize>(),
-        40
+        150
     );
     assert!(!decoded[0].drops.is_empty());
     assert!(decoded[1..].iter().all(|l| l.drops.is_empty()));
@@ -510,4 +517,21 @@ fn a_rejected_drop_line_never_repeats_the_events_stored_with_it() {
     );
     drop(spool);
     assert_eq!(pending(&dir), 0);
+}
+
+#[test]
+fn the_largest_valid_request_is_always_one_record() {
+    // A body is at most 256 KiB. A hundred events with values made only of
+    // characters that JSON escapes are the worst case for the lines.
+    let dir = spool_dir("one-record");
+    let spool = open(&dir);
+    let events: Vec<_> = (0..100)
+        .map(|n| {
+            let mut event = accepted(n, 0);
+            event.strings = vec![("note".to_owned(), "\"".repeat(2_500))];
+            event
+        })
+        .collect();
+    let done = enqueue(&spool, &request(events, 3), 7, NOW).unwrap();
+    assert_eq!((done.events, done.records), (100, 1));
 }

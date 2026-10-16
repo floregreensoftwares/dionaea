@@ -20,9 +20,11 @@ use crate::pipeline::{Accepted, Processed};
 
 const VERSION: u8 = 1;
 const HEADER: usize = 5;
-/// Most bytes of event lines in one record: well under the spool's default
-/// record limit, so a large request becomes a few records, not an error.
-const CHUNK_BYTES: usize = 512 * 1024;
+/// Most bytes of event lines in one record. A request body is at most 256 KiB,
+/// so its lines (escaping and field names included) stay far below this: every
+/// valid request is one record, acknowledged or refused as a whole. The spool
+/// must allow records of at least this size plus the drop lines.
+pub const CHUNK_BYTES: usize = 3 * 1024 * 1024;
 /// The drop reason for an accepted event the store could not take as a row.
 pub const INVALID_ROW: &str = "invalid_row";
 
@@ -49,11 +51,11 @@ fn row(accepted: &Accepted) -> Option<EventRow> {
         screen: accepted.screen.clone().unwrap_or_default(),
         props_str: accepted.strings.clone(),
         props_num: accepted.numbers.clone(),
-        country: String::new(),
-        platform: String::new(),
-        os: String::new(),
-        browser: String::new(),
-        device_class: String::new(),
+        country: accepted.country.clone(),
+        platform: accepted.platform.clone(),
+        os: accepted.os.clone(),
+        browser: accepted.browser.clone(),
+        device_class: accepted.device_class.clone(),
         app_version: accepted.app_version.clone().unwrap_or_default(),
         sdk: accepted.sdk.clone(),
     })
