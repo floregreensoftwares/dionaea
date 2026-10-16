@@ -914,31 +914,31 @@ fn a_worker_holds_a_request_until_its_lease_runs_out() {
     let second = store.request_erasure(site.id, "u_2", "ops").unwrap();
     assert!(
         store
-            .claim_erasure(ErasureState::Hidden, "a", 60)
+            .claim_erasure(ErasureState::Hidden, "a", 60, i64::MAX)
             .unwrap()
             .is_none()
     );
 
     let one = store
-        .claim_erasure(ErasureState::Requested, "a", 60)
+        .claim_erasure(ErasureState::Requested, "a", 60, i64::MAX)
         .unwrap()
         .unwrap();
     assert_eq!(one.id, first.id, "oldest first");
     let two = store
-        .claim_erasure(ErasureState::Requested, "b", 60)
+        .claim_erasure(ErasureState::Requested, "b", 60, i64::MAX)
         .unwrap()
         .unwrap();
     assert_eq!(two.id, second.id, "the first is held");
     assert!(
         store
-            .claim_erasure(ErasureState::Requested, "c", 60)
+            .claim_erasure(ErasureState::Requested, "c", 60, i64::MAX)
             .unwrap()
             .is_none()
     );
 
     now.store(1_000 + 61, Ordering::SeqCst);
     let again = store
-        .claim_erasure(ErasureState::Requested, "c", 60)
+        .claim_erasure(ErasureState::Requested, "c", 60, i64::MAX)
         .unwrap()
         .unwrap();
     assert_eq!(again.id, first.id, "a dead worker lets go");
@@ -948,7 +948,7 @@ fn a_worker_holds_a_request_until_its_lease_runs_out() {
         .advance_erasure(first.id, ErasureState::Hidden, None)
         .unwrap();
     let hidden = store
-        .claim_erasure(ErasureState::Hidden, "d", 60)
+        .claim_erasure(ErasureState::Hidden, "d", 60, i64::MAX)
         .unwrap()
         .unwrap();
     assert_eq!(hidden.id, first.id);
@@ -1005,4 +1005,63 @@ fn tombstones_survive_reopening_the_database() {
     assert!(tombstones.user_erased(site_id, "u_42") && tombstones.anon_erased(site_id, "a1"));
     assert_eq!(tombstones.len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_request_is_claimed_only_once_it_has_waited_long_enough() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    store
+        .advance_erasure(request.id, ErasureState::Hidden, None)
+        .unwrap();
+    // Hidden at 1_000: not due before that, due from then on.
+    assert!(
+        store
+            .claim_erasure(ErasureState::Hidden, "a", 60, 999)
+            .unwrap()
+            .is_none()
+    );
+    now.store(5_000, Ordering::SeqCst);
+    assert!(
+        store
+            .claim_erasure(ErasureState::Hidden, "a", 60, 1_000)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn the_devices_are_kept_in_the_clear_only_until_the_request_completes() {
+    let store = store();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    assert!(store.erasure_anons(request.id).unwrap().is_empty());
+    store
+        .add_erasure_anons(
+            request.id,
+            &["b".to_owned(), "a".to_owned(), "a".to_owned()],
+        )
+        .unwrap();
+    assert_eq!(store.erasure_anons(request.id).unwrap(), vec!["a", "b"]);
+    store
+        .advance_erasure(request.id, ErasureState::Hidden, None)
+        .unwrap();
+    assert_eq!(store.erasure_anons(request.id).unwrap().len(), 2);
+    store
+        .advance_erasure(request.id, ErasureState::Complete, None)
+        .unwrap();
+    assert!(store.erasure_anons(request.id).unwrap().is_empty());
+    assert!(
+        store
+            .snapshot()
+            .unwrap()
+            .tombstones
+            .anon_erased(site.id, "a"),
+        "only the hashes remain, and they keep blocking"
+    );
+    assert!(matches!(
+        store.erasure_anons(999),
+        Err(MetaError::NotFound("erasure request"))
+    ));
 }

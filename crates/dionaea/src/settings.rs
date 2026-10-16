@@ -61,6 +61,13 @@ pub(crate) struct Tuning {
     /// How often the drop counts of requests that kept no event are written
     /// to the spool. A crash loses the counts of the last interval.
     pub(crate) drop_flush: Duration,
+    /// How long the erasure job waits, after tombstoning a user's devices,
+    /// for every node to have loaded the tombstones before it deletes (at
+    /// least twice the refresh interval is always waited).
+    pub(crate) erase_grace: Duration,
+    /// How long a user stays hidden before the daily physical removal, so a
+    /// day of requests share one rewrite of the tables.
+    pub(crate) erase_finish_after: Duration,
 }
 
 /// Where a setting's value came from.
@@ -351,6 +358,26 @@ pub(crate) static SPECS: &[Spec] = &[
         |t, v| t.drop_flush = Duration::from_secs(v),
         |t| secs(t.drop_flush)
     ),
+    spec!(
+        "erase_grace_secs",
+        "10",
+        "from 0 to 3600 seconds",
+        "how long erasure waits for every server to know a user was erased before it deletes",
+        u64,
+        |v| *v <= 3600,
+        |t, v| t.erase_grace = Duration::from_secs(v),
+        |t| secs(t.erase_grace)
+    ),
+    spec!(
+        "erase_finish_after_secs",
+        "86400",
+        "from 0 to 604800 seconds",
+        "how long an erased user stays hidden before the rows are physically removed",
+        u64,
+        |v| *v <= 604_800,
+        |t, v| t.erase_finish_after = Duration::from_secs(v),
+        |t| secs(t.erase_finish_after)
+    ),
 ];
 
 /// The setting called `name`.
@@ -406,6 +433,8 @@ impl Tuning {
             dedup_window: Duration::ZERO,
             shared_dedup: true,
             drop_flush: Duration::ZERO,
+            erase_grace: Duration::ZERO,
+            erase_finish_after: Duration::ZERO,
         }
     }
 

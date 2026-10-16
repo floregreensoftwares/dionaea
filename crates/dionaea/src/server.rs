@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::collect::{self, Collect, Settings};
 use crate::config::{Config, clickhouse_endpoint};
+use crate::erasure::{Eraser, Job, Timing};
 use crate::net::{self, NetControl, NetCounters};
 use crate::ops::{self, Ops, Status};
 use crate::settings::{self, Origin, Tuning};
@@ -25,6 +26,11 @@ const MIGRATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// The largest spool record: a valid request's rows always fit one (see
 /// `dionaea_ingest::CHUNK_BYTES`).
 const SPOOL_RECORD_BYTES: u32 = 4 * 1024 * 1024;
+/// How long one erasure statement may run: rewriting the tables of a large
+/// installation takes far longer than an insert.
+const ERASE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How often the erasure job looks for work.
+const ERASE_TICK: Duration = Duration::from_secs(5);
 
 /// The public listener's routes: the collect endpoint, and `/healthz` for
 /// load balancers that probe the port events arrive on.
@@ -219,6 +225,9 @@ impl Node {
                 server_name: config.clickhouse_server_name.clone(),
             });
         }
+        let mut erase_config = store_config.clone();
+        erase_config.timeout = ERASE_TIMEOUT;
+        let eraser = Store::new(erase_config).map_err(|e| format!("clickhouse settings: {e}"))?;
         let store = Store::new(store_config).map_err(|e| format!("clickhouse settings: {e}"))?;
 
         // The user agent dataset compiles its patterns on first use; do it now
@@ -311,6 +320,49 @@ impl Node {
                 .map_err(|e| format!("cannot start the refresh thread: {e}"))?
         };
         threads.push(refresher);
+
+        // Erasure requests are carried out once ClickHouse is prepared. The
+        // job has its own connection to the metadata store and its own
+        // ClickHouse handle with a long timeout.
+        let erasure = {
+            let job_meta = SqliteMeta::open(&config.metadata_path)
+                .map_err(|e| format!("cannot open {}: {e}", config.metadata_path.display()))?;
+            let (live, stop, status) = (live.clone(), Arc::clone(&stop), Arc::clone(status));
+            let job = Job::new(
+                Arc::new(job_meta),
+                Arc::new(eraser) as Arc<dyn Eraser>,
+                format!("pid-{}", std::process::id()),
+            );
+            thread::Builder::new()
+                .name("dionaea-erasure".to_owned())
+                .spawn(move || {
+                    let secs = |at: i64| at / 1000;
+                    while !stop.load(Ordering::Acquire) {
+                        nap(ERASE_TICK, &stop);
+                        if !status.clickhouse_ready.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let tuning = live.tuning();
+                        // Every node must have reloaded the tombstones before
+                        // anything is deleted: at least two refreshes.
+                        let timing = Timing {
+                            grace: tuning.erase_grace.max(tuning.refresh_every * 2),
+                            finish_after: tuning.erase_finish_after,
+                        };
+                        let wait = |grace: Duration| {
+                            nap(grace, &stop);
+                            !stop.load(Ordering::Acquire)
+                        };
+                        while !stop.load(Ordering::Acquire)
+                            && job.hide_next(timing, secs(now_ms()), &wait)
+                        {
+                        }
+                        job.finish_due(timing, secs(now_ms()));
+                    }
+                })
+                .map_err(|e| format!("cannot start the erasure thread: {e}"))?
+        };
+        threads.push(erasure);
 
         // The tables must exist before anything is inserted: a missing table
         // is an error the batcher would keep retrying, so it starts only once

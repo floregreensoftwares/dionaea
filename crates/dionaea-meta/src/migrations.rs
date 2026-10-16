@@ -101,6 +101,14 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             created_at INTEGER NOT NULL,
             PRIMARY KEY (site_id, kind, hash)
         );
+        -- The devices found linked to the user, kept in the clear only while
+        -- the job needs them to delete and to verify; removed when the
+        -- request completes. The tombstones keep only their hashes.
+        CREATE TABLE erasure_anons (
+            request_id INTEGER NOT NULL REFERENCES erasure_requests(id),
+            anon_id    TEXT NOT NULL,
+            PRIMARY KEY (request_id, anon_id)
+        );
     ",
     },
 ];
