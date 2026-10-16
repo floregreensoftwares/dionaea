@@ -7,7 +7,7 @@
 //! Nothing here logs or stores the client address, the key or the payload: the
 //! address only keys a token bucket, and requests are counted by outcome.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -130,6 +130,24 @@ pub(crate) fn routes(collect: Arc<Collect>) -> Router {
         .with_state(collect)
 }
 
+/// What an address is limited as: an IPv6 client by its /64, since one host
+/// controls a whole prefix and could otherwise rotate through it; an IPv4
+/// address mapped into IPv6 as the IPv4 address.
+fn address_bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || {
+                let octets = v6.octets();
+                let mut prefix = [0u8; 16];
+                prefix[..8].copy_from_slice(&octets[..8]);
+                IpAddr::V6(Ipv6Addr::from(prefix))
+            },
+            IpAddr::V4,
+        ),
+        v4 => v4,
+    }
+}
+
 /// Milliseconds since the Unix epoch.
 pub(crate) fn system_clock() -> u64 {
     std::time::SystemTime::now()
@@ -230,7 +248,10 @@ async fn handle(
         }
     };
     let now = (collect.clock)();
-    if let Err(RetryAfter(seconds)) = collect.address_limiter.check(peer.ip(), now) {
+    if let Err(RetryAfter(seconds)) = collect
+        .address_limiter
+        .check(address_bucket(peer.ip()), now)
+    {
         counters.rate_limited.fetch_add(1, Ordering::Relaxed);
         return with_retry_after(
             error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
@@ -759,6 +780,43 @@ mod tests {
         assert_eq!(headers[RETRY_AFTER], "5");
         assert_eq!(answer["error"], "unavailable");
         assert!(w.collect.counters.unavailable.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn ipv6_clients_are_limited_by_their_prefix_and_mapped_ipv4_as_ipv4() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::9".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(address_bucket(a), address_bucket(b));
+        assert_ne!(address_bucket(a), address_bucket(other));
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        assert_eq!(
+            address_bucket(mapped),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        let v4: IpAddr = "198.51.100.1".parse().unwrap();
+        assert_eq!(address_bucket(v4), v4);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_finishes_is_408() {
+        let settings = Settings {
+            body_timeout: Duration::from_millis(50),
+            ..Settings::default()
+        };
+        let w = world(&[], settings, None);
+        let stalled = Request::post("/v1/collect")
+            .header(CONTENT_TYPE, "application/json")
+            .header(KEY_HEADER, &w.key)
+            .extension(peer())
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        let (status, _, answer) = send(&w, stalled).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(answer["error"], "body_timeout");
+        assert_eq!(spooled(&w), 0);
     }
 
     #[tokio::test]

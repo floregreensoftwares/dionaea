@@ -499,6 +499,7 @@ dependencies = [
  "dionaea-meta",
  "dionaea-spool",
  "dionaea-store",
+ "futures-util",
  "jsonschema",
  "proptest",
  "serde",
