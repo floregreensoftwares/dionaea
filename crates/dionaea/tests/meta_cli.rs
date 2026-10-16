@@ -17,6 +17,7 @@ fn run(db: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dionaea"))
         .args(args)
         .env("DIONAEA_METADATA_PATH", db)
+        .env("DIONAEA_ERASURE_KEY", "0123456789abcdef0123456789abcdef")
         .output()
         .expect("run the binary")
 }
@@ -216,4 +217,120 @@ fn erase_refuses_what_it_cannot_do_with_a_clear_message() {
         err(&missing)
     );
     assert_eq!(out(&run(&db, &["erase", "list"])), "");
+}
+
+fn run_keyed(db: &Path, args: &[&str], key: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dionaea"));
+    command
+        .args(args)
+        .env("DIONAEA_METADATA_PATH", db)
+        .env_remove("DIONAEA_ERASURE_KEY")
+        .env_remove("DIONAEA_ERASURE_KEY_FILE");
+    if let Some(key) = key {
+        command.env("DIONAEA_ERASURE_KEY", key);
+    }
+    command.output().expect("run the binary")
+}
+
+const OTHER_KEY: &str = "fedcba9876543210fedcba9876543210";
+
+#[test]
+fn erasure_needs_a_key_and_says_how_to_set_one() {
+    let dir = dir("erase-nokey");
+    let db = dir.join("meta.db");
+    assert_eq!(
+        run_keyed(&db, &["site", "create", "shop"], None)
+            .status
+            .code(),
+        Some(0),
+        "the rest of the product needs no key"
+    );
+    let asked = run_keyed(
+        &db,
+        &["erase", "request", "--site", "1", "--user", "u_1"],
+        None,
+    );
+    assert_eq!(asked.status.code(), Some(1));
+    let message = err(&asked);
+    assert!(
+        message.contains("erasure_key") && message.contains("same on every server"),
+        "{message}"
+    );
+    let short = run_keyed(
+        &db,
+        &["erase", "request", "--site", "1", "--user", "u_1"],
+        Some("too short"),
+    );
+    assert_eq!(short.status.code(), Some(2), "{}", err(&short));
+    assert!(err(&short).contains("32"), "{}", err(&short));
+}
+
+#[test]
+fn another_key_cannot_read_or_add_erasures_made_with_the_first() {
+    let dir = dir("erase-otherkey");
+    let db = dir.join("meta.db");
+    let key = "0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        run_keyed(&db, &["site", "create", "shop"], None)
+            .status
+            .code(),
+        Some(0)
+    );
+    let first = run_keyed(
+        &db,
+        &["erase", "request", "--site", "1", "--user", "u_1"],
+        Some(key),
+    );
+    assert_eq!(first.status.code(), Some(0), "{}", err(&first));
+
+    for other in [Some(OTHER_KEY), None] {
+        let again = run_keyed(
+            &db,
+            &["erase", "request", "--site", "1", "--user", "u_2"],
+            other,
+        );
+        assert_eq!(again.status.code(), Some(1), "{other:?}: {}", err(&again));
+    }
+    // Listing needs no key: it shows hashes of requests already made.
+    let listed = run_keyed(&db, &["erase", "list"], Some(OTHER_KEY));
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(out(&listed).lines().count(), 1);
+}
+
+#[test]
+fn the_key_may_come_from_a_file_but_not_from_both() {
+    let dir = dir("erase-keyfile");
+    let db = dir.join("meta.db");
+    assert_eq!(
+        run_keyed(&db, &["site", "create", "shop"], None)
+            .status
+            .code(),
+        Some(0)
+    );
+    let file = dir.join("erasure.key");
+    fs::write(&file, "0123456789abcdef0123456789abcdef\n").expect("write the key");
+    let run_file = |extra: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dionaea"));
+        command
+            .args(["erase", "request", "--site", "1", "--user", "u_1"])
+            .env("DIONAEA_METADATA_PATH", &db)
+            .env_remove("DIONAEA_ERASURE_KEY")
+            .env("DIONAEA_ERASURE_KEY_FILE", &file);
+        if let Some(extra) = extra {
+            command.env("DIONAEA_ERASURE_KEY", extra);
+        }
+        command.output().expect("run the binary")
+    };
+    let ok = run_file(None);
+    assert_eq!(ok.status.code(), Some(0), "{}", err(&ok));
+    let both = run_file(Some("0123456789abcdef0123456789abcdef"));
+    assert_eq!(both.status.code(), Some(2));
+    assert!(err(&both).contains("not both"), "{}", err(&both));
+    // The same key from the file and from the variable are the same key.
+    let again = run_keyed(
+        &db,
+        &["erase", "request", "--site", "1", "--user", "u_2"],
+        Some("0123456789abcdef0123456789abcdef"),
+    );
+    assert_eq!(again.status.code(), Some(0), "{}", err(&again));
 }

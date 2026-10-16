@@ -32,8 +32,16 @@ max = 10
 required = true
 "#;
 
+const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+fn key() -> HashKey {
+    HashKey::from_secret(SECRET).expect("a valid key")
+}
+
 fn store() -> SqliteMeta {
-    SqliteMeta::open_in_memory().expect("an in-memory database")
+    SqliteMeta::open_in_memory()
+        .expect("an in-memory database")
+        .with_hash_key(key())
 }
 
 fn site(store: &SqliteMeta) -> Site {
@@ -447,7 +455,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 4,
+        migrations, 5,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
@@ -736,7 +744,7 @@ fn a_request_is_recorded_and_tombstones_the_user_at_once() {
     assert_eq!(request.user_id.as_deref(), Some("u_42"));
     assert_eq!(
         request.user_hash,
-        tombstone_hash(site.id, IdKind::User, "u_42")
+        key().tombstone_hash(site.id, IdKind::User, "u_42")
     );
     assert_eq!(request.requested_by, "ops");
     assert!(store.generation().unwrap() > before, "nodes must reload");
@@ -978,14 +986,14 @@ fn requests_are_listed_by_state_and_a_hash_is_stable_and_not_the_id() {
     assert_eq!(ids(Some(ErasureState::Requested)), vec![a.id]);
     assert_eq!(ids(Some(ErasureState::Failed)), vec![b.id]);
 
-    let hash = tombstone_hash(1, IdKind::User, "u_1");
+    let hash = key().tombstone_hash(1, IdKind::User, "u_1");
     assert_eq!(hash.len(), 64);
     assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
     assert!(!hash.contains("u_1"));
-    assert_eq!(hash, tombstone_hash(1, IdKind::User, "u_1"));
-    assert_ne!(hash, tombstone_hash(2, IdKind::User, "u_1"), "site");
-    assert_ne!(hash, tombstone_hash(1, IdKind::Anon, "u_1"), "kind");
-    assert_ne!(hash, tombstone_hash(1, IdKind::User, "u_2"), "id");
+    assert_eq!(hash, key().tombstone_hash(1, IdKind::User, "u_1"));
+    assert_ne!(hash, key().tombstone_hash(2, IdKind::User, "u_1"), "site");
+    assert_ne!(hash, key().tombstone_hash(1, IdKind::Anon, "u_1"), "kind");
+    assert_ne!(hash, key().tombstone_hash(1, IdKind::User, "u_2"), "id");
 }
 
 #[test]
@@ -995,7 +1003,7 @@ fn tombstones_survive_reopening_the_database() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("meta.db");
     let site_id = {
-        let store = SqliteMeta::open(&path).unwrap();
+        let store = SqliteMeta::open(&path).unwrap().with_hash_key(key());
         let site = site(&store);
         let request = store.request_erasure(site.id, "u_42", "ops").unwrap();
         store
@@ -1003,7 +1011,7 @@ fn tombstones_survive_reopening_the_database() {
             .unwrap();
         site.id
     };
-    let store = SqliteMeta::open(&path).unwrap();
+    let store = SqliteMeta::open(&path).unwrap().with_hash_key(key());
     let tombstones = tombstones(&store);
     assert!(tombstones.user_erased(site_id, "u_42") && tombstones.anon_erased(site_id, "a1"));
     assert_eq!(tombstones.len(), 2);
@@ -1305,5 +1313,144 @@ fn the_memory_kept_for_a_tombstone_is_a_short_digest_of_its_hash() {
     assert!(
         !empty.user_erased(site.id, "u_1"),
         "nothing loaded, nothing erased"
+    );
+}
+
+// The key that keys the tombstone hashes.
+
+#[test]
+fn hmac_sha256_matches_the_published_test_vectors() {
+    use crate::erasure::hmac_sha256;
+    let hex = |bytes: [u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    // RFC 4231, test case 1.
+    assert_eq!(
+        hex(hmac_sha256(&[0x0b; 20], &[b"Hi There"])),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+    // Test case 2, and the message given in two parts.
+    assert_eq!(
+        hex(hmac_sha256(
+            b"Jefe",
+            &[b"what do ya want ", b"for nothing?"]
+        )),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    // Test case 6: a key longer than the block.
+    assert_eq!(
+        hex(hmac_sha256(
+            &[0xaa; 131],
+            &[b"Test Using Larger Than Block-Size Key - Hash Key First"]
+        )),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+    );
+}
+
+#[test]
+fn a_key_must_be_long_enough_and_plain_text() {
+    assert!(HashKey::from_secret(SECRET).is_ok());
+    for bad in [
+        "",
+        "short",
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef 0123456789abcdef",
+        "0123456789abcdef\n0123456789abcdef",
+    ] {
+        assert!(HashKey::from_secret(bad).is_err(), "{bad:?}");
+    }
+    assert!(HashKey::from_secret(&"k".repeat(MAX_KEY_LEN + 1)).is_err());
+    assert!(HashKey::from_secret(&"k".repeat(MAX_KEY_LEN)).is_ok());
+    let shown = format!("{:?}", key());
+    assert!(!shown.contains(SECRET) && !shown.contains('['), "{shown}");
+}
+
+#[test]
+fn the_same_identifier_hashes_differently_under_another_key() {
+    let other = HashKey::from_secret("fedcba9876543210fedcba9876543210").unwrap();
+    let a = key().tombstone_hash(1, IdKind::User, "u_1");
+    let b = other.tombstone_hash(1, IdKind::User, "u_1");
+    assert_ne!(a, b);
+    assert_eq!(a, key().tombstone_hash(1, IdKind::User, "u_1"));
+    assert_ne!(key().check(), other.check());
+    assert!(!key().check().contains(SECRET));
+}
+
+#[test]
+fn without_a_key_no_erasure_can_be_requested_and_the_message_says_what_to_do() {
+    let store = SqliteMeta::open_in_memory().unwrap();
+    let site = site(&store);
+    let error = store.request_erasure(site.id, "u_1", "ops").unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("erasure_key") && message.contains("32"),
+        "{message}"
+    );
+    assert!(store.erasure_requests(None).unwrap().is_empty());
+    // Reading tombstones is fine while there are none.
+    assert_eq!(Tombstones::default().load_from(&store).unwrap(), 0);
+}
+
+fn reopened(path: &std::path::Path, secret: Option<&str>) -> SqliteMeta {
+    let store = SqliteMeta::open(path).unwrap();
+    match secret {
+        Some(secret) => store.with_hash_key(HashKey::from_secret(secret).unwrap()),
+        None => store,
+    }
+}
+
+#[test]
+fn a_server_with_another_key_or_none_refuses_to_read_or_add_tombstones() {
+    let dir = std::env::temp_dir().join(format!("dionaea-meta-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meta.db");
+    let site_id = {
+        let store = reopened(&path, Some(SECRET));
+        let site = site(&store);
+        store.request_erasure(site.id, "u_1", "ops").unwrap();
+        site.id
+    };
+
+    // The right key reads them.
+    let held = Tombstones::default();
+    held.load_from(&reopened(&path, Some(SECRET))).unwrap();
+    assert!(held.user_erased(site_id, "u_1"));
+
+    // Another key, or none, neither reads nor adds: it must not run as if
+    // nothing had been erased.
+    for secret in [Some("fedcba9876543210fedcba9876543210"), None] {
+        let store = reopened(&path, secret);
+        let error = Tombstones::default().load_from(&store).unwrap_err();
+        assert!(matches!(error, MetaError::Invalid(_)), "{error}");
+        assert!(error.to_string().contains("key"), "{error}");
+        assert!(store.request_erasure(site_id, "u_2", "ops").is_err());
+        assert!(store.add_erasure_anons(1, &["a".to_owned()]).is_err());
+    }
+    let wrong = reopened(&path, Some("fedcba9876543210fedcba9876543210"));
+    assert!(
+        wrong
+            .request_erasure(site_id, "u_2", "ops")
+            .unwrap_err()
+            .to_string()
+            .contains("not the one"),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_tombstone_made_under_one_key_is_not_found_with_the_hash_of_another() {
+    let store = store();
+    let site = site(&store);
+    store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let batch = store.tombstones_since(0, 10).unwrap();
+    assert_eq!(batch.entries.len(), 1);
+    assert_eq!(
+        batch.entries[0].2,
+        key().tombstone_hash(site.id, IdKind::User, "u_1")
+    );
+    let other = HashKey::from_secret("fedcba9876543210fedcba9876543210").unwrap();
+    assert_ne!(
+        batch.entries[0].2,
+        other.tombstone_hash(site.id, IdKind::User, "u_1"),
+        "what the file holds is of no use without the key"
     );
 }

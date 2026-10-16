@@ -173,7 +173,9 @@ fn a_malformed_request_is_refused_whole() {
 fn with_erased(schemas: &[&str]) -> Admission {
     use std::sync::Arc;
 
-    let meta = SqliteMeta::open_in_memory().expect("meta");
+    let meta = SqliteMeta::open_in_memory().expect("meta").with_hash_key(
+        dionaea_meta::HashKey::from_secret("0123456789abcdef0123456789abcdef").expect("key"),
+    );
     let organization = meta.create_organization("o").expect("organization");
     let site = meta.create_site(organization.id, "s").expect("site");
     for schema in schemas {

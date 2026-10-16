@@ -779,7 +779,9 @@ mod tests {
 
     fn world(origins: &[&str], settings: Settings, spool_quota: Option<u64>) -> World {
         static N: AtomicUsize = AtomicUsize::new(0);
-        let meta = SqliteMeta::open_in_memory().unwrap();
+        let meta = SqliteMeta::open_in_memory().unwrap().with_hash_key(
+            dionaea_meta::HashKey::from_secret("0123456789abcdef0123456789abcdef").expect("key"),
+        );
         let organization = meta.create_organization("o").unwrap();
         let site = meta.create_site(organization.id, "s").unwrap();
         meta.publish_schema(site.id, SCHEMA).unwrap();

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use dionaea_meta::{HashKey, SqliteMeta};
 use serde::Deserialize;
 
 use crate::settings::{self, Origin, Tuning};
@@ -40,6 +41,10 @@ pub(crate) struct Config {
     pub(crate) spool_dir: PathBuf,
     pub(crate) spool_quota_bytes: u64,
     pub(crate) metadata_path: PathBuf,
+    /// The secret that keys the hashes erasure keeps (empty: none), or a file
+    /// that holds it. The same on every server that shares the metadata.
+    pub(crate) erasure_key: Secret,
+    pub(crate) erasure_key_file: Option<PathBuf>,
     /// A MaxMind country database (`.mmdb`); without it events have no country.
     pub(crate) geoip_path: Option<PathBuf>,
     pub(crate) tuning: Tuning,
@@ -87,6 +92,8 @@ const FILE_KEYS: &[&str] = &[
     "spool_dir",
     "spool_quota_bytes",
     "metadata_path",
+    "erasure_key",
+    "erasure_key_file",
     "geoip_path",
     "log_level",
     "log_format",
@@ -105,6 +112,8 @@ struct FileConfig {
     spool_dir: Option<PathBuf>,
     spool_quota_bytes: Option<u64>,
     metadata_path: Option<PathBuf>,
+    erasure_key: Option<String>,
+    erasure_key_file: Option<PathBuf>,
     geoip_path: Option<PathBuf>,
     log_level: Option<String>,
     log_format: Option<LogFormat>,
@@ -235,6 +244,8 @@ impl Config {
 
         let (tuning, tuning_origins) = settings::resolve(&table, &source.env)?;
 
+        let erasure_key = Secret(source.text("ERASURE_KEY", file.erasure_key, ""));
+        let erasure_key_file = source.path("ERASURE_KEY_FILE", file.erasure_key_file);
         let log_level = source.text("LOG_LEVEL", file.log_level, "info");
         let log_format = match source.var("LOG_FORMAT") {
             Some(value) => match value.as_str() {
@@ -262,11 +273,41 @@ impl Config {
             spool_dir,
             spool_quota_bytes,
             metadata_path,
+            erasure_key,
+            erasure_key_file,
             geoip_path,
             tuning,
             tuning_origins,
             log_level,
             log_format,
+        })
+    }
+}
+
+impl Config {
+    /// The key that keys the erasure hashes, from the configuration or the file
+    /// it names; `None` when neither is set.
+    pub(crate) fn erasure_key(&self) -> Result<Option<HashKey>, String> {
+        match (self.erasure_key.0.is_empty(), &self.erasure_key_file) {
+            (false, Some(_)) => Err("set `erasure_key` or `erasure_key_file`, not both".to_owned()),
+            (false, None) => HashKey::from_secret(&self.erasure_key.0).map(Some),
+            (true, Some(path)) => {
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    format!("cannot read the erasure key file {}: {e}", path.display())
+                })?;
+                HashKey::from_secret(text.trim_end()).map(Some)
+            }
+            (true, None) => Ok(None),
+        }
+    }
+
+    /// Opens the metadata store with the erasure key, if there is one.
+    pub(crate) fn open_meta(&self) -> Result<SqliteMeta, String> {
+        let meta = SqliteMeta::open(&self.metadata_path)
+            .map_err(|e| format!("cannot open {}: {e}", self.metadata_path.display()))?;
+        Ok(match self.erasure_key()? {
+            Some(key) => meta.with_hash_key(key),
+            None => meta,
         })
     }
 }
@@ -489,6 +530,31 @@ mod tests {
                 "{name}={bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_erasure_key_comes_from_the_environment_or_a_file_and_is_never_shown() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let from_env = |name: &str| (name == "DIONAEA_ERASURE_KEY").then(|| secret.to_owned());
+        let config = Config::resolve(None, from_env).unwrap();
+        assert!(config.erasure_key().unwrap().is_some());
+        assert!(!format!("{config:?}").contains(secret));
+
+        let none = Config::resolve(None, |_| None).unwrap();
+        assert_eq!(none.erasure_key(), Ok(None));
+
+        let short = Config::resolve(None, |name| {
+            (name == "DIONAEA_ERASURE_KEY").then(|| "short".to_owned())
+        })
+        .unwrap();
+        assert!(short.erasure_key().unwrap_err().contains("32"));
+
+        let both = Config::resolve(Some("erasure_key_file = \"k\"\n"), from_env).unwrap();
+        assert!(both.erasure_key().unwrap_err().contains("not both"));
+
+        let missing =
+            Config::resolve(Some("erasure_key_file = \"/no/such/file\"\n"), |_| None).unwrap();
+        assert!(missing.erasure_key().unwrap_err().contains("cannot read"));
     }
 
     #[test]

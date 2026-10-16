@@ -33,6 +33,7 @@ been prepared. Labels come from fixed sets, never from request content.
 | Key | Default | Meaning |
 |---|---|---|
 | `metadata_path` | `dionaea.db` | The SQLite file with sites, keys and schemas; set it to an absolute path |
+| `erasure_key`, `erasure_key_file` | none | A random secret of 32 to 512 characters, or a file that holds it. Needed only to erase users (see below); the same on every server that shares the metadata |
 | `spool_dir` | `spool` | The on-disk queue between the endpoint and ClickHouse; keep it on a disk that survives restarts |
 | `spool_quota_bytes` | 1 GiB | The most disk the spool uses (at least 32 MiB). When it is full the endpoint answers 503 with `Retry-After` |
 | `clickhouse_url` | `http://127.0.0.1:8123` | `http://host[:port]` or `https://host[:port]` |
@@ -225,7 +226,9 @@ Guarantee, with the defaults: invisible to queries within a few seconds of the r
 
 Tombstones are never removed, so a server learns of new ones by asking only for what came after the last it saw, in batches, and keeps 128 bits of each hash (a few dozen bytes with the set's overhead: a million erased devices are tens of megabytes). A metadata change that adds none reads none.
 
-What the metadata store keeps: the user id and the devices in the clear until the request is complete, then only SHA-256 hashes (not salted: someone holding the metadata file can test whether a guessable id was erased) and an audit line (who asked, when, counts). `event_ids` holds only random event ids and expires after a day; the rollups hold no identifier.
+**The erasure key.** The hashes kept for erased users and devices are HMAC-SHA-256 under a secret you configure, so someone who has only the metadata file cannot test whether a guessable id such as `u_42` was erased. Make one with `openssl rand -hex 32` and give every server and every `dionaea` command the same value (`DIONAEA_ERASURE_KEY`, or `DIONAEA_ERASURE_KEY_FILE` for a file such as a container secret). Nothing needs it until the first erasure is requested; asking without one is refused with that instruction. The key itself is never stored, only a value derived from it, and once an erasure exists a server whose key is missing or different **refuses to start** (and a command refuses to read or add erasures) instead of running as if nobody had been erased. There is no rotation: the identifiers are gone, so the hashes cannot be recomputed. Keep the key as you keep the ClickHouse password; if it leaks, the hashes are as testable as unkeyed ones would have been, and nothing else is exposed.
+
+What the metadata store keeps: the user id and the devices in the clear until the request is complete, then only the keyed hashes and an audit line (who asked, when, counts). `event_ids` holds only random event ids and expires after a day; the rollups hold no identifier.
 
 Metrics: `dionaea_identifies_total{result="erased"}`, `dionaea_batcher_erased_rows_total`, and drops with reason `erased` in `dionaea_events_dropped_total`.
 
