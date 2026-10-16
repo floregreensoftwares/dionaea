@@ -5,6 +5,7 @@ mod net;
 mod ops;
 mod schema_cli;
 mod server;
+mod settings;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,6 +45,11 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: KeyCommand,
+    },
+    /// Read and change the limits and intervals a running server follows
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
     },
 }
 
@@ -109,6 +115,37 @@ enum SiteCommand {
     },
 }
 
+/// The operational settings: limits and intervals that follow a change within
+/// the server's refresh interval, with no restart. Addresses, paths and
+/// credentials stay in the file and the environment.
+#[derive(Subcommand)]
+enum SettingsCommand {
+    /// List every setting: name, value in force, where it comes from, what it is
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Print the value in force of one setting
+    Get {
+        name: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Store a value; the file, the environment and the default give way to it
+    Set {
+        name: String,
+        value: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Remove a stored value, so the file, the environment or the default applies
+    Unset {
+        name: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
 #[derive(Subcommand)]
 enum KeyCommand {
     /// Issue a write key for a site; prints the key
@@ -145,6 +182,7 @@ fn main() -> ExitCode {
         Command::Schema { command } => schema(command),
         Command::Site { command } => site(command),
         Command::Key { command } => key(command),
+        Command::Settings { command } => settings_command(command),
     }
 }
 
@@ -238,6 +276,19 @@ fn with_store(
     args: &StoreArgs,
     work: impl FnOnce(&dyn MetaStore, &mut std::io::StdoutLock<'_>, &mut std::io::StderrLock<'_>) -> u8,
 ) -> ExitCode {
+    with_config_store(args, |_, meta, out, err| work(meta, out, err))
+}
+
+/// The same, for work that also needs the configuration.
+fn with_config_store(
+    args: &StoreArgs,
+    work: impl FnOnce(
+        &Config,
+        &dyn MetaStore,
+        &mut std::io::StdoutLock<'_>,
+        &mut std::io::StderrLock<'_>,
+    ) -> u8,
+) -> ExitCode {
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     let config = match load_config(args.config.clone()) {
         Ok(config) => config,
@@ -257,7 +308,33 @@ fn with_store(
             return ExitCode::from(meta_cli::UNUSABLE);
         }
     };
-    ExitCode::from(work(&store, &mut out, &mut err))
+    ExitCode::from(work(&config, &store, &mut out, &mut err))
+}
+
+fn settings_command(command: SettingsCommand) -> ExitCode {
+    match command {
+        SettingsCommand::List { store } => with_config_store(&store, |config, meta, out, err| {
+            meta_cli::settings_list(meta, &config.tuning, &config.tuning_origins, out, err)
+        }),
+        SettingsCommand::Get { name, store } => {
+            with_config_store(&store, |config, meta, out, err| {
+                meta_cli::settings_get(
+                    meta,
+                    &config.tuning,
+                    &config.tuning_origins,
+                    &name,
+                    out,
+                    err,
+                )
+            })
+        }
+        SettingsCommand::Set { name, value, store } => with_store(&store, |meta, _, err| {
+            meta_cli::settings_set(meta, &name, &value, err)
+        }),
+        SettingsCommand::Unset { name, store } => with_store(&store, |meta, _, err| {
+            meta_cli::settings_unset(meta, &name, err)
+        }),
+    }
 }
 
 fn site(command: SiteCommand) -> ExitCode {

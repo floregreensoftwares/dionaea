@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -32,7 +32,7 @@ use dionaea_meta::is_write_key_shape;
 use dionaea_spool::{Spool, SpoolError};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 
-use crate::config::Tuning;
+use crate::settings::Tuning;
 
 /// The header the SDKs send the write key in.
 pub(crate) const KEY_HEADER: &str = "x-dionaea-key";
@@ -159,7 +159,7 @@ pub(crate) struct Collect {
     deduper: Deduper,
     drops: DropAggregator,
     geo: Option<Arc<dyn CountryLookup>>,
-    settings: Settings,
+    settings: RwLock<Arc<Settings>>,
     clock: Box<Clock>,
     pub(crate) counters: Counters,
 }
@@ -194,10 +194,37 @@ impl Collect {
             geo: None,
             cache,
             spool,
-            settings,
+            settings: RwLock::new(Arc::new(settings)),
             clock: Box::new(clock),
             counters: Counters::default(),
         }
+    }
+
+    /// The settings in force. A request reads them once, so a change never
+    /// splits one request between two sets.
+    pub(crate) fn settings(&self) -> Arc<Settings> {
+        Arc::clone(&self.settings.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Puts new settings into force: the limiters and the event id memory are
+    /// changed in place, the rest is read by the next request.
+    pub(crate) fn apply(&self, settings: Settings) {
+        self.key_limiter.reconfigure(
+            settings.key_rate_per_sec,
+            settings.key_burst,
+            settings.tracked,
+        );
+        self.address_limiter.reconfigure(
+            settings.address_rate_per_sec,
+            settings.address_burst,
+            settings.tracked,
+        );
+        let window = u64::try_from(settings.dedup_window.as_millis()).unwrap_or(u64::MAX);
+        self.deduper.reconfigure(settings.dedup_capacity, window);
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(settings);
     }
 
     /// Uses `lookup` to give events a country.
@@ -210,8 +237,9 @@ impl Collect {
     /// Keeps the remembered event ids in a file as well, so a restart does not
     /// forget them.
     pub(crate) fn with_dedup_journal(mut self, path: &std::path::Path) -> std::io::Result<Self> {
-        let window = u64::try_from(self.settings.dedup_window.as_millis()).unwrap_or(u64::MAX);
-        self.deduper = Deduper::open(self.settings.dedup_capacity, window, path, (self.clock)())?;
+        let settings = self.settings();
+        let window = u64::try_from(settings.dedup_window.as_millis()).unwrap_or(u64::MAX);
+        self.deduper = Deduper::open(settings.dedup_capacity, window, path, (self.clock)())?;
         Ok(self)
     }
 
@@ -235,7 +263,7 @@ impl Collect {
 
     /// How often the refresher flushes drop counts.
     pub(crate) fn drop_flush_every(&self) -> Duration {
-        self.settings.drop_flush
+        self.settings().drop_flush
     }
 
     /// Whether enough distinct drop counts are held to flush them early.
@@ -393,6 +421,7 @@ async fn handle(
     request: Request<Body>,
 ) -> Response<Body> {
     let counters = &collect.counters;
+    let settings = collect.settings();
     let (parts, body) = request.into_parts();
     let preflight = parts.method == Method::OPTIONS;
     if !preflight && parts.method != Method::POST {
@@ -419,8 +448,8 @@ async fn handle(
     let client = client_address(
         &parts.headers,
         peer.ip(),
-        collect.settings.trusted_proxy_hops,
-        &collect.settings.client_address_header,
+        settings.trusted_proxy_hops,
+        &settings.client_address_header,
     );
     if let Err(RetryAfter(seconds)) = collect.address_limiter.check(address_bucket(client), now) {
         counters.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -492,7 +521,7 @@ async fn handle(
             origin,
         );
     }
-    let bytes = match read_body(body, collect.settings.body_timeout).await {
+    let bytes = match read_body(body, settings.body_timeout).await {
         BodyRead::Complete(bytes) => bytes,
         BodyRead::TooLarge => {
             counters.too_large.fetch_add(1, Ordering::Relaxed);
@@ -544,7 +573,7 @@ async fn handle(
             counters.unavailable.fetch_add(1, Ordering::Relaxed);
             with_retry_after(
                 error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-                collect.settings.retry_after_busy,
+                settings.retry_after_busy,
             )
         }
     };
@@ -564,15 +593,16 @@ fn store(
     now: u64,
     enrichment: &Enrichment,
 ) -> Outcome {
+    let settings = collect.settings();
     let context = Context {
         enrichment: Some(enrichment),
         deduper: Some(&collect.deduper),
     };
-    let processed: Processed =
-        match process_with(admission, body, now, &collect.settings.limits, &context) {
-            Ok(processed) => processed,
-            Err(error) => return Outcome::Refused(error.as_str()),
-        };
+    let processed: Processed = match process_with(admission, body, now, &settings.limits, &context)
+    {
+        Ok(processed) => processed,
+        Err(error) => return Outcome::Refused(error.as_str()),
+    };
     let dropped: u64 = processed.drops.iter().map(|d| d.count).sum();
     if processed.accepted.is_empty() {
         // Nothing to make durable: only counts, merged and written every few

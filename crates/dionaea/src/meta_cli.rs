@@ -8,10 +8,13 @@
 //! Results go to stdout as tab-separated lines, so scripts can read them;
 //! problems go to stderr.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use dionaea_core::Severity;
 use dionaea_meta::{MetaError, MetaStore, Organization};
+
+use crate::settings::{self, Origin, Tuning};
 
 pub(crate) const OK: u8 = 0;
 pub(crate) const REFUSED: u8 = 1;
@@ -229,6 +232,124 @@ pub(crate) fn schema_retire(
 ) -> u8 {
     match store.retire_schema_version(site_id, version) {
         Ok(()) => OK,
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// The value of every setting in force, with where it came from.
+fn effective(
+    store: &dyn MetaStore,
+    base: &Tuning,
+    origins: &BTreeMap<&'static str, Origin>,
+) -> Result<Vec<(&'static settings::Spec, String, Origin)>, MetaError> {
+    let stored = store.settings()?;
+    let (tuning, skipped) = base.with_stored(&stored);
+    Ok(settings::SPECS
+        .iter()
+        .map(|spec| {
+            let applied = stored.contains_key(spec.name)
+                && !skipped.iter().any(|(name, _)| name == spec.name);
+            let origin = if applied {
+                Origin::Stored
+            } else {
+                origins.get(spec.name).copied().unwrap_or(Origin::Default)
+            };
+            (spec, tuning.show(spec), origin)
+        })
+        .collect())
+}
+
+/// Lists every setting that can change while the server runs: name, value in
+/// force, where the value comes from, and what it is.
+pub(crate) fn settings_list(
+    store: &dyn MetaStore,
+    base: &Tuning,
+    origins: &BTreeMap<&'static str, Origin>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match effective(store, base, origins) {
+        Ok(rows) => {
+            for (spec, value, origin) in rows {
+                let _ = writeln!(
+                    out,
+                    "{}\t{value}\t{}\t{}\t{}",
+                    spec.name,
+                    origin.as_str(),
+                    spec.rule,
+                    spec.help
+                );
+            }
+            OK
+        }
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// Prints the value in force of one setting, alone, for scripts.
+pub(crate) fn settings_get(
+    store: &dyn MetaStore,
+    base: &Tuning,
+    origins: &BTreeMap<&'static str, Origin>,
+    name: &str,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match effective(store, base, origins) {
+        Ok(rows) => match rows.into_iter().find(|(spec, _, _)| spec.name == name) {
+            Some((_, value, _)) => {
+                let _ = writeln!(out, "{value}");
+                OK
+            }
+            None => {
+                let _ = writeln!(err, "error: {}", unknown(name));
+                REFUSED
+            }
+        },
+        Err(error) => report(&error, "", err),
+    }
+}
+
+fn unknown(name: &str) -> String {
+    settings::validate(name, "0")
+        .err()
+        .unwrap_or_else(|| format!("`{name}` is not a setting"))
+}
+
+/// Stores a setting. A running server applies it within its refresh interval,
+/// without a restart.
+pub(crate) fn settings_set(
+    store: &dyn MetaStore,
+    name: &str,
+    value: &str,
+    err: &mut impl Write,
+) -> u8 {
+    let canonical = match settings::canonical(name, value) {
+        Ok(canonical) => canonical,
+        Err(reason) => {
+            let _ = writeln!(err, "error: {name}: {reason}");
+            return REFUSED;
+        }
+    };
+    match store.set_setting(name, &canonical) {
+        Ok(()) => OK,
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// Removes a stored setting, so the file, the environment or the default
+/// applies again.
+pub(crate) fn settings_unset(store: &dyn MetaStore, name: &str, err: &mut impl Write) -> u8 {
+    if settings::find(name).is_none() {
+        let _ = writeln!(err, "error: {}", unknown(name));
+        return REFUSED;
+    }
+    match store.unset_setting(name) {
+        Ok(true) => OK,
+        Ok(false) => {
+            let _ = writeln!(err, "{name} was not stored");
+            OK
+        }
         Err(error) => report(&error, "", err),
     }
 }

@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -18,7 +18,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use tracing::warn;
 
@@ -28,13 +27,37 @@ const DRAIN: Duration = Duration::from_secs(10);
 /// default is far larger, and it is paid per connection.
 const MAX_HEADER_BUFFER: usize = 32 * 1024;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct NetLimits {
+/// The limits of a listener, which can change while it serves: a connection
+/// already open keeps the header time it was given, new ones get the new one.
+#[derive(Debug)]
+pub(crate) struct NetControl {
     /// Connections open at once; a further one is closed as soon as it opens.
-    pub(crate) max_connections: usize,
-    /// Time to receive the headers of a request. It also ends a keep-alive
-    /// connection that stays idle.
-    pub(crate) header_timeout: Duration,
+    max_connections: AtomicUsize,
+    /// Time to receive the headers of a request, in milliseconds. It also ends
+    /// a keep-alive connection that stays idle.
+    header_timeout_ms: AtomicU64,
+}
+
+impl NetControl {
+    pub(crate) fn new(max_connections: usize, header_timeout: Duration) -> Self {
+        let control = Self {
+            max_connections: AtomicUsize::new(0),
+            header_timeout_ms: AtomicU64::new(0),
+        };
+        control.set(max_connections, header_timeout);
+        control
+    }
+
+    pub(crate) fn set(&self, max_connections: usize, header_timeout: Duration) {
+        self.max_connections
+            .store(max_connections, Ordering::Relaxed);
+        let millis = u64::try_from(header_timeout.as_millis()).unwrap_or(u64::MAX);
+        self.header_timeout_ms.store(millis, Ordering::Relaxed);
+    }
+
+    fn header_timeout(&self) -> Duration {
+        Duration::from_millis(self.header_timeout_ms.load(Ordering::Relaxed))
+    }
 }
 
 /// Connection counts, for the metrics.
@@ -56,11 +79,10 @@ impl NetCounters {
 pub(crate) async fn serve(
     listener: TcpListener,
     app: Router,
-    limits: NetLimits,
+    control: Arc<NetControl>,
     counters: Arc<NetCounters>,
     shutdown: impl Future<Output = ()>,
 ) {
-    let slots = Arc::new(Semaphore::new(limits.max_connections));
     let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
     loop {
@@ -76,12 +98,15 @@ pub(crate) async fn serve(
             },
             () = &mut shutdown => break,
         };
-        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+        // Counted first, then compared: two connections arriving together
+        // cannot both take the last place.
+        let before = counters.open.fetch_add(1, Ordering::AcqRel);
+        if before >= control.max_connections.load(Ordering::Relaxed) as u64 {
+            counters.open.fetch_sub(1, Ordering::AcqRel);
             counters.refused.fetch_add(1, Ordering::Relaxed);
             continue;
-        };
+        }
         counters.accepted.fetch_add(1, Ordering::Relaxed);
-        counters.open.fetch_add(1, Ordering::Relaxed);
         let _ = stream.set_nodelay(true);
 
         let app = app.clone();
@@ -94,15 +119,14 @@ pub(crate) async fn serve(
         let mut builder = http1::Builder::new();
         builder
             .timer(TokioTimer::new())
-            .header_read_timeout(limits.header_timeout)
+            .header_read_timeout(control.header_timeout())
             .max_buf_size(MAX_HEADER_BUFFER)
             .keep_alive(true);
         let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
         let counters = Arc::clone(&counters);
         tokio::spawn(async move {
             let _ = connection.await;
-            counters.open.fetch_sub(1, Ordering::Relaxed);
-            drop(slot);
+            counters.open.fetch_sub(1, Ordering::AcqRel);
         });
     }
     drop(listener);

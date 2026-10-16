@@ -24,6 +24,10 @@ use crate::net::NetCounters;
 pub(crate) struct Status {
     /// ClickHouse has been prepared (tables exist) at least once.
     pub(crate) clickhouse_ready: AtomicBool,
+    /// How many operational settings an operator stored, and how many of them
+    /// were ignored because they are unknown or out of range.
+    pub(crate) settings_stored: AtomicU64,
+    pub(crate) settings_skipped: AtomicU64,
     /// The last attempt to read keys and schemas failed.
     pub(crate) metadata_failing: AtomicBool,
     pub(crate) batcher: Mutex<Option<Arc<BatcherStats>>>,
@@ -34,6 +38,8 @@ impl Status {
     pub(crate) fn new(spool_quota_bytes: u64) -> Self {
         Self {
             clickhouse_ready: AtomicBool::new(false),
+            settings_stored: AtomicU64::new(0),
+            settings_skipped: AtomicU64::new(0),
             metadata_failing: AtomicBool::new(false),
             batcher: Mutex::new(None),
             spool_quota_bytes,
@@ -299,6 +305,28 @@ fn render(ops: &Ops) -> String {
         );
     }
 
+    metric(
+        &mut out,
+        "dionaea_settings_stored",
+        "gauge",
+        "Operational settings stored by an operator.",
+    );
+    let _ = writeln!(
+        out,
+        "dionaea_settings_stored {}",
+        ops.status.settings_stored.load(Ordering::Relaxed)
+    );
+    metric(
+        &mut out,
+        "dionaea_settings_skipped",
+        "gauge",
+        "Stored settings ignored because they are unknown or out of range.",
+    );
+    let _ = writeln!(
+        out,
+        "dionaea_settings_skipped {}",
+        ops.status.settings_skipped.load(Ordering::Relaxed)
+    );
     metric(
         &mut out,
         "dionaea_metadata_failing",

@@ -722,6 +722,247 @@ fn events_reach_clickhouse_over_tls() {
     );
 }
 
+// Settings stored with the command line reach a running server.
+
+/// Runs the binary and returns (exit code, stdout, stderr).
+fn run_status(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = command(dir).args(args).output().expect("run the binary");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    )
+}
+
+/// Polls `condition` for up to `seconds`.
+fn eventually(what: &str, seconds: u64, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_limit_stored_on_the_command_line_takes_hold_in_a_running_server_and_lifts_when_removed() {
+    let dir = dir("hot-limit");
+    let key = bootstrap(&dir);
+    let server = server_with(&dir, &[("REFRESH_SECS", "1")]);
+    let post = || server.request(&collect_head(&key), &batch(1, 1)).0;
+    for n in 0..5 {
+        assert_eq!(
+            server.request(&collect_head(&key), &batch(n + 100, 1)).0,
+            202
+        );
+    }
+
+    // No restart: a burst of two and almost no refill.
+    assert_eq!(
+        run_status(&dir, &["settings", "set", "address_burst", "2"]).0,
+        0
+    );
+    assert_eq!(
+        run_status(&dir, &["settings", "set", "address_rate_per_sec", "0.001"]).0,
+        0
+    );
+    eventually("the limit to take hold", 15, || post() == 429);
+    let metrics = server.ops("/metrics").1;
+    assert_eq!(metric(&metrics, "dionaea_settings_stored "), 2);
+    assert_eq!(metric(&metrics, "dionaea_settings_skipped "), 0);
+
+    // Removed, the default applies again.
+    assert_eq!(
+        run_status(&dir, &["settings", "unset", "address_burst"]).0,
+        0
+    );
+    assert_eq!(
+        run_status(&dir, &["settings", "unset", "address_rate_per_sec"]).0,
+        0
+    );
+    eventually("the limit to lift", 15, || post() == 202);
+    assert_eq!(
+        metric(&server.ops("/metrics").1, "dionaea_settings_stored "),
+        0
+    );
+}
+
+#[test]
+fn a_connection_limit_stored_while_the_server_runs_applies_to_new_connections() {
+    let dir = dir("hot-connections");
+    let server = server_with(
+        &dir,
+        &[("REFRESH_SECS", "1"), ("HEADER_TIMEOUT_SECS", "30")],
+    );
+    assert_eq!(
+        run_status(&dir, &["settings", "set", "max_connections", "1"]).0,
+        0
+    );
+    eventually("one connection to be the limit", 15, || {
+        let first = TcpStream::connect(&server.address).expect("connect");
+        first
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        std::thread::sleep(Duration::from_millis(150));
+        let mut second = TcpStream::connect(&server.address).expect("connect");
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut byte = [0u8; 1];
+        // Closed by the server: end of stream, or a reset. A read that merely
+        // times out means the server kept the connection.
+        let refused = match second.read(&mut byte) {
+            Ok(0) => true,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            ),
+            Ok(_) => false,
+        };
+        drop((first, second));
+        std::thread::sleep(Duration::from_millis(150));
+        refused
+    });
+    assert_eq!(
+        run_status(&dir, &["settings", "unset", "max_connections"]).0,
+        0
+    );
+    eventually("the limit to lift", 15, || {
+        let first = TcpStream::connect(&server.address).expect("connect");
+        let mut second = TcpStream::connect(&server.address).expect("connect");
+        second
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .expect("send");
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let mut answer = String::new();
+        let _ = second.read_to_string(&mut answer);
+        drop(first);
+        answer.contains("200")
+    });
+}
+
+#[test]
+fn settings_stored_before_the_server_starts_apply_from_the_first_request() {
+    let dir = dir("stored-first");
+    let key = bootstrap(&dir);
+    run_status(&dir, &["settings", "set", "address_burst", "1"]);
+    run_status(&dir, &["settings", "set", "address_rate_per_sec", "0.001"]);
+    let server = server_with(&dir, &[]);
+    let head = collect_head(&key);
+    assert_eq!(server.request(&head, &batch(1, 1)).0, 202);
+    assert_eq!(server.request(&head, &batch(2, 1)).0, 429, "a burst of one");
+}
+
+#[test]
+fn a_stored_value_that_is_out_of_range_is_ignored_and_reported_not_fatal() {
+    let dir = dir("stored-bad");
+    let key = bootstrap(&dir);
+    // Written behind the command line's back, as a hand edit of the file could.
+    let meta = dionaea_meta::SqliteMeta::open(&dir.join("meta.db")).expect("open");
+    dionaea_meta::MetaStore::set_setting(&meta, "key_burst", "0").expect("store");
+    dionaea_meta::MetaStore::set_setting(&meta, "no_such_setting", "1").expect("store");
+    dionaea_meta::MetaStore::set_setting(&meta, "address_burst", "3").expect("store");
+    drop(meta);
+
+    let server = server_with(&dir, &[("ADDRESS_RATE_PER_SEC", "0.001")]);
+    let head = collect_head(&key);
+    for n in 0..3 {
+        assert_eq!(
+            server.request(&head, &batch(n, 1)).0,
+            202,
+            "the good value applies"
+        );
+    }
+    assert_eq!(
+        server.request(&head, &batch(9, 1)).0,
+        429,
+        "a burst of three"
+    );
+    let metrics = server.ops("/metrics").1;
+    assert_eq!(metric(&metrics, "dionaea_settings_stored "), 3);
+    assert_eq!(metric(&metrics, "dionaea_settings_skipped "), 2);
+    assert_eq!(server.ops("/readyz").0, 200);
+}
+
+#[test]
+fn the_command_line_validates_lists_and_removes_settings() {
+    let dir = dir("settings-cli");
+    bootstrap(&dir);
+
+    let (code, _, err) = run_status(&dir, &["settings", "set", "key_burst", "0.1"]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("key_burst") && err.contains("from 1 to 1e9"),
+        "{err}"
+    );
+    let (code, _, err) = run_status(&dir, &["settings", "set", "listen", "127.0.0.1:1"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("key_burst"), "it names what can change: {err}");
+    assert_eq!(run_status(&dir, &["settings", "get", "nope"]).0, 1);
+    assert_eq!(run_status(&dir, &["settings", "unset", "nope"]).0, 1);
+
+    assert_eq!(
+        run_status(&dir, &["settings", "set", "key_burst", "0900"]).0,
+        0
+    );
+    let (code, value, _) = run_status(&dir, &["settings", "get", "key_burst"]);
+    assert_eq!(
+        (code, value.as_str()),
+        (0, "900"),
+        "stored as 900, not as written"
+    );
+    let (_, list, _) = run_status(&dir, &["settings", "list"]);
+    let line = list
+        .lines()
+        .find(|l| l.starts_with("key_burst\t"))
+        .expect("listed");
+    let fields: Vec<&str> = line.split('\t').collect();
+    assert_eq!(&fields[..3], ["key_burst", "900", "stored"]);
+    let other = list
+        .lines()
+        .find(|l| l.starts_with("address_burst\t"))
+        .expect("listed");
+    assert!(
+        other.starts_with("address_burst\t100\tdefault\t"),
+        "{other}"
+    );
+
+    let (code, _, err) = run_status(&dir, &["settings", "unset", "key_burst"]);
+    assert_eq!((code, err.as_str()), (0, ""));
+    let (_, again, _) = run_status(&dir, &["settings", "unset", "key_burst"]);
+    assert_eq!(again, "");
+    let (_, value, _) = run_status(&dir, &["settings", "get", "key_burst"]);
+    assert_eq!(value, "400");
+}
+
+#[test]
+fn the_file_and_the_environment_show_as_the_source_of_a_setting() {
+    let dir = dir("settings-sources");
+    bootstrap(&dir);
+    let config = dir.join("dionaea.toml");
+    std::fs::write(&config, "key_burst = 555\naddress_burst = 66\n").expect("write");
+    let list = |extra: &[(&str, &str)]| {
+        let mut command = command(&dir);
+        command.args(["settings", "list", "--config"]).arg(&config);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        String::from_utf8_lossy(&command.output().expect("run").stdout).into_owned()
+    };
+    let text = list(&[("DIONAEA_ADDRESS_BURST", "77")]);
+    assert!(text.contains("key_burst\t555\tfile\t"), "{text}");
+    assert!(text.contains("address_burst\t77\tenvironment\t"), "{text}");
+    run_status(&dir, &["settings", "set", "key_burst", "10"]);
+    let text = list(&[]);
+    assert!(
+        text.contains("key_burst\t10\tstored\t"),
+        "stored wins over the file: {text}"
+    );
+}
+
 /// A database of its own on the ClickHouse of `compose.yaml`, dropped when the
 /// guard goes out of scope.
 struct ScratchDatabase {

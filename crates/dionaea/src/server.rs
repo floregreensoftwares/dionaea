@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,9 @@ use tracing::{info, warn};
 
 use crate::collect::{self, Collect, Settings};
 use crate::config::{Config, clickhouse_endpoint};
-use crate::net::{self, NetCounters, NetLimits};
+use crate::net::{self, NetControl, NetCounters};
 use crate::ops::{self, Ops, Status};
+use crate::settings::{self, Tuning};
 
 /// The longest wait between attempts to prepare ClickHouse.
 const MIGRATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -55,16 +56,114 @@ struct Node {
     batcher: Arc<Mutex<Option<Batcher>>>,
 }
 
+/// The settings in force and how to put new ones into force: the pieces the
+/// refresher changes in place when an operator stores a setting.
+#[derive(Clone)]
+struct Live {
+    /// Defaults, file and environment: what stored settings are applied on.
+    base: Arc<Tuning>,
+    current: Arc<RwLock<Arc<Tuning>>>,
+    collect: Arc<Collect>,
+    control: Arc<NetControl>,
+    batcher: Arc<Mutex<Option<Batcher>>>,
+    status: Arc<Status>,
+}
+
+fn batcher_config(tuning: &Tuning) -> BatcherConfig {
+    BatcherConfig {
+        max_records: tuning.batch_max_records,
+        max_bytes: tuning.batch_max_bytes,
+        min_interval: tuning.batch_min_interval,
+        shared_dedup: tuning.shared_dedup,
+        ..BatcherConfig::default()
+    }
+}
+
+impl Live {
+    fn tuning(&self) -> Arc<Tuning> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Applies the stored settings found in the cache on top of the base.
+    /// Returns what changed, as `name: before -> after`.
+    fn reload(&self) -> Vec<String> {
+        let stored = self.collect.cache.settings();
+        let (next, skipped) = self.base.with_stored(&stored);
+        for (name, reason) in &skipped {
+            warn!(setting = %name, %reason, "a stored setting is ignored");
+        }
+        self.status
+            .settings_skipped
+            .store(skipped.len() as u64, Ordering::Relaxed);
+        self.status
+            .settings_stored
+            .store(stored.len() as u64, Ordering::Relaxed);
+
+        let before = self.tuning();
+        if *before == next {
+            return Vec::new();
+        }
+        let changed: Vec<String> = settings::SPECS
+            .iter()
+            .filter(|spec| before.show(spec) != next.show(spec))
+            .map(|spec| {
+                format!(
+                    "{}: {} -> {}",
+                    spec.name,
+                    before.show(spec),
+                    next.show(spec)
+                )
+            })
+            .collect();
+        self.put(next);
+        changed
+    }
+
+    /// Puts `tuning` into force everywhere.
+    fn put(&self, tuning: Tuning) {
+        // The shared copy first: a batcher that starts at this moment reads it.
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(tuning.clone());
+        self.collect.apply(Settings::from_tuning(&tuning));
+        self.control
+            .set(tuning.max_connections, tuning.header_timeout);
+        if let Some(batcher) = self
+            .batcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            batcher.reconfigure(batcher_config(&tuning));
+        }
+    }
+}
+
 impl Node {
-    fn start(config: &Config, status: &Arc<Status>) -> Result<(Self, Arc<Collect>), String> {
+    fn start(
+        config: &Config,
+        status: &Arc<Status>,
+        control: &Arc<NetControl>,
+    ) -> Result<(Self, Arc<Collect>), String> {
         let endpoint = clickhouse_endpoint(&config.clickhouse_url)?;
-        let tuning = &config.tuning;
         let meta = SqliteMeta::open(&config.metadata_path)
             .map_err(|e| format!("cannot open {}: {e}", config.metadata_path.display()))?;
         let cache = Cache::new();
         cache
             .refresh(&meta)
             .map_err(|e| format!("cannot read the metadata: {e}"))?;
+
+        // The settings an operator stored apply from the first request.
+        let stored = cache.settings();
+        let (tuning, skipped) = config.tuning.with_stored(&stored);
+        for (name, reason) in &skipped {
+            warn!(setting = %name, %reason, "a stored setting is ignored");
+        }
+        status
+            .settings_skipped
+            .store(skipped.len() as u64, Ordering::Relaxed);
+        status
+            .settings_stored
+            .store(stored.len() as u64, Ordering::Relaxed);
+        control.set(tuning.max_connections, tuning.header_timeout);
 
         let mut spool_config = SpoolConfig::new(&config.spool_dir);
         spool_config.quota_bytes = config.spool_quota_bytes;
@@ -93,7 +192,7 @@ impl Node {
         let mut collect = Collect::new(
             cache,
             spool.clone(),
-            Settings::from_tuning(tuning),
+            Settings::from_tuning(&tuning),
             collect::system_clock,
         );
         if let Some(path) = &config.geoip_path {
@@ -107,23 +206,30 @@ impl Node {
         let collect = Arc::new(collect);
         let stop = Arc::new(AtomicBool::new(false));
         let batcher = Arc::new(Mutex::new(None));
+        let live = Live {
+            base: Arc::new(config.tuning.clone()),
+            current: Arc::new(RwLock::new(Arc::new(tuning))),
+            collect: Arc::clone(&collect),
+            control: Arc::clone(control),
+            batcher: Arc::clone(&batcher),
+            status: Arc::clone(status),
+        };
         let mut threads = Vec::new();
 
         let refresher = {
-            let (collect, stop, status) =
-                (Arc::clone(&collect), Arc::clone(&stop), Arc::clone(status));
-            let every = tuning.refresh_every;
+            let (live, stop, status) = (live.clone(), Arc::clone(&stop), Arc::clone(status));
             thread::Builder::new()
                 .name("dionaea-refresh".to_owned())
                 .spawn(move || {
                     // The journal is made durable every second whatever the
                     // refresh interval is, so a crash loses at most a second of
                     // remembered ids; drop counts are written on their own timer.
-                    let tick = every.min(Duration::from_secs(1));
                     let mut last_refresh = Instant::now();
                     let mut last_flush = Instant::now();
                     while !stop.load(Ordering::Acquire) {
-                        nap(tick, &stop);
+                        let every = live.tuning().refresh_every;
+                        nap(every.min(Duration::from_secs(1)), &stop);
+                        let collect = &live.collect;
                         if let Err(error) = collect.sync_dedup() {
                             warn!(%error, "cannot write the event id journal");
                         }
@@ -142,6 +248,9 @@ impl Node {
                                 status.metadata_failing.store(false, Ordering::Relaxed);
                                 if reloaded {
                                     info!("keys and schemas reloaded");
+                                    for change in live.reload() {
+                                        info!(%change, "a setting changed");
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -155,20 +264,17 @@ impl Node {
         };
         threads.push(refresher);
 
-        let batcher_config = BatcherConfig {
-            max_records: tuning.batch_max_records,
-            max_bytes: tuning.batch_max_bytes,
-            min_interval: tuning.batch_min_interval,
-            shared_dedup: tuning.shared_dedup,
-            ..BatcherConfig::default()
-        };
         // The tables must exist before anything is inserted: a missing table
         // is an error the batcher would keep retrying, so it starts only once
         // ClickHouse is prepared. Until then requests are still accepted into
         // the spool.
         let bootstrap = {
-            let (stop, slot, status) =
-                (Arc::clone(&stop), Arc::clone(&batcher), Arc::clone(status));
+            let (stop, slot, status, live) = (
+                Arc::clone(&stop),
+                Arc::clone(&batcher),
+                Arc::clone(status),
+                live.clone(),
+            );
             thread::Builder::new()
                 .name("dionaea-bootstrap".to_owned())
                 .spawn(move || {
@@ -178,7 +284,8 @@ impl Node {
                             Ok(applied) => {
                                 info!(applied = applied.len(), "clickhouse is ready");
                                 let destination: Arc<dyn Destination> = Arc::new(store);
-                                match Batcher::start(spool, destination, batcher_config) {
+                                let config = batcher_config(&live.tuning());
+                                match Batcher::start(spool, destination, config) {
                                     Ok(started) => {
                                         *status
                                             .batcher
@@ -186,8 +293,11 @@ impl Node {
                                             .unwrap_or_else(PoisonError::into_inner) =
                                             Some(started.stats_handle());
                                         status.clickhouse_ready.store(true, Ordering::Relaxed);
-                                        *slot.lock().unwrap_or_else(PoisonError::into_inner) =
-                                            Some(started);
+                                        let mut slot =
+                                            slot.lock().unwrap_or_else(PoisonError::into_inner);
+                                        // A setting stored while it was starting.
+                                        started.reconfigure(batcher_config(&live.tuning()));
+                                        *slot = Some(started);
                                     }
                                     Err(error) => warn!(%error, "cannot start the batcher"),
                                 }
@@ -253,17 +363,17 @@ pub(crate) async fn run(
     info!(listen = %public_address, ops = %ops_address, "listening");
 
     let status = Arc::new(Status::new(config.spool_quota_bytes));
+    let control = Arc::new(NetControl::new(
+        config.tuning.max_connections,
+        config.tuning.header_timeout,
+    ));
     let (node, collect) = {
-        let (config, status) = (config.clone(), Arc::clone(&status));
-        tokio::task::spawn_blocking(move || Node::start(&config, &status))
+        let (config, status, control) = (config.clone(), Arc::clone(&status), Arc::clone(&control));
+        tokio::task::spawn_blocking(move || Node::start(&config, &status, &control))
             .await
             .map_err(|e| e.to_string())??
     };
 
-    let limits = NetLimits {
-        max_connections: config.tuning.max_connections,
-        header_timeout: config.tuning.header_timeout,
-    };
     let public_counters = Arc::new(NetCounters::default());
     let collect_for_stop = Arc::clone(&collect);
     let ops_state = Arc::new(Ops {
@@ -290,22 +400,19 @@ pub(crate) async fn run(
 
     // The operator listener is small and local: a few connections, short
     // header time.
-    let ops_limits = NetLimits {
-        max_connections: 64,
-        header_timeout: Duration::from_secs(10),
-    };
+    let ops_control = Arc::new(NetControl::new(64, Duration::from_secs(10)));
     tokio::join!(
         net::serve(
             public,
             router(Some(collect)),
-            limits,
+            control,
             Arc::clone(&public_counters),
             wait_public
         ),
         net::serve(
             operator,
             ops::routes(ops_state),
-            ops_limits,
+            ops_control,
             Arc::new(NetCounters::default()),
             wait_ops
         ),

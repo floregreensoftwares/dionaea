@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 
 use serde::Deserialize;
+
+use crate::settings::{self, Origin, Tuning};
 
 const ENV_PREFIX: &str = "DIONAEA_";
 
@@ -18,54 +20,6 @@ impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<hidden>")
     }
-}
-
-/// Every limit and interval of the running server. Each has a default and can
-/// be set in the file or by `DIONAEA_<NAME>`; a value outside its range is a
-/// startup error, not a silent clamp.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Tuning {
-    /// Requests per second and burst allowed per write key.
-    pub(crate) key_rate_per_sec: f64,
-    pub(crate) key_burst: f64,
-    /// The same per client address (an IPv6 client counts by its /64).
-    pub(crate) address_rate_per_sec: f64,
-    pub(crate) address_burst: f64,
-    /// How many keys and addresses each limiter remembers.
-    pub(crate) tracked_keys: usize,
-    /// How long a client has to deliver a whole request body.
-    pub(crate) body_timeout: Duration,
-    /// The `Retry-After` of a `503`, in seconds.
-    pub(crate) retry_after_secs: u64,
-    /// How far back and ahead an event time may be, after skew correction.
-    pub(crate) max_event_age: Duration,
-    pub(crate) max_event_future: Duration,
-    /// Open connections at once; further ones are closed at once.
-    pub(crate) max_connections: usize,
-    /// How long a connection has to deliver the headers of a request, which
-    /// also bounds how long an idle keep-alive connection is kept.
-    pub(crate) header_timeout: Duration,
-    /// How often keys and schemas are checked for changes.
-    pub(crate) refresh_every: Duration,
-    pub(crate) batch_max_records: usize,
-    pub(crate) batch_max_bytes: usize,
-    pub(crate) batch_min_interval: Duration,
-    /// How many reverse proxies sit in front of the server. With 0 the client
-    /// address is the socket peer and `client_address_header` is ignored.
-    pub(crate) trusted_proxy_hops: u8,
-    /// The header those proxies append the client address to.
-    pub(crate) client_address_header: String,
-    /// How many recent event ids are remembered to drop retried events, and
-    /// for how long. 0 turns the check off.
-    pub(crate) dedup_capacity: usize,
-    pub(crate) dedup_window: Duration,
-    /// Whether the batcher leaves out events another node already stored, and
-    /// records the ids of the ones it stores, in ClickHouse. A single node can
-    /// turn it off to save one query and one insert per batch.
-    pub(crate) shared_dedup: bool,
-    /// How often the drop counts of requests that kept no event are written
-    /// to the spool. A crash loses the counts of the last interval.
-    pub(crate) drop_flush: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +43,8 @@ pub(crate) struct Config {
     /// A MaxMind country database (`.mmdb`); without it events have no country.
     pub(crate) geoip_path: Option<PathBuf>,
     pub(crate) tuning: Tuning,
+    /// Where each setting in `tuning` came from.
+    pub(crate) tuning_origins: BTreeMap<&'static str, Origin>,
     pub(crate) log_level: String,
     pub(crate) log_format: LogFormat,
 }
@@ -117,8 +73,26 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The keys of the file that are not operational settings (those are in
+/// `settings::SPECS`).
+const FILE_KEYS: &[&str] = &[
+    "listen",
+    "ops_listen",
+    "clickhouse_url",
+    "clickhouse_user",
+    "clickhouse_password",
+    "clickhouse_database",
+    "clickhouse_ca_file",
+    "clickhouse_server_name",
+    "spool_dir",
+    "spool_quota_bytes",
+    "metadata_path",
+    "geoip_path",
+    "log_level",
+    "log_format",
+];
+
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FileConfig {
     listen: Option<String>,
     ops_listen: Option<String>,
@@ -134,27 +108,6 @@ struct FileConfig {
     geoip_path: Option<PathBuf>,
     log_level: Option<String>,
     log_format: Option<LogFormat>,
-    key_rate_per_sec: Option<f64>,
-    key_burst: Option<f64>,
-    address_rate_per_sec: Option<f64>,
-    address_burst: Option<f64>,
-    tracked_keys: Option<usize>,
-    body_timeout_secs: Option<u64>,
-    retry_after_secs: Option<u64>,
-    max_event_age_days: Option<u64>,
-    max_event_future_secs: Option<u64>,
-    max_connections: Option<usize>,
-    header_timeout_secs: Option<u64>,
-    refresh_secs: Option<u64>,
-    batch_max_records: Option<usize>,
-    batch_max_bytes: Option<usize>,
-    batch_min_interval_ms: Option<u64>,
-    trusted_proxy_hops: Option<u8>,
-    client_address_header: Option<String>,
-    dedup_capacity: Option<usize>,
-    dedup_window_secs: Option<u64>,
-    shared_dedup: Option<bool>,
-    drop_flush_secs: Option<u64>,
 }
 
 /// Reads one setting: the environment first, then the file, then the default;
@@ -205,26 +158,6 @@ impl<E: Fn(&str) -> Option<String>> Source<E> {
     }
 }
 
-fn seconds(value: u64) -> Duration {
-    Duration::from_secs(value)
-}
-
-fn rate(value: &f64) -> bool {
-    value.is_finite() && *value > 0.0 && *value <= 1e9
-}
-
-fn burst(value: &f64) -> bool {
-    value.is_finite() && (1.0..=1e9).contains(value)
-}
-
-fn header_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 impl Config {
     /// Defaults, then the file, then `DIONAEA_*` environment variables.
     /// `env` is injected so resolution stays free of ambient state.
@@ -232,10 +165,20 @@ impl Config {
         file: Option<&str>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
-        let file: FileConfig = match file {
+        let table: toml::Table = match file {
             Some(text) => toml::from_str(text).map_err(|e| ConfigError::File(e.to_string()))?,
-            None => FileConfig::default(),
+            None => toml::Table::new(),
         };
+        if let Some(unknown) = table
+            .keys()
+            .find(|key| !FILE_KEYS.contains(&key.as_str()) && settings::find(key).is_none())
+        {
+            return Err(ConfigError::File(format!("unknown key `{unknown}`")));
+        }
+        let file: FileConfig = table
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::File(e.to_string()))?;
         let source = Source { env };
 
         let address = |name: &str, key: &'static str, file: Option<String>, default: &str| {
@@ -290,179 +233,7 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("dionaea.db"));
         let geoip_path = source.path("GEOIP_PATH", file.geoip_path);
 
-        let tuning = Tuning {
-            key_rate_per_sec: source.pick(
-                "KEY_RATE_PER_SEC",
-                "key_rate_per_sec",
-                file.key_rate_per_sec,
-                200.0,
-                rate,
-                "a number above 0 and at most 1e9",
-            )?,
-            key_burst: source.pick(
-                "KEY_BURST",
-                "key_burst",
-                file.key_burst,
-                400.0,
-                burst,
-                "a number from 1 to 1e9",
-            )?,
-            address_rate_per_sec: source.pick(
-                "ADDRESS_RATE_PER_SEC",
-                "address_rate_per_sec",
-                file.address_rate_per_sec,
-                50.0,
-                rate,
-                "a number above 0 and at most 1e9",
-            )?,
-            address_burst: source.pick(
-                "ADDRESS_BURST",
-                "address_burst",
-                file.address_burst,
-                100.0,
-                burst,
-                "a number from 1 to 1e9",
-            )?,
-            tracked_keys: source.pick(
-                "TRACKED_KEYS",
-                "tracked_keys",
-                file.tracked_keys,
-                100_000,
-                |v| (1..=10_000_000).contains(v),
-                "from 1 to 10000000",
-            )?,
-            body_timeout: seconds(source.pick(
-                "BODY_TIMEOUT_SECS",
-                "body_timeout_secs",
-                file.body_timeout_secs,
-                10,
-                |v| (1..=300).contains(v),
-                "from 1 to 300 seconds",
-            )?),
-            retry_after_secs: source.pick(
-                "RETRY_AFTER_SECS",
-                "retry_after_secs",
-                file.retry_after_secs,
-                5,
-                |v| (1..=3600).contains(v),
-                "from 1 to 3600 seconds",
-            )?,
-            max_event_age: seconds(
-                86_400
-                    * source.pick(
-                        "MAX_EVENT_AGE_DAYS",
-                        "max_event_age_days",
-                        file.max_event_age_days,
-                        30,
-                        |v| (1..=3650).contains(v),
-                        "from 1 to 3650 days",
-                    )?,
-            ),
-            max_event_future: seconds(source.pick(
-                "MAX_EVENT_FUTURE_SECS",
-                "max_event_future_secs",
-                file.max_event_future_secs,
-                3600,
-                |v| *v <= 86_400,
-                "at most 86400 seconds",
-            )?),
-            max_connections: source.pick(
-                "MAX_CONNECTIONS",
-                "max_connections",
-                file.max_connections,
-                10_000,
-                |v| (1..=1_000_000).contains(v),
-                "from 1 to 1000000",
-            )?,
-            header_timeout: seconds(source.pick(
-                "HEADER_TIMEOUT_SECS",
-                "header_timeout_secs",
-                file.header_timeout_secs,
-                10,
-                |v| (1..=300).contains(v),
-                "from 1 to 300 seconds",
-            )?),
-            refresh_every: seconds(source.pick(
-                "REFRESH_SECS",
-                "refresh_secs",
-                file.refresh_secs,
-                2,
-                |v| (1..=3600).contains(v),
-                "from 1 to 3600 seconds",
-            )?),
-            batch_max_records: source.pick(
-                "BATCH_MAX_RECORDS",
-                "batch_max_records",
-                file.batch_max_records,
-                1000,
-                |v| (1..=1000).contains(v),
-                "from 1 to 1000",
-            )?,
-            batch_max_bytes: source.pick(
-                "BATCH_MAX_BYTES",
-                "batch_max_bytes",
-                file.batch_max_bytes,
-                8 << 20,
-                |v| ((64 << 10)..=(64 << 20)).contains(v),
-                "from 65536 to 67108864",
-            )?,
-            batch_min_interval: Duration::from_millis(source.pick(
-                "BATCH_MIN_INTERVAL_MS",
-                "batch_min_interval_ms",
-                file.batch_min_interval_ms,
-                200,
-                |v| *v <= 60_000,
-                "at most 60000 milliseconds",
-            )?),
-            trusted_proxy_hops: source.pick(
-                "TRUSTED_PROXY_HOPS",
-                "trusted_proxy_hops",
-                file.trusted_proxy_hops,
-                0,
-                |v| *v <= 8,
-                "from 0 to 8",
-            )?,
-            client_address_header: source.pick(
-                "CLIENT_ADDRESS_HEADER",
-                "client_address_header",
-                file.client_address_header,
-                "x-forwarded-for".to_owned(),
-                |v| header_name(v),
-                "a lowercase header name",
-            )?,
-            dedup_capacity: source.pick(
-                "DEDUP_CAPACITY",
-                "dedup_capacity",
-                file.dedup_capacity,
-                1_000_000,
-                |v| *v <= 100_000_000,
-                "at most 100000000 (0 turns it off)",
-            )?,
-            dedup_window: seconds(source.pick(
-                "DEDUP_WINDOW_SECS",
-                "dedup_window_secs",
-                file.dedup_window_secs,
-                600,
-                |v| (1..=86_400).contains(v),
-                "from 1 to 86400 seconds",
-            )?),
-            shared_dedup: source.pick(
-                "SHARED_DEDUP",
-                "shared_dedup",
-                file.shared_dedup,
-                true,
-                |_| true,
-                "true or false",
-            )?,
-            drop_flush: seconds(source.pick(
-                "DROP_FLUSH_SECS",
-                "drop_flush_secs",
-                file.drop_flush_secs,
-                5,
-                |v| (1..=300).contains(v),
-                "from 1 to 300 seconds",
-            )?),
-        };
+        let (tuning, tuning_origins) = settings::resolve(&table, &source.env)?;
 
         let log_level = source.text("LOG_LEVEL", file.log_level, "info");
         let log_format = match source.var("LOG_FORMAT") {
@@ -493,6 +264,7 @@ impl Config {
             metadata_path,
             geoip_path,
             tuning,
+            tuning_origins,
             log_level,
             log_format,
         })
@@ -541,6 +313,7 @@ pub(crate) fn clickhouse_endpoint(url: &str) -> Result<Endpoint, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn no_env(_: &str) -> Option<String> {
         None
