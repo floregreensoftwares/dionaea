@@ -256,15 +256,21 @@ pub trait MetaStore: Send + Sync {
         state: Option<ErasureState>,
     ) -> Result<Vec<ErasureRequest>, MetaError>;
 
-    /// Takes the oldest request in `state` that no worker holds, for
-    /// `lease_secs`; a worker that dies lets go of it by the lease running
-    /// out. `None` when there is nothing to take.
+    /// Takes the oldest request in `state` that no worker holds and that
+    /// reached that state at `due_before` (seconds since the epoch) or
+    /// earlier, for `lease_secs`; a worker that dies lets go of it by the
+    /// lease running out. `None` when there is nothing to take.
     fn claim_erasure(
         &self,
         state: ErasureState,
         worker: &str,
         lease_secs: i64,
+        due_before: i64,
     ) -> Result<Option<ErasureRequest>, MetaError>;
+
+    /// The devices found linked to the user of a request, in the clear, until
+    /// the request completes.
+    fn erasure_anons(&self, id: u64) -> Result<Vec<String>, MetaError>;
 
     /// Tombstones the anonymous ids found linked to the user of a request that
     /// is still `requested`. Returns how many were new; moves the generation

@@ -773,8 +773,13 @@ impl MetaStore for SqliteMeta {
         state: ErasureState,
         worker: &str,
         lease_secs: i64,
+        due_before: i64,
     ) -> Result<Option<ErasureRequest>, MetaError> {
-        self.write(|tx, at| erasure_sql::claim(tx, state, worker, lease_secs, at))
+        self.write(|tx, at| erasure_sql::claim(tx, state, worker, lease_secs, due_before, at))
+    }
+
+    fn erasure_anons(&self, id: u64) -> Result<Vec<String>, MetaError> {
+        self.read(|tx| erasure_sql::anons(tx, id))
     }
 
     fn add_erasure_anons(&self, id: u64, anon_ids: &[String]) -> Result<u64, MetaError> {

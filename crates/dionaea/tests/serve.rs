@@ -1925,3 +1925,132 @@ fn identify_links_an_anonymous_id_to_a_user_and_keeps_the_latest_traits() {
     let metrics = server.ops("/metrics").1;
     assert!(metric(&metrics, "dionaea_batcher_rows_total{table=\"identity\"}") >= 2);
 }
+
+/// Erasure against the whole product: a user is erased from ClickHouse, what
+/// belongs to anyone else stays, and the erased user and their device are
+/// refused from then on.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn an_erased_user_disappears_from_clickhouse_and_stays_out() {
+    let database = ScratchDatabase::new("erase");
+    let dir = dir("erase");
+    let cli = |args: &[&str]| {
+        let output = in_clickhouse(&dir, &database.name)
+            .args(args)
+            .output()
+            .expect("run the binary");
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    cli(&["site", "create", "shop"]);
+    let schema = dir.join("schema.toml");
+    std::fs::write(&schema, SCHEMA_WITH_TRAITS).expect("write the schema");
+    cli(&[
+        "schema",
+        "push",
+        "--site",
+        "1",
+        schema.to_str().expect("utf-8"),
+    ]);
+    let key = cli(&["key", "issue", "--site", "1"]);
+
+    let mut command = in_clickhouse(&dir, &database.name);
+    command
+        .env("DIONAEA_REFRESH_SECS", "1")
+        .env("DIONAEA_ERASE_GRACE_SECS", "0")
+        .env("DIONAEA_ERASE_FINISH_AFTER_SECS", "0");
+    let server = Server::start_with(command);
+
+    // Two people: u_gone on device a1, u_stays on device a2.
+    let event_of = |n: u32, anon: &str| {
+        batch(n, 1).replace("\"anon_id\":\"a1\"", &format!("\"anon_id\":\"{anon}\""))
+    };
+    for (n, anon) in [(1, "a1"), (2, "a1"), (3, "a2")] {
+        assert_eq!(
+            server.request(&collect_head(&key), &event_of(n, anon)).0,
+            202
+        );
+    }
+    for (anon, user) in [("a1", "u_gone"), ("a2", "u_stays")] {
+        let body = identify_body(anon, user, "{\"plan\":\"pro\"}");
+        assert_eq!(server.request(&identify_head(&key), &body).0, 202);
+    }
+    database.wait_for("the events", "SELECT count() FROM events", 3);
+    database.wait_for("the links", "SELECT count() FROM identity_alias", 2);
+    database.wait_for("the traits", "SELECT count() FROM user_traits", 2);
+
+    let asked = cli(&[
+        "erase", "request", "--site", "1", "--user", "u_gone", "--by", "test",
+    ]);
+    assert!(asked.contains("requested"), "{asked}");
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !cli(&["erase", "list", "--state", "complete"]).contains("complete") {
+        assert!(
+            Instant::now() < deadline,
+            "never completed: {}",
+            cli(&["erase", "show", "1"])
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let shown = cli(&["erase", "show", "1"]);
+    assert!(shown.contains("verified"), "{shown}");
+    assert!(!shown.contains("u_gone"), "the id is not printed");
+
+    assert_eq!(database.number("SELECT count() FROM events"), 1, "only a2");
+    assert_eq!(
+        database.text("SELECT anon_id FROM events"),
+        "a2",
+        "the other person's event"
+    );
+    assert_eq!(
+        database.text("SELECT user_id FROM identity_alias FINAL"),
+        "u_stays"
+    );
+    assert_eq!(
+        database.text("SELECT user_id FROM user_traits FINAL"),
+        "u_stays"
+    );
+    assert_eq!(
+        database.number(
+            "SELECT count() FROM events WHERE anon_id = 'a1' SETTINGS apply_deleted_mask = 0"
+        ),
+        0,
+        "gone from disk, not only hidden"
+    );
+
+    // From now on the user and the device are refused, the other stays welcome.
+    let (status, answer) = server.request(&collect_head(&key), &event_of(10, "a1"));
+    assert_eq!(status, 202);
+    assert!(
+        answer.contains("{\"accepted\":0,\"dropped\":1}"),
+        "{answer}"
+    );
+    let (_, answer) = server.request(
+        &identify_head(&key),
+        &identify_body("a_new_device", "u_gone", "{}"),
+    );
+    assert!(
+        answer.contains("{\"accepted\":0,\"stripped\":0}"),
+        "{answer}"
+    );
+    assert_eq!(
+        server.request(&collect_head(&key), &event_of(11, "a2")).0,
+        202
+    );
+    database.wait_for(
+        "the other person's new event",
+        "SELECT count() FROM events",
+        2,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        database.number("SELECT count() FROM events WHERE anon_id = 'a1'"),
+        0
+    );
+    let metrics = server.ops("/metrics").1;
+    assert_eq!(
+        metric(&metrics, "dionaea_identifies_total{result=\"erased\"}"),
+        1
+    );
+}

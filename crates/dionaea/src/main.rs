@@ -1,5 +1,6 @@
 mod collect;
 mod config;
+mod erasure;
 mod meta_cli;
 mod net;
 mod ops;

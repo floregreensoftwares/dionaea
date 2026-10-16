@@ -169,20 +169,23 @@ pub(crate) fn request(
     get(tx, id)
 }
 
-/// Takes the oldest request in `state` that nobody holds, for `lease_secs`.
+/// Takes the oldest request in `state` that nobody holds and that has been in
+/// that state since `due_before` or earlier, for `lease_secs`.
 pub(crate) fn claim(
     tx: &Transaction<'_>,
     state: ErasureState,
     worker: &str,
     lease_secs: i64,
+    due_before: i64,
     at: i64,
 ) -> Result<Option<ErasureRequest>, MetaError> {
     let id: Option<i64> = tx
         .query_row(
             "SELECT id FROM erasure_requests
              WHERE state = ?1 AND (lease_until IS NULL OR lease_until <= ?2)
+               AND COALESCE(hidden_at, requested_at) <= ?3
              ORDER BY id LIMIT 1",
-            params![state.as_str(), at],
+            params![state.as_str(), at, due_before],
             |row| row.get(0),
         )
         .optional()
@@ -219,6 +222,11 @@ pub(crate) fn add_anons(
             continue;
         }
         let hash = tombstone_hash(request.site_id, IdKind::Anon, anon);
+        tx.execute(
+            "INSERT OR IGNORE INTO erasure_anons (request_id, anon_id) VALUES (?1, ?2)",
+            params![i64::try_from(id).unwrap_or(i64::MAX), anon],
+        )
+        .map_err(storage)?;
         if tombstone(tx, request.site_id, IdKind::Anon, &hash, id, at)? {
             added += 1;
         }
@@ -235,6 +243,19 @@ pub(crate) fn add_anons(
         bump(tx)?;
     }
     Ok(added)
+}
+
+/// The devices found linked to the user of a request that is not yet
+/// complete.
+pub(crate) fn anons(tx: &Transaction<'_>, id: u64) -> Result<Vec<String>, MetaError> {
+    get(tx, id)?;
+    let mut statement = tx
+        .prepare("SELECT anon_id FROM erasure_anons WHERE request_id = ?1 ORDER BY anon_id")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([i64::try_from(id).unwrap_or(i64::MAX)], |row| row.get(0))
+        .map_err(storage)?;
+    rows.map(|row| row.map_err(storage)).collect()
 }
 
 /// Moves a request forward: `requested` to `hidden` to `complete`, or to
@@ -285,6 +306,13 @@ pub(crate) fn advance(
         ],
     )
     .map_err(storage)?;
+    if to == ErasureState::Complete {
+        tx.execute(
+            "DELETE FROM erasure_anons WHERE request_id = ?1",
+            [i64::try_from(id).unwrap_or(i64::MAX)],
+        )
+        .map_err(storage)?;
+    }
     get(tx, id)
 }
 

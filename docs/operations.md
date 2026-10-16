@@ -65,6 +65,8 @@ the status listed in `wire-format.md`.
 | `dedup_capacity`, `dedup_window_secs` | 1000000, 600 (about 80 MB at the default capacity) | 0 to 100000000 (0 is off), 1 to 86400 | Event ids remembered to drop an event sent again |
 | `shared_dedup` | true | true or false | Ask ClickHouse which events another node stored, and record this node's ids |
 | `drop_flush_secs` | 5 | 1 to 300 | How often the drop counts of requests that kept no event are written |
+| `erase_grace_secs` | 10 | 0 to 3600 | How long erasure waits for every server to know a user was erased before deleting (never less than twice `refresh_secs`) |
+| `erase_finish_after_secs` | 86400 | 0 to 604800 | How long an erased user stays hidden before the rows are physically removed, so a day of requests share one rewrite |
 
 ## Changing limits while the server runs
 
@@ -195,4 +197,29 @@ SELECT count() FROM events WHERE (site_id, anon_id) IN
 
 Metrics: `dionaea_identifies_total{result="linked"|"bot"}`, `dionaea_identify_traits_stripped_total`, and `dionaea_batcher_rows_total{table="identity"}`.
 
-Not done yet: retention for both tables and erasure by user (an erased user's links and traits are not removed by any job yet).
+Retention for both tables is not done yet; erasure covers them (see below).
+
+## Erasing a user
+
+```
+dionaea erase request --site 1 --user u_42 --by ops
+dionaea erase list [--state requested|hidden|complete|failed]
+dionaea erase show 3
+dionaea erase retry 3
+```
+
+A request is recorded in the metadata store and from that moment every server drops what belongs to the user: an identify for the user is acknowledged and ignored, and so is anything from a device that was ever linked to them. The server's erasure job then:
+
+1. finds every anonymous id linked to the user in `identity_alias` and keeps a permanent hash of each (and of the user id) so the device stays blocked when it keeps sending;
+2. waits for every server to have loaded the hashes, then deletes the user's rows and the rows of those devices from `events`, `identity_alias` and `user_traits` with a lightweight delete. Queries stop returning them at once; the request is `hidden`;
+3. after `erase_finish_after_secs`, deletes once more (a slow server may have inserted some), rewrites the tables without the deleted rows (`APPLY DELETED MASK`, one rewrite for all the requests due together) and counts directly, marked rows included, that none is left. Then the request is `complete`; if any remains it is `failed` with the counts.
+
+Rows that were already in a server's spool are left out when they are inserted, so a replay cannot bring the user back. A failure that retrying could fix (ClickHouse unreachable) is retried by itself; a request ClickHouse rejects fails with the reason and can be put back with `erase retry`. The job needs the ClickHouse user `serve` runs migrations with (it uses `ALTER` and `DELETE`).
+
+Guarantee, with the defaults: invisible to queries within a few seconds of the request reaching a server that has reloaded the metadata, and gone from disk within a day and the time one rewrite takes. If a device is shared, erasing one user removes the rows of every device that was ever linked to them, including another user's on the same device.
+
+What the metadata store keeps: the user id and the devices in the clear until the request is complete, then only SHA-256 hashes (not salted: someone holding the metadata file can test whether a guessable id was erased) and an audit line (who asked, when, counts). `event_ids` holds only random event ids and expires after a day; the rollups hold no identifier.
+
+Metrics: `dionaea_identifies_total{result="erased"}`, `dionaea_batcher_erased_rows_total`, and drops with reason `erased` in `dionaea_events_dropped_total`.
+
+Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `sessions`, `errors` and `measurements`, which do not exist yet and will join the list of identifier tables a test enforces.
