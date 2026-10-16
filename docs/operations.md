@@ -178,3 +178,21 @@ These run in CI (`cargo test -p dionaea --test serve -- --ignored`, with ClickHo
 - **Kills.** The server is killed six times at different moments while a client sends without pause. Every event acknowledged before a kill is in the tables at the end; events sent but not acknowledged may or may not be.
 
 Not covered: a disk that fails or fills under the spool, a ClickHouse that answers slowly rather than not at all, and load heavier than one machine's loopback can produce.
+
+## Identity
+
+`POST /v1/identify` (see `docs/wire-format.md`) writes two ClickHouse tables, created by the start-up migrations like the others:
+
+- `identity_alias`: one row per anonymous id and user pair, with the time of the latest link. The ingest user can insert into it and cannot read it.
+- `user_traits`: the user's traits as of the latest identify that carried a declared trait, as two maps (text and numeric).
+
+Both are `ReplacingMergeTree` tables, so a repeated identify is harmless; read them with `FINAL` (or `argMax` over the link time) until background merges have run. To list the events of a user through the link:
+
+```sql
+SELECT count() FROM events WHERE (site_id, anon_id) IN
+  (SELECT site_id, anon_id FROM identity_alias FINAL WHERE user_id = 'u_42')
+```
+
+Metrics: `dionaea_identifies_total{result="linked"|"bot"}`, `dionaea_identify_traits_stripped_total`, and `dionaea_batcher_rows_total{table="identity"}`.
+
+Not done yet: retention for both tables and erasure by user (an erased user's links and traits are not removed by any job yet).

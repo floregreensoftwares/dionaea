@@ -1,4 +1,4 @@
-//! `POST /v1/collect`: the HTTP face of the ingest path. It admits the write
+//! `POST /v1/collect` and `POST /v1/identify`: the HTTP face of the ingest path. It admits the write
 //! key and origin, applies the rate limits, reads the body within its size and
 //! time limits, hands it to the pipeline and answers only after the spool has
 //! made the events durable. The rules live in `dionaea-ingest`; this module
@@ -26,7 +26,8 @@ use axum::routing::any;
 use dionaea_core::MAX_BODY_LEN;
 use dionaea_ingest::{
     Admission, Cache, Context, CountryLookup, Deduper, DropAggregator, Enrichment, Limits,
-    Processed, RateLimiter, Refusal, RetryAfter, enqueue, enqueue_drop_rows, process_with,
+    Processed, RateLimiter, Refusal, RetryAfter, enqueue, enqueue_drop_rows, enqueue_identified,
+    process_identify, process_with,
 };
 use dionaea_meta::is_write_key_shape;
 use dionaea_spool::{Spool, SpoolError};
@@ -123,6 +124,12 @@ pub(crate) struct Counters {
     pub(crate) too_large: AtomicU64,
     pub(crate) rate_limited: AtomicU64,
     pub(crate) unavailable: AtomicU64,
+    /// Identify requests that linked an anonymous id, and those ignored
+    /// because the sender is an automated client.
+    pub(crate) identified: AtomicU64,
+    pub(crate) identify_bots: AtomicU64,
+    /// Traits removed by the guard from identify requests.
+    pub(crate) traits_stripped: AtomicU64,
     /// Events dropped, by reason. The reasons are a fixed small set, so this
     /// never grows with what senders send.
     drops: Mutex<BTreeMap<&'static str, u64>>,
@@ -279,8 +286,33 @@ impl Collect {
 
 pub(crate) fn routes(collect: Arc<Collect>) -> Router {
     Router::new()
-        .route("/v1/collect", any(handle))
+        .route("/v1/collect", any(handle_collect))
+        .route("/v1/identify", any(handle_identify))
         .with_state(collect)
+}
+
+/// Which endpoint a request is for. Admission, limits and the body are the
+/// same; only what is made of the body differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Collect,
+    Identify,
+}
+
+async fn handle_collect(
+    state: State<Arc<Collect>>,
+    peer: ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    handle(Kind::Collect, state, peer, request).await
+}
+
+async fn handle_identify(
+    state: State<Arc<Collect>>,
+    peer: ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> Response<Body> {
+    handle(Kind::Identify, state, peer, request).await
 }
 
 /// Milliseconds since the Unix epoch.
@@ -416,6 +448,7 @@ async fn read_body(body: Body, timeout: Duration) -> BodyRead {
 }
 
 async fn handle(
+    kind: Kind,
     State(collect): State<Arc<Collect>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
@@ -548,9 +581,11 @@ async fn handle(
     // Decoding, the guard and the durable write block the thread (CPU and an
     // fsync wait), so they run off the async workers.
     let work = Arc::clone(&collect);
-    let outcome =
-        tokio::task::spawn_blocking(move || store(&work, &admission, &bytes, now, &enrichment))
-            .await;
+    let outcome = tokio::task::spawn_blocking(move || match kind {
+        Kind::Collect => store(&work, &admission, &bytes, now, &enrichment),
+        Kind::Identify => store_identify(&work, &admission, &bytes, now, &enrichment),
+    })
+    .await;
     let response = match outcome {
         Ok(Outcome::Stored { accepted, dropped }) => {
             counters.accepted.fetch_add(1, Ordering::Relaxed);
@@ -563,6 +598,25 @@ async fn handle(
             json(
                 StatusCode::ACCEPTED,
                 &format!("{{\"accepted\":{accepted},\"dropped\":{dropped}}}"),
+            )
+        }
+        Ok(Outcome::Linked { linked, stripped }) => {
+            counters.accepted.fetch_add(1, Ordering::Relaxed);
+            let seen = if linked {
+                &counters.identified
+            } else {
+                &counters.identify_bots
+            };
+            seen.fetch_add(1, Ordering::Relaxed);
+            counters
+                .traits_stripped
+                .fetch_add(stripped, Ordering::Relaxed);
+            json(
+                StatusCode::ACCEPTED,
+                &format!(
+                    "{{\"accepted\":{},\"stripped\":{stripped}}}",
+                    u8::from(linked)
+                ),
             )
         }
         Ok(Outcome::Refused(reason)) => {
@@ -581,9 +635,60 @@ async fn handle(
 }
 
 enum Outcome {
-    Stored { accepted: usize, dropped: u64 },
+    Stored {
+        accepted: usize,
+        dropped: u64,
+    },
+    /// An identify request: whether the link was stored (not for a bot) and
+    /// how many traits the guard removed.
+    Linked {
+        linked: bool,
+        stripped: u64,
+    },
     Refused(&'static str),
     Unavailable,
+}
+
+/// What a spool that would not take a record means for the sender.
+fn spool_failure(error: &SpoolError) -> Outcome {
+    match error {
+        SpoolError::Full
+        | SpoolError::Busy
+        | SpoolError::Closed
+        | SpoolError::Io(_)
+        | SpoolError::Locked
+        | SpoolError::BadCommit => Outcome::Unavailable,
+        // The request cannot be a valid one: too large for a record, or empty.
+        SpoolError::TooLarge | SpoolError::Empty => Outcome::Refused("body_too_large"),
+    }
+}
+
+fn store_identify(
+    collect: &Collect,
+    admission: &Admission,
+    body: &[u8],
+    now: u64,
+    enrichment: &Enrichment,
+) -> Outcome {
+    let identified = match process_identify(admission, body, enrichment) {
+        Ok(identified) => identified,
+        Err(error) => return Outcome::Refused(error.as_str()),
+    };
+    if identified.bot {
+        // Nothing to store: only the count, merged with the other drop counts.
+        collect.drops.add(admission.site_id, &identified.drops, now);
+        return Outcome::Linked {
+            linked: false,
+            stripped: 0,
+        };
+    }
+    match enqueue_identified(&collect.spool, &identified, now) {
+        Ok(()) => Outcome::Linked {
+            linked: true,
+            stripped: identified.stripped,
+        },
+        Err(error) => spool_failure(&error),
+    }
 }
 
 fn store(
@@ -631,12 +736,7 @@ fn store(
                 dropped: dropped + stored.invalid as u64,
             }
         }
-        Err(SpoolError::Full | SpoolError::Busy | SpoolError::Closed | SpoolError::Io(_)) => {
-            Outcome::Unavailable
-        }
-        // The request cannot be a valid one: too large for a record, or empty.
-        Err(SpoolError::TooLarge | SpoolError::Empty) => Outcome::Refused("body_too_large"),
-        Err(SpoolError::Locked | SpoolError::BadCommit) => Outcome::Unavailable,
+        Err(error) => spool_failure(&error),
     }
 }
 
@@ -652,8 +752,7 @@ mod tests {
 
     use super::*;
 
-    const SCHEMA: &str =
-        "[events.checkout.fields.items]\nkind = \"count\"\nmax = 100\nrequired = true\n";
+    const SCHEMA: &str = "[events.checkout.fields.items]\nkind = \"count\"\nmax = 100\nrequired = true\n\n[traits.plan]\nkind = \"id\"\n\n[traits.seats]\nkind = \"count\"\nmax = 1000\n";
     const NOW: u64 = 1_760_000_000_000;
     const PEER: ([u8; 4], u16) = ([203, 0, 113, 9], 5555);
     const OTHER_KEY: &str = "wk_aaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -743,7 +842,9 @@ mod tests {
     }
 
     fn spooled(world: &World) -> usize {
-        world.collect.spool.read(1000, usize::MAX).unwrap().len()
+        let records = world.collect.spool.read(1000, usize::MAX).unwrap();
+        world.collect.spool.rewind();
+        records.len()
     }
 
     #[tokio::test]
@@ -1145,5 +1246,196 @@ mod tests {
             !text.contains(&w.key) && !text.contains("203.0.113"),
             "{text}"
         );
+    }
+
+    fn identify_body(traits: Option<Value>) -> Vec<u8> {
+        let mut request = json!({
+            "sent_at": NOW, "sdk": "t/1", "anon_id": "anon1", "user_id": "u_42"
+        });
+        if let Some(traits) = traits {
+            request["traits"] = traits;
+        }
+        serde_json::to_vec(&request).unwrap()
+    }
+
+    fn identify_post(key: Option<&str>, body: Vec<u8>) -> Request<Body> {
+        let mut builder = Request::post("/v1/identify")
+            .header(CONTENT_TYPE, "application/json")
+            .extension(peer());
+        if let Some(key) = key {
+            builder = builder.header(KEY_HEADER, key);
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    /// Everything in the spool as text. Reading moves the spool's cursor, so
+    /// it is put back.
+    fn spool_text(world: &World) -> String {
+        let records = world.collect.spool.read(1000, usize::MAX).unwrap();
+        world.collect.spool.rewind();
+        records
+            .iter()
+            .map(|record| String::from_utf8_lossy(&record.payload).into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_identify_request_is_acknowledged_after_its_link_and_traits_are_in_the_spool() {
+        let w = world(&[], Settings::default(), None);
+        let traits = json!({"plan": "pro", "seats": 5, "email": "a@b.c"});
+        let (status, _, answer) =
+            send(&w, identify_post(Some(&w.key), identify_body(Some(traits)))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(answer, json!({"accepted": 1, "stripped": 1}));
+        assert_eq!(spooled(&w), 1);
+        let text = spool_text(&w);
+        for expected in [
+            "\"anon_id\":\"anon1\"",
+            "\"user_id\":\"u_42\"",
+            "\"plan\":\"pro\"",
+            "\"seats\":5",
+        ] {
+            assert!(text.contains(expected), "{expected} in {text}");
+        }
+        assert!(
+            !text.contains("a@b.c"),
+            "an undeclared trait never reaches the spool"
+        );
+        let c = &w.collect.counters;
+        assert_eq!(c.accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(c.identified.load(Ordering::Relaxed), 1);
+        assert_eq!(c.traits_stripped.load(Ordering::Relaxed), 1);
+        assert_eq!(c.events_accepted.load(Ordering::Relaxed), 0, "not an event");
+    }
+
+    #[tokio::test]
+    async fn an_identify_request_without_traits_still_links() {
+        let w = world(&[], Settings::default(), None);
+        let (status, _, answer) = send(&w, identify_post(Some(&w.key), identify_body(None))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(answer, json!({"accepted": 1, "stripped": 0}));
+        let text = spool_text(&w);
+        assert!(text.contains("\"user_id\":\"u_42\"") && !text.contains("traits_str"));
+    }
+
+    #[tokio::test]
+    async fn identify_needs_the_same_key_origin_and_method_as_collect() {
+        let w = world(&["https://shop.example"], Settings::default(), None);
+        let (status, ..) = send(&w, identify_post(None, identify_body(None))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, ..) = send(&w, identify_post(Some(OTHER_KEY), identify_body(None))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, ..) = send(&w, identify_post(Some(&w.key), identify_body(None))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "no allowed origin");
+        assert_eq!(spooled(&w), 0);
+
+        let mut request = identify_post(Some(&w.key), identify_body(None));
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://shop.example"));
+        let (status, headers, _) = send(&w, request).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://shop.example"
+        );
+
+        let preflight = Request::options("/v1/identify")
+            .header(KEY_HEADER, &w.key)
+            .header(ORIGIN, "https://shop.example")
+            .extension(peer())
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send(&w, preflight).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(headers.get(ACCESS_CONTROL_ALLOW_METHODS).is_some());
+
+        let get = Request::get("/v1/identify")
+            .extension(peer())
+            .body(Body::empty())
+            .unwrap();
+        let (status, ..) = send(&w, get).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_identify_request_is_refused_and_nothing_is_stored() {
+        let w = world(&[], Settings::default(), None);
+        let email = serde_json::to_vec(&json!({
+            "sent_at": NOW, "sdk": "t/1", "anon_id": "a", "user_id": "a@b.c"
+        }))
+        .unwrap();
+        let (status, _, answer) = send(&w, identify_post(Some(&w.key), email)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(answer, json!({"error": "invalid_field"}));
+        let (status, ..) = send(&w, identify_post(Some(&w.key), b"nope".to_vec())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A batch of events is not an identify request.
+        let (status, ..) = send(&w, identify_post(Some(&w.key), body(&[]))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(spooled(&w), 0);
+        assert_eq!(w.collect.counters.identified.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn identify_shares_the_rate_limit_of_its_key() {
+        let settings = Settings {
+            key_burst: 2.0,
+            key_rate_per_sec: 0.001,
+            ..Settings::default()
+        };
+        let w = world(&[], settings, None);
+        let (first, ..) = send(&w, identify_post(Some(&w.key), identify_body(None))).await;
+        let (second, ..) = send(&w, post(Some(&w.key), body(&[]))).await;
+        let (third, headers, _) = send(&w, identify_post(Some(&w.key), identify_body(None))).await;
+        assert_eq!(
+            (first, second, third),
+            (
+                StatusCode::ACCEPTED,
+                StatusCode::ACCEPTED,
+                StatusCode::TOO_MANY_REQUESTS
+            )
+        );
+        assert!(headers.get(RETRY_AFTER).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_bot_identify_is_acknowledged_counted_and_not_stored() {
+        let w = world(&[], Settings::default(), None);
+        let mut request = identify_post(Some(&w.key), identify_body(Some(json!({"plan": "pro"}))));
+        request
+            .headers_mut()
+            .insert(USER_AGENT, HeaderValue::from_static("Googlebot/2.1"));
+        let (status, _, answer) = send(&w, request).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(answer, json!({"accepted": 0, "stripped": 0}));
+        assert_eq!(spooled(&w), 0);
+        assert_eq!(w.collect.counters.identify_bots.load(Ordering::Relaxed), 1);
+        assert_eq!(w.collect.counters.identified.load(Ordering::Relaxed), 0);
+        w.collect.flush_drops();
+        let text = spool_text(&w);
+        assert!(
+            text.contains("(identify)") && text.contains("\"reason\":\"bot\""),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_spool_answers_503_to_identify_too() {
+        let w = world(&[], Settings::default(), Some(4_000));
+        let mut refused = None;
+        for _ in 0..200 {
+            let (status, headers, answer) =
+                send(&w, identify_post(Some(&w.key), identify_body(None))).await;
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                refused = Some((headers, answer));
+                break;
+            }
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+        let (headers, answer) = refused.expect("the quota is reached");
+        assert_eq!(headers[RETRY_AFTER], "5");
+        assert_eq!(answer["error"], "unavailable");
+        assert!(w.collect.counters.unavailable.load(Ordering::Relaxed) >= 1);
     }
 }

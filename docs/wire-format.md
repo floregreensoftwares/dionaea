@@ -162,6 +162,32 @@ refuses the request. `traits` is an optional object checked against the
 schema's declared traits (undeclared ones are stripped). There is no endpoint
 for `reset`: signing out is a new `anon_id` on the client.
 
+The key, the origin rules, the rate limits, the body limits and the status
+codes are those of `/v1/collect`. A request that is accepted is answered `202`
+once it is durable:
+
+```json
+{ "accepted": 1, "stripped": 1 }
+```
+
+`accepted` is 1 when the link was recorded and 0 when the sender is an
+automated client (counted, not stored). `stripped` is how many traits the
+schema did not declare or whose value broke its rules. A request with more
+than 32 traits is refused with `400`.
+
+What is stored:
+
+- **The link.** One row says `anon_id` belongs to `user_id` as of the arrival
+  time. A device that identified as two users keeps both links; queries use
+  the latest one. Sending the same identify again changes nothing but the
+  time of the link.
+- **The traits.** When at least one trait survives the schema, the user's
+  traits become exactly that set (an earlier trait that is not sent again is
+  gone). A request with no trait, or none the schema declares, leaves the
+  earlier traits alone.
+- Time is the server's arrival time, not `sent_at`, so a delayed retry of an
+  old identify replaces a newer one.
+
 ## What is not here yet
 
 - Request headers, authentication with the write key, and the HTTP status

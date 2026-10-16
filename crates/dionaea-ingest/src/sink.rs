@@ -21,6 +21,7 @@
 use dionaea_spool::{Spool, SpoolError};
 use dionaea_store::{AliasRow, DropRow, EventRow, Store, TraitsRow};
 
+use crate::identify::Identified;
 use crate::pipeline::{Accepted, Processed};
 
 const VERSION: u8 = 2;
@@ -218,6 +219,41 @@ pub(crate) fn decode(payload: &[u8]) -> Option<Lines<'_>> {
         traits,
         drops,
     })
+}
+
+/// Writes the result of an identify request to the spool, durably: the link,
+/// the traits that survived the guard (none leaves the user's earlier ones
+/// alone) and what was dropped. `received_ms` is the time of the link.
+pub fn enqueue_identified(
+    spool: &Spool,
+    identified: &Identified,
+    received_ms: u64,
+) -> Result<(), SpoolError> {
+    let alias = AliasRow {
+        site_id: identified.site_id,
+        anon_id: identified.anon_id.clone(),
+        user_id: identified.user_id.clone(),
+        linked_ms: received_ms,
+    };
+    let traits = identified.traits.as_ref().map(|traits| TraitsRow {
+        site_id: identified.site_id,
+        user_id: identified.user_id.clone(),
+        traits_str: traits.strings.clone(),
+        traits_num: traits.numbers.clone(),
+        updated_ms: received_ms,
+    });
+    let drops: Vec<DropRow> = identified
+        .drops
+        .iter()
+        .map(|d| DropRow {
+            site_id: identified.site_id,
+            event_name: d.event_name.clone(),
+            reason: d.reason.as_str().to_owned(),
+            at_ms: received_ms,
+            count: d.count,
+        })
+        .collect();
+    enqueue_identity(spool, &alias, traits.as_ref(), &drops)
 }
 
 /// Writes one identify request to the spool as a single record: the link

@@ -103,7 +103,7 @@ fn render(ops: &Ops) -> String {
         &mut out,
         "dionaea_requests_total",
         "counter",
-        "Collect requests by outcome.",
+        "Collect and identify requests by outcome.",
     );
     for (outcome, value) in [
         ("accepted", &counters.accepted),
@@ -120,6 +120,34 @@ fn render(ops: &Ops) -> String {
             read(value)
         );
     }
+
+    metric(
+        &mut out,
+        "dionaea_identifies_total",
+        "counter",
+        "Identify requests: linked, or ignored because the sender is an automated client.",
+    );
+    let _ = writeln!(
+        out,
+        "dionaea_identifies_total{{result=\"linked\"}} {}",
+        read(&counters.identified)
+    );
+    let _ = writeln!(
+        out,
+        "dionaea_identifies_total{{result=\"bot\"}} {}",
+        read(&counters.identify_bots)
+    );
+    metric(
+        &mut out,
+        "dionaea_identify_traits_stripped_total",
+        "counter",
+        "Traits removed from identify requests: undeclared or with an invalid value.",
+    );
+    let _ = writeln!(
+        out,
+        "dionaea_identify_traits_stripped_total {}",
+        read(&counters.traits_stripped)
+    );
 
     metric(
         &mut out,
@@ -302,6 +330,11 @@ fn render(ops: &Ops) -> String {
             out,
             "dionaea_batcher_rows_total{{table=\"drops_daily\"}} {}",
             stats.drop_rows()
+        );
+        let _ = writeln!(
+            out,
+            "dionaea_batcher_rows_total{{table=\"identity\"}} {}",
+            stats.identity_rows()
         );
     }
 
