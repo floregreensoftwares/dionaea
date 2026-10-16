@@ -13,8 +13,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::migrations::MIGRATIONS;
 use crate::{
-    KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MetaError, MetaStore, Organization, Published,
-    SchemaVersionInfo, Site, SiteSchemas, Snapshot, WriteKeyInfo,
+    KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError,
+    MetaStore, Organization, Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot,
+    StoredSetting, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -173,6 +174,25 @@ fn bump(tx: &Transaction<'_>) -> Result<(), MetaError> {
     tx.execute("UPDATE state SET generation = generation + 1", [])
         .map_err(storage)?;
     Ok(())
+}
+
+fn settings_of(tx: &Transaction<'_>) -> Result<BTreeMap<String, StoredSetting>, MetaError> {
+    let mut statement = tx
+        .prepare("SELECT key, value, previous, effective_at_ms FROM settings ORDER BY key")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredSetting {
+                    value: row.get(1)?,
+                    previous: row.get(2)?,
+                    effective_at_ms: row.get(3)?,
+                },
+            ))
+        })
+        .map_err(storage)?;
+    rows.map(|row| row.map_err(storage)).collect()
 }
 
 fn generation_of(tx: &Transaction<'_>) -> Result<u64, MetaError> {
@@ -641,6 +661,92 @@ impl MetaStore for SqliteMeta {
         })
     }
 
+    fn settings(&self) -> Result<BTreeMap<String, StoredSetting>, MetaError> {
+        self.read(settings_of)
+    }
+
+    fn set_setting(
+        &self,
+        name: &str,
+        value: Option<&str>,
+        effective_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), MetaError> {
+        if name.is_empty()
+            || name.len() > MAX_SETTING_NAME_LEN
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(MetaError::Invalid(
+                "a setting name is lowercase letters, digits and underscores".to_owned(),
+            ));
+        }
+        if value.is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_SETTING_VALUE_LEN
+                || value.chars().any(char::is_control)
+        }) {
+            return Err(MetaError::Invalid(format!(
+                "a setting value is 1 to {MAX_SETTING_VALUE_LEN} printable characters"
+            )));
+        }
+        self.write(|tx, at| {
+            let current: Option<StoredSetting> = tx
+                .query_row(
+                    "SELECT value, previous, effective_at_ms FROM settings WHERE key = ?1",
+                    [name],
+                    |row| {
+                        Ok(StoredSetting {
+                            value: row.get(0)?,
+                            previous: row.get(1)?,
+                            effective_at_ms: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(storage)?;
+            // What readers see now, so that it stays until the new time.
+            let in_force = current
+                .as_ref()
+                .and_then(|stored| stored.at(now_ms))
+                .map(str::to_owned);
+            let next = StoredSetting {
+                value: value.map(str::to_owned),
+                previous: in_force,
+                effective_at_ms,
+            };
+            // The same value, already in force and asked for now, is no change.
+            let unchanged = match &current {
+                Some(stored) => {
+                    *stored == next
+                        || (stored.value == next.value
+                            && stored.effective_at_ms <= now_ms
+                            && next.effective_at_ms <= now_ms)
+                }
+                None => next.value.is_none(),
+            };
+            if !unchanged {
+                tx.execute(
+                    "INSERT INTO settings (key, value, previous, effective_at_ms, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(key) DO UPDATE SET value = ?2, previous = ?3,
+                         effective_at_ms = ?4, updated_at = ?5",
+                    params![name, next.value, next.previous, next.effective_at_ms, at],
+                )
+                .map_err(storage)?;
+                bump(tx)?;
+            }
+            // A removal that has taken effect leaves nothing to remember.
+            tx.execute(
+                "DELETE FROM settings WHERE value IS NULL AND effective_at_ms <= ?1",
+                [now_ms],
+            )
+            .map_err(storage)?;
+            Ok(())
+        })
+    }
+
     fn snapshot(&self) -> Result<Snapshot, MetaError> {
         self.read(|tx| {
             let generation = generation_of(tx)?;
@@ -723,6 +829,7 @@ impl MetaStore for SqliteMeta {
                 generation,
                 keys,
                 schemas,
+                settings: settings_of(tx)?,
             })
         })
     }

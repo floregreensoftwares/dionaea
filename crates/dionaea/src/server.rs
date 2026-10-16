@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,9 @@ use tracing::{info, warn};
 
 use crate::collect::{self, Collect, Settings};
 use crate::config::{Config, clickhouse_endpoint};
-use crate::net::{self, NetCounters, NetLimits};
+use crate::net::{self, NetControl, NetCounters};
 use crate::ops::{self, Ops, Status};
+use crate::settings::{self, Origin, Tuning};
 
 /// The longest wait between attempts to prepare ClickHouse.
 const MIGRATE_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -55,16 +57,149 @@ struct Node {
     batcher: Arc<Mutex<Option<Batcher>>>,
 }
 
+/// The settings in force and how to put new ones into force: the pieces the
+/// refresher changes in place when an operator stores a setting.
+#[derive(Clone)]
+struct Live {
+    /// Defaults, file and environment: what stored settings are applied on.
+    base: Arc<Tuning>,
+    /// Where each of those values came from, to say what a stored one overrides.
+    origins: Arc<BTreeMap<&'static str, Origin>>,
+    current: Arc<RwLock<Arc<Tuning>>>,
+    collect: Arc<Collect>,
+    control: Arc<NetControl>,
+    batcher: Arc<Mutex<Option<Batcher>>>,
+    status: Arc<Status>,
+    /// What was last reported in the log, so a standing condition is said once.
+    reported: Arc<Mutex<Vec<String>>>,
+}
+
+fn batcher_config(tuning: &Tuning) -> BatcherConfig {
+    BatcherConfig {
+        max_records: tuning.batch_max_records,
+        max_bytes: tuning.batch_max_bytes,
+        min_interval: tuning.batch_min_interval,
+        shared_dedup: tuning.shared_dedup,
+        ..BatcherConfig::default()
+    }
+}
+
+impl Live {
+    fn tuning(&self) -> Arc<Tuning> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Works out the settings in force at `now_ms` from what the cache holds
+    /// and puts them into force if they differ from the ones in force. Returns
+    /// what changed, as `name: before -> after`, and when the next stored
+    /// change is due.
+    ///
+    /// The result depends only on the stored values and the time, so servers
+    /// that read the same store switch at the same moment.
+    fn sync(&self, now_ms: i64) -> (Vec<String>, Option<i64>) {
+        let stored = self.collect.cache.settings();
+        let due = settings::next_change(&stored, now_ms);
+        let resolved = settings::resolve_at(&stored, now_ms);
+        let (next, skipped) = self.base.with_stored(&resolved);
+
+        self.status
+            .settings_skipped
+            .store(skipped.len() as u64, Ordering::Relaxed);
+        self.status
+            .settings_stored
+            .store(resolved.len() as u64, Ordering::Relaxed);
+        self.report(&resolved, &skipped);
+
+        let before = self.tuning();
+        if *before == next {
+            return (Vec::new(), due);
+        }
+        let changed: Vec<String> = settings::SPECS
+            .iter()
+            .filter(|spec| before.show(spec) != next.show(spec))
+            .map(|spec| {
+                format!(
+                    "{}: {} -> {}",
+                    spec.name,
+                    before.show(spec),
+                    next.show(spec)
+                )
+            })
+            .collect();
+        self.put(next);
+        (changed, due)
+    }
+
+    /// Says in the log which stored values are ignored and which override the
+    /// file or the environment, once for as long as that stays true.
+    fn report(&self, resolved: &BTreeMap<String, String>, skipped: &[(String, String)]) {
+        let mut lines: Vec<String> = skipped
+            .iter()
+            .map(|(name, reason)| format!("ignored {name}: {reason}"))
+            .collect();
+        lines.extend(
+            settings::overridden(&self.base, &self.origins, resolved)
+                .into_iter()
+                .map(|(name, from, was)| {
+                    format!("{name}: a stored value overrides {} ({was})", from.as_str())
+                }),
+        );
+        let mut reported = self.reported.lock().unwrap_or_else(PoisonError::into_inner);
+        if *reported != lines {
+            for line in lines.iter().filter(|line| !reported.contains(line)) {
+                warn!("{line}");
+            }
+            *reported = lines;
+        }
+    }
+
+    /// Puts `tuning` into force everywhere.
+    fn put(&self, tuning: Tuning) {
+        // The shared copy first: a batcher that starts at this moment reads it.
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(tuning.clone());
+        self.collect.apply(Settings::from_tuning(&tuning));
+        self.control
+            .set(tuning.max_connections, tuning.header_timeout);
+        if let Some(batcher) = self
+            .batcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            batcher.reconfigure(batcher_config(&tuning));
+        }
+    }
+}
+
+/// The time now, in milliseconds since the Unix epoch.
+fn now_ms() -> i64 {
+    i64::try_from(collect::system_clock()).unwrap_or(i64::MAX / 2)
+}
+
 impl Node {
-    fn start(config: &Config, status: &Arc<Status>) -> Result<(Self, Arc<Collect>), String> {
+    fn start(
+        config: &Config,
+        status: &Arc<Status>,
+        control: &Arc<NetControl>,
+    ) -> Result<(Self, Arc<Collect>), String> {
         let endpoint = clickhouse_endpoint(&config.clickhouse_url)?;
-        let tuning = &config.tuning;
         let meta = SqliteMeta::open(&config.metadata_path)
             .map_err(|e| format!("cannot open {}: {e}", config.metadata_path.display()))?;
         let cache = Cache::new();
         cache
             .refresh(&meta)
             .map_err(|e| format!("cannot read the metadata: {e}"))?;
+
+        // The settings an operator stored apply from the first request.
+        let resolved = settings::resolve_at(&cache.settings(), now_ms());
+        let (tuning, skipped) = config.tuning.with_stored(&resolved);
+        status
+            .settings_stored
+            .store(resolved.len() as u64, Ordering::Relaxed);
+        status
+            .settings_skipped
+            .store(skipped.len() as u64, Ordering::Relaxed);
+        control.set(tuning.max_connections, tuning.header_timeout);
 
         let mut spool_config = SpoolConfig::new(&config.spool_dir);
         spool_config.quota_bytes = config.spool_quota_bytes;
@@ -93,7 +228,7 @@ impl Node {
         let mut collect = Collect::new(
             cache,
             spool.clone(),
-            Settings::from_tuning(tuning),
+            Settings::from_tuning(&tuning),
             collect::system_clock,
         );
         if let Some(path) = &config.geoip_path {
@@ -107,23 +242,41 @@ impl Node {
         let collect = Arc::new(collect);
         let stop = Arc::new(AtomicBool::new(false));
         let batcher = Arc::new(Mutex::new(None));
+        let live = Live {
+            base: Arc::new(config.tuning.clone()),
+            origins: Arc::new(config.tuning_origins.clone()),
+            reported: Arc::new(Mutex::new(Vec::new())),
+            current: Arc::new(RwLock::new(Arc::new(tuning))),
+            collect: Arc::clone(&collect),
+            control: Arc::clone(control),
+            batcher: Arc::clone(&batcher),
+            status: Arc::clone(status),
+        };
         let mut threads = Vec::new();
 
         let refresher = {
-            let (collect, stop, status) =
-                (Arc::clone(&collect), Arc::clone(&stop), Arc::clone(status));
-            let every = tuning.refresh_every;
+            let (live, stop, status) = (live.clone(), Arc::clone(&stop), Arc::clone(status));
             thread::Builder::new()
                 .name("dionaea-refresh".to_owned())
                 .spawn(move || {
                     // The journal is made durable every second whatever the
                     // refresh interval is, so a crash loses at most a second of
                     // remembered ids; drop counts are written on their own timer.
-                    let tick = every.min(Duration::from_secs(1));
+                    // Settings are worked out from the clock on every tick, and
+                    // the tick is short while a stored change is waiting for its
+                    // moment, so servers switch within a fraction of a second.
                     let mut last_refresh = Instant::now();
                     let mut last_flush = Instant::now();
+                    let mut due = None::<i64>;
                     while !stop.load(Ordering::Acquire) {
+                        let every = live.tuning().refresh_every;
+                        let tick = if due.is_some() {
+                            Duration::from_millis(100)
+                        } else {
+                            every.min(Duration::from_secs(1))
+                        };
                         nap(tick, &stop);
+                        let collect = &live.collect;
                         if let Err(error) = collect.sync_dedup() {
                             warn!(%error, "cannot write the event id journal");
                         }
@@ -133,21 +286,25 @@ impl Node {
                             last_flush = Instant::now();
                             collect.flush_drops();
                         }
-                        if last_refresh.elapsed() < every {
-                            continue;
-                        }
-                        last_refresh = Instant::now();
-                        match collect.cache.refresh(&meta) {
-                            Ok(reloaded) => {
-                                status.metadata_failing.store(false, Ordering::Relaxed);
-                                if reloaded {
-                                    info!("keys and schemas reloaded");
+                        if last_refresh.elapsed() >= every {
+                            last_refresh = Instant::now();
+                            match collect.cache.refresh(&meta) {
+                                Ok(reloaded) => {
+                                    status.metadata_failing.store(false, Ordering::Relaxed);
+                                    if reloaded {
+                                        info!("keys, schemas and settings reloaded");
+                                    }
+                                }
+                                Err(error) => {
+                                    status.metadata_failing.store(true, Ordering::Relaxed);
+                                    warn!(%error, "cannot refresh keys and schemas");
                                 }
                             }
-                            Err(error) => {
-                                status.metadata_failing.store(true, Ordering::Relaxed);
-                                warn!(%error, "cannot refresh keys and schemas");
-                            }
+                        }
+                        let (changes, next) = live.sync(now_ms());
+                        due = next;
+                        for change in changes {
+                            info!(%change, "a setting changed");
                         }
                     }
                 })
@@ -155,20 +312,17 @@ impl Node {
         };
         threads.push(refresher);
 
-        let batcher_config = BatcherConfig {
-            max_records: tuning.batch_max_records,
-            max_bytes: tuning.batch_max_bytes,
-            min_interval: tuning.batch_min_interval,
-            shared_dedup: tuning.shared_dedup,
-            ..BatcherConfig::default()
-        };
         // The tables must exist before anything is inserted: a missing table
         // is an error the batcher would keep retrying, so it starts only once
         // ClickHouse is prepared. Until then requests are still accepted into
         // the spool.
         let bootstrap = {
-            let (stop, slot, status) =
-                (Arc::clone(&stop), Arc::clone(&batcher), Arc::clone(status));
+            let (stop, slot, status, live) = (
+                Arc::clone(&stop),
+                Arc::clone(&batcher),
+                Arc::clone(status),
+                live.clone(),
+            );
             thread::Builder::new()
                 .name("dionaea-bootstrap".to_owned())
                 .spawn(move || {
@@ -178,7 +332,8 @@ impl Node {
                             Ok(applied) => {
                                 info!(applied = applied.len(), "clickhouse is ready");
                                 let destination: Arc<dyn Destination> = Arc::new(store);
-                                match Batcher::start(spool, destination, batcher_config) {
+                                let config = batcher_config(&live.tuning());
+                                match Batcher::start(spool, destination, config) {
                                     Ok(started) => {
                                         *status
                                             .batcher
@@ -186,8 +341,11 @@ impl Node {
                                             .unwrap_or_else(PoisonError::into_inner) =
                                             Some(started.stats_handle());
                                         status.clickhouse_ready.store(true, Ordering::Relaxed);
-                                        *slot.lock().unwrap_or_else(PoisonError::into_inner) =
-                                            Some(started);
+                                        let mut slot =
+                                            slot.lock().unwrap_or_else(PoisonError::into_inner);
+                                        // A setting stored while it was starting.
+                                        started.reconfigure(batcher_config(&live.tuning()));
+                                        *slot = Some(started);
                                     }
                                     Err(error) => warn!(%error, "cannot start the batcher"),
                                 }
@@ -253,17 +411,17 @@ pub(crate) async fn run(
     info!(listen = %public_address, ops = %ops_address, "listening");
 
     let status = Arc::new(Status::new(config.spool_quota_bytes));
+    let control = Arc::new(NetControl::new(
+        config.tuning.max_connections,
+        config.tuning.header_timeout,
+    ));
     let (node, collect) = {
-        let (config, status) = (config.clone(), Arc::clone(&status));
-        tokio::task::spawn_blocking(move || Node::start(&config, &status))
+        let (config, status, control) = (config.clone(), Arc::clone(&status), Arc::clone(&control));
+        tokio::task::spawn_blocking(move || Node::start(&config, &status, &control))
             .await
             .map_err(|e| e.to_string())??
     };
 
-    let limits = NetLimits {
-        max_connections: config.tuning.max_connections,
-        header_timeout: config.tuning.header_timeout,
-    };
     let public_counters = Arc::new(NetCounters::default());
     let collect_for_stop = Arc::clone(&collect);
     let ops_state = Arc::new(Ops {
@@ -290,22 +448,19 @@ pub(crate) async fn run(
 
     // The operator listener is small and local: a few connections, short
     // header time.
-    let ops_limits = NetLimits {
-        max_connections: 64,
-        header_timeout: Duration::from_secs(10),
-    };
+    let ops_control = Arc::new(NetControl::new(64, Duration::from_secs(10)));
     tokio::join!(
         net::serve(
             public,
             router(Some(collect)),
-            limits,
+            control,
             Arc::clone(&public_counters),
             wait_public
         ),
         net::serve(
             operator,
             ops::routes(ops_state),
-            ops_limits,
+            ops_control,
             Arc::new(NetCounters::default()),
             wait_ops
         ),

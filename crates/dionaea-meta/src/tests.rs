@@ -446,7 +446,10 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
     let migrations: i64 = connection
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(migrations, 1);
+    assert_eq!(
+        migrations, 2,
+        "each migration once, however many times it was opened"
+    );
     let mode: String = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("mode");
@@ -528,4 +531,179 @@ fn keys_issued_in_the_same_second_are_listed_in_the_order_they_were_issued() {
         .map(|k| k.key)
         .collect();
     assert_eq!(listed, issued);
+}
+
+const NOW: i64 = 1_760_000_000_000;
+
+fn set(store: &SqliteMeta, name: &str, value: &str) {
+    store.set_setting(name, Some(value), NOW, NOW).expect("set");
+}
+
+fn value_now(store: &SqliteMeta, name: &str) -> Option<String> {
+    store
+        .settings()
+        .expect("settings")
+        .get(name)
+        .and_then(|s| s.at(NOW + 1))
+        .map(str::to_owned)
+}
+
+#[test]
+fn settings_are_stored_read_replaced_and_removed() {
+    let store = store();
+    assert!(store.settings().expect("settings").is_empty());
+    set(&store, "key_burst", "900");
+    set(&store, "max_connections", "50");
+    set(&store, "key_burst", "1000");
+    assert_eq!(value_now(&store, "key_burst").as_deref(), Some("1000"));
+    assert_eq!(value_now(&store, "max_connections").as_deref(), Some("50"));
+    store
+        .set_setting("key_burst", None, NOW, NOW)
+        .expect("remove");
+    assert_eq!(value_now(&store, "key_burst"), None);
+    assert_eq!(
+        store.settings().expect("settings").len(),
+        1,
+        "a removal that took effect leaves nothing behind"
+    );
+    store
+        .set_setting("never_set", None, NOW, NOW)
+        .expect("removing what is not there is fine");
+    assert_eq!(store.settings().expect("settings").len(), 1);
+}
+
+#[test]
+fn a_change_scheduled_for_later_leaves_the_old_value_in_force_until_then() {
+    let store = store();
+    set(&store, "key_burst", "400");
+    let later = NOW + 5_000;
+    store
+        .set_setting("key_burst", Some("900"), later, NOW)
+        .expect("schedule");
+    let stored = store.settings().expect("settings")["key_burst"].clone();
+    assert_eq!(stored.at(NOW), Some("400"), "before the time");
+    assert_eq!(stored.at(later - 1), Some("400"));
+    assert_eq!(stored.at(later), Some("900"), "from the time on");
+    assert_eq!(stored.at(later + 60_000), Some("900"));
+
+    // A second change before the first took effect replaces it, and what was
+    // in force stays the old value.
+    store
+        .set_setting("key_burst", Some("700"), later + 1_000, NOW + 100)
+        .expect("reschedule");
+    let stored = store.settings().expect("settings")["key_burst"].clone();
+    assert_eq!(stored.at(later), Some("400"));
+    assert_eq!(stored.at(later + 1_000), Some("700"));
+}
+
+#[test]
+fn a_removal_scheduled_for_later_also_waits() {
+    let store = store();
+    set(&store, "key_burst", "400");
+    let later = NOW + 5_000;
+    store
+        .set_setting("key_burst", None, later, NOW)
+        .expect("schedule the removal");
+    let stored = store.settings().expect("settings")["key_burst"].clone();
+    assert_eq!(stored.at(NOW + 1), Some("400"));
+    assert_eq!(stored.at(later), None);
+    // The next write after the time has passed tidies the removed row away.
+    store
+        .set_setting("max_connections", Some("5"), later + 1, later + 1)
+        .expect("set");
+    assert!(
+        !store
+            .settings()
+            .expect("settings")
+            .contains_key("key_burst")
+    );
+}
+
+#[test]
+fn a_setting_moves_the_generation_only_when_it_changes() {
+    let store = store();
+    let start = store.generation().expect("generation");
+    set(&store, "key_burst", "900");
+    let after_set = store.generation().expect("generation");
+    assert!(after_set > start);
+    set(&store, "key_burst", "900");
+    assert_eq!(
+        store.generation().expect("generation"),
+        after_set,
+        "nothing changed"
+    );
+    set(&store, "key_burst", "901");
+    let after_change = store.generation().expect("generation");
+    assert!(after_change > after_set);
+    store
+        .set_setting("missing", None, NOW, NOW)
+        .expect("remove what is absent");
+    assert_eq!(store.generation().expect("generation"), after_change);
+    store
+        .set_setting("key_burst", Some("901"), NOW + 9_000, NOW)
+        .expect("the same value, at another time");
+    assert!(
+        store.generation().expect("generation") > after_change,
+        "a new time is a change nodes must see"
+    );
+}
+
+#[test]
+fn the_snapshot_carries_the_settings_of_its_generation() {
+    let store = store();
+    set(&store, "address_burst", "7");
+    let snapshot = store.snapshot().expect("snapshot");
+    assert_eq!(snapshot.settings["address_burst"].at(NOW + 1), Some("7"));
+    assert_eq!(snapshot.generation, store.generation().expect("generation"));
+}
+
+#[test]
+fn bad_setting_names_and_values_are_refused() {
+    let store = store();
+    for name in [
+        "",
+        "Key",
+        "key-burst",
+        "key burst",
+        "é",
+        &"a".repeat(MAX_SETTING_NAME_LEN + 1),
+    ] {
+        assert!(
+            matches!(
+                store.set_setting(name, Some("1"), NOW, NOW),
+                Err(MetaError::Invalid(_))
+            ),
+            "{name:?}"
+        );
+    }
+    for value in [
+        "",
+        "tab\there",
+        "new\nline",
+        &"9".repeat(MAX_SETTING_VALUE_LEN + 1),
+    ] {
+        assert!(
+            matches!(
+                store.set_setting("key_burst", Some(value), NOW, NOW),
+                Err(MetaError::Invalid(_))
+            ),
+            "{value:?}"
+        );
+    }
+    assert!(store.settings().expect("settings").is_empty());
+}
+
+#[test]
+fn settings_survive_a_reopen() {
+    let path = temp_path("settings");
+    {
+        let store = SqliteMeta::open(&path).expect("open");
+        store
+            .set_setting("key_burst", Some("123"), NOW + 10_000, NOW)
+            .expect("set");
+    }
+    let store = SqliteMeta::open(&path).expect("reopen");
+    let stored = store.settings().expect("settings")["key_burst"].clone();
+    assert_eq!(stored.at(NOW + 10_000), Some("123"));
+    assert_eq!(stored.effective_at_ms, NOW + 10_000);
 }

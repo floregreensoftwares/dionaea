@@ -7,6 +7,13 @@ be set either way: the environment name is the key in capitals with the
 file, a value that does not parse and a value outside its range stop the server
 at start with a message naming the key.
 
+There are two kinds of setting. The ones in **Listeners** and **Storage** are
+needed before anything can be read, or are secret: they come from the file and
+the environment and change with a restart. The ones in **Limits** are
+operational and can also be stored in the metadata store with
+`dionaea settings`, which a running server follows without a restart (see
+[Changing limits while the server runs](#changing-limits-while-the-server-runs)).
+
 ## Listeners
 
 | Key | Default | Meaning |
@@ -58,6 +65,58 @@ the status listed in `wire-format.md`.
 | `dedup_capacity`, `dedup_window_secs` | 1000000, 600 (about 80 MB at the default capacity) | 0 to 100000000 (0 is off), 1 to 86400 | Event ids remembered to drop an event sent again |
 | `shared_dedup` | true | true or false | Ask ClickHouse which events another node stored, and record this node's ids |
 | `drop_flush_secs` | 5 | 1 to 300 | How often the drop counts of requests that kept no event are written |
+
+## Changing limits while the server runs
+
+Every key of the **Limits** table is an operational setting. Its value is the
+first that exists of: the value stored in the metadata store, the environment,
+the file, the default.
+
+```
+dionaea settings list                      # name, value in force, source, range, meaning
+dionaea settings get key_burst             # the value in force, alone
+dionaea settings set key_burst 800         # store a value (takes effect after a short delay)
+dionaea settings set key_burst 800 --now   # take effect on each server's next refresh
+dionaea settings set key_burst 800 --after 30   # take effect 30 seconds from now
+dionaea settings unset key_burst           # back to the environment, file or default
+```
+
+`set` checks the value against the same range the file is checked against and
+refuses a name that is not an operational setting (listing the ones that are);
+it stores the number the way the server shows it (`0800` and `800` are the same
+setting). The commands read the same configuration as `serve`
+(`--config`, `DIONAEA_*`, notably `metadata_path`), so they act on the same
+database.
+
+A change takes effect at a stated moment, the same for every server that reads
+the store. The default is one refresh interval plus a second from now, long
+enough for every server to have read the change before it is due; `--after N`
+chooses another delay and `--now` skips the wait (each server then switches on
+its own next refresh, so servers may differ for up to `refresh_secs`). Until
+the moment arrives the old value stays in force and `dionaea settings list`
+shows what is coming (`; 900 in 3 s`). Servers check the clock every tenth of a
+second while a change is waiting, so they switch within a fraction of a second
+of each other, as far as their clocks agree; keep them synchronised (NTP).
+
+Once a change is due, a running server applies it in place: the rate limits
+and the number of tracked keys, the event id memory, the batch size and the
+cross-node check, the connection limit and the header time (a connection
+already open keeps the time it was given), the body time, the event time
+window, the proxy settings and the flush time of drop counts. Nothing is
+dropped or restarted; a request that is being handled finishes under the
+settings it started with.
+
+A stored value wins over the environment and the file, so editing the file
+will not change a setting that has a stored value. `dionaea settings list`
+says so (`stored (overrides file: 555)`), and the server logs a warning for each
+such setting. `dionaea settings unset` gives the file or the environment its
+say again.
+
+A stored value that is out of range or no longer a known setting (for example
+after an upgrade removed it, or a hand edit of the database) is ignored with a
+warning in the log; `dionaea_settings_stored` and `dionaea_settings_skipped` in
+`/metrics` show how many are stored and how many were ignored. The server never
+refuses to start because of a stored value.
 
 ## Behind a reverse proxy
 

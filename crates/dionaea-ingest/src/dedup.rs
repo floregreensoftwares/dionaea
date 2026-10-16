@@ -20,6 +20,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 /// One journal record: the id (big endian) and when it was remembered.
@@ -42,8 +43,8 @@ struct Journal {
 /// Remembers up to `capacity` ids for `window_ms` milliseconds each.
 #[derive(Debug)]
 pub struct Deduper {
-    capacity: usize,
-    window_ms: u64,
+    capacity: AtomicUsize,
+    window_ms: AtomicU64,
     state: Mutex<Window>,
     journal: Mutex<Option<Journal>>,
 }
@@ -53,8 +54,8 @@ impl Deduper {
     /// which turns the check off.
     pub fn new(capacity: usize, window_ms: u64) -> Self {
         Self {
-            capacity,
-            window_ms,
+            capacity: AtomicUsize::new(capacity),
+            window_ms: AtomicU64::new(window_ms),
             state: Mutex::new(Window::default()),
             journal: Mutex::new(None),
         }
@@ -69,9 +70,6 @@ impl Deduper {
     /// When the file cannot be read or written.
     pub fn open(capacity: usize, window_ms: u64, path: &Path, now_ms: u64) -> io::Result<Self> {
         let deduper = Self::new(capacity, window_ms);
-        if capacity == 0 {
-            return Ok(deduper);
-        }
         {
             let mut state = deduper.state.lock().unwrap_or_else(PoisonError::into_inner);
             match File::open(path) {
@@ -90,6 +88,21 @@ impl Deduper {
         Ok(deduper)
     }
 
+    /// Changes the size and the window from now on. A smaller size forgets the
+    /// oldest ids at once; 0 forgets everything and turns the check off. The
+    /// journal, if there is one, keeps being written only while the size is
+    /// not 0.
+    pub fn reconfigure(&self, capacity: usize, window_ms: u64) {
+        self.capacity.store(capacity, Ordering::Relaxed);
+        self.window_ms.store(window_ms, Ordering::Relaxed);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if capacity == 0 {
+            *state = Window::default();
+        } else {
+            self.trim(&mut state);
+        }
+    }
+
     /// Whether `id` was remembered and has not expired at `now_ms`.
     pub fn contains(&self, id: u128, now_ms: u64) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -99,7 +112,7 @@ impl Deduper {
 
     /// Remembers `ids` as seen at `now_ms`. When full, the oldest are forgotten.
     pub fn remember(&self, ids: impl IntoIterator<Item = u128>, now_ms: u64) {
-        if self.capacity == 0 {
+        if self.capacity.load(Ordering::Relaxed) == 0 {
             return;
         }
         let mut fresh = Vec::new();
@@ -141,7 +154,7 @@ impl Deduper {
         let Some(current) = journal.as_mut() else {
             return Ok(());
         };
-        if current.records > self.capacity.saturating_mul(2) {
+        if current.records > self.capacity.load(Ordering::Relaxed).saturating_mul(2) {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             *current = rewrite(&current.path.clone(), &state)?;
             return Ok(());
@@ -152,7 +165,7 @@ impl Deduper {
 
     fn expire(&self, state: &mut Window, now_ms: u64) {
         while let Some(&(id, at)) = state.order.front() {
-            if now_ms.saturating_sub(at) < self.window_ms {
+            if now_ms.saturating_sub(at) < self.window_ms.load(Ordering::Relaxed) {
                 break;
             }
             state.order.pop_front();
@@ -161,7 +174,7 @@ impl Deduper {
     }
 
     fn trim(&self, state: &mut Window) {
-        while state.ids.len() > self.capacity {
+        while state.ids.len() > self.capacity.load(Ordering::Relaxed) {
             if let Some((oldest, _)) = state.order.pop_front() {
                 state.ids.remove(&oldest);
             } else {

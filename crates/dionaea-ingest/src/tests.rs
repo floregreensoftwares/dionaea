@@ -590,3 +590,100 @@ fn extreme_times_do_not_overflow() {
     assert!(one(0, max, 0).accepted.len() <= 1);
     assert!(one(max, 0, u64::MAX).accepted.len() <= 1);
 }
+
+// Changing limits while they are in use.
+
+#[test]
+fn a_limiter_takes_a_new_rate_and_burst_without_forgetting_its_keys() {
+    let limiter = RateLimiter::new(1.0, 5.0, 100);
+    for _ in 0..5 {
+        limiter.check("k", 0).expect("within the burst");
+    }
+    assert!(limiter.check("k", 0).is_err());
+    // A larger burst and rate are felt as time passes.
+    limiter.reconfigure(10.0, 20.0, 100);
+    assert!(
+        limiter.check("k", 500).is_ok(),
+        "5 tokens after 500 ms at 10 per second"
+    );
+    // A smaller burst caps what a bucket may hold.
+    limiter.reconfigure(10.0, 2.0, 100);
+    limiter.check("k", 100_000).expect("one");
+    limiter.check("k", 100_000).expect("two");
+    assert!(limiter.check("k", 100_000).is_err(), "the new burst is two");
+}
+
+#[test]
+fn a_limiter_that_must_hold_fewer_keys_forgets_the_surplus_at_once() {
+    let limiter = RateLimiter::new(1.0, 2.0, 100);
+    for n in 0..60u32 {
+        limiter.check(n, 0).expect("new key");
+    }
+    assert_eq!(limiter.len(), 60);
+    limiter.reconfigure(1.0, 2.0, 10);
+    assert_eq!(limiter.len(), 10);
+    limiter.check(1000, 0).expect("still works");
+    assert!(limiter.len() <= 10);
+}
+
+#[test]
+fn a_limiter_ignores_limits_it_could_not_have_been_made_with() {
+    let limiter = RateLimiter::new(1.0, 3.0, 10);
+    for bad in [
+        (0.0, 3.0, 10),
+        (1.0, 0.5, 10),
+        (1.0, 3.0, 0),
+        (f64::NAN, 3.0, 10),
+        (1.0, f64::INFINITY, 10),
+    ] {
+        limiter.reconfigure(bad.0, bad.1, bad.2);
+    }
+    for _ in 0..3 {
+        limiter.check("k", 0).expect("the burst is still three");
+    }
+    assert!(limiter.check("k", 0).is_err());
+}
+
+#[test]
+fn the_duplicate_memory_can_be_resized_and_turned_off_while_in_use() {
+    let seen = Deduper::new(10, 1_000_000);
+    seen.remember(0..10u128, 0);
+    seen.reconfigure(3, 1_000_000);
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen.contains(9, 1) && !seen.contains(0, 1),
+        "the oldest went"
+    );
+    seen.reconfigure(10, 100);
+    assert!(!seen.contains(9, 1_000), "the shorter window applies");
+    seen.remember([50], 2_000);
+    seen.reconfigure(0, 100);
+    assert!(seen.is_empty(), "off forgets everything");
+    seen.remember([51], 3_000);
+    assert!(seen.is_empty(), "and remembers nothing");
+    seen.reconfigure(5, 100);
+    seen.remember([52], 4_000);
+    assert!(seen.contains(52, 4_001), "on again");
+}
+
+#[test]
+fn settings_stored_in_the_metadata_reach_the_cache_when_the_generation_moves() {
+    let store = SqliteMeta::open_in_memory().expect("store");
+    let cache = Cache::new();
+    cache.refresh(&store).expect("refresh");
+    assert!(cache.settings().is_empty());
+    store
+        .set_setting("key_burst", Some("300"), 1_000, 1_000)
+        .expect("set");
+    assert!(
+        cache.refresh(&store).expect("refresh"),
+        "a setting is a change"
+    );
+    assert_eq!(cache.settings()["key_burst"].at(1_000), Some("300"));
+    store
+        .set_setting("key_burst", None, 2_000, 2_000)
+        .expect("remove");
+    assert!(cache.refresh(&store).expect("refresh"));
+    let removed = cache.settings();
+    assert_eq!(removed.get("key_burst").and_then(|s| s.at(2_000)), None);
+}

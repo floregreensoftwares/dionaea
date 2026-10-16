@@ -832,3 +832,58 @@ fn a_site_is_part_of_the_key() {
         "the same id under two sites is two events"
     );
 }
+
+#[test]
+fn the_cross_node_check_can_be_turned_off_while_the_batcher_runs() {
+    let dir = spool_dir("toggle");
+    let spool = open(&dir);
+    let store = Arc::new(Fake::default());
+    store
+        .known
+        .lock()
+        .unwrap()
+        .insert((7, "01890000-0000-7000-8000-000000000001".to_owned()));
+    let batcher = start(&spool, &store);
+
+    // With the check on, an event another node stored is left out.
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    wait_for("the duplicate", || batcher.stats().duplicates() == 1);
+
+    // Turned off, the same event goes in.
+    batcher.reconfigure(BatcherConfig {
+        shared_dedup: false,
+        ..fast()
+    });
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    wait_for("the row", || batcher.stats().event_rows() == 1);
+    assert_eq!(batcher.stats().duplicates(), 1, "no longer counted");
+    batcher.stop();
+}
+
+#[test]
+fn the_size_of_a_batch_follows_the_configuration_in_force() {
+    let dir = spool_dir("batch-size");
+    let spool = open(&dir);
+    for n in 0..30 {
+        enqueue(&spool, &same_event(n), 7, NOW).unwrap();
+    }
+    let store = Arc::new(Fake::default());
+    // One record per insert.
+    let config = BatcherConfig {
+        max_records: 1,
+        ..fast()
+    };
+    let batcher = Batcher::start(
+        spool.clone(),
+        Arc::clone(&store) as Arc<dyn Destination>,
+        config,
+    )
+    .unwrap();
+    wait_for("the rows", || batcher.stats().event_rows() == 30);
+    assert!(
+        batcher.stats().batches() >= 30,
+        "{} inserts",
+        batcher.stats().batches()
+    );
+    batcher.stop();
+}

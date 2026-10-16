@@ -5,6 +5,7 @@ mod net;
 mod ops;
 mod schema_cli;
 mod server;
+mod settings;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,6 +45,11 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: KeyCommand,
+    },
+    /// Read and change the limits and intervals a running server follows
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
     },
 }
 
@@ -109,6 +115,68 @@ enum SiteCommand {
     },
 }
 
+/// The operational settings: limits and intervals that follow a change within
+/// the server's refresh interval, with no restart. Addresses, paths and
+/// credentials stay in the file and the environment.
+#[derive(Subcommand)]
+enum SettingsCommand {
+    /// List every setting: name, value in force, where it comes from, its range, what it is
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Print the value in force of one setting
+    Get {
+        name: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Store a value; the file, the environment and the default give way to it
+    Set {
+        name: String,
+        value: String,
+        #[command(flatten)]
+        when: When,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Remove a stored value, so the file, the environment or the default applies
+    Unset {
+        name: String,
+        #[command(flatten)]
+        when: When,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+/// When a change takes effect. Every server that reads the store switches at
+/// the same moment, so the default waits one refresh interval plus a second:
+/// by then all of them have the change. Servers' clocks are assumed to agree
+/// to within about a second.
+#[derive(clap::Args)]
+struct When {
+    /// Take effect this many seconds from now instead
+    #[arg(long, conflicts_with = "now")]
+    after: Option<u64>,
+    /// Take effect on each server's next refresh, not all at once
+    #[arg(long)]
+    now: bool,
+}
+
+impl When {
+    /// The delay in milliseconds.
+    fn delay_ms(&self, config: &Config) -> i64 {
+        let seconds = if self.now {
+            0
+        } else {
+            self.after
+                .unwrap_or(config.tuning.refresh_every.as_secs() + 1)
+        };
+        i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX / 2)
+    }
+}
+
 #[derive(Subcommand)]
 enum KeyCommand {
     /// Issue a write key for a site; prints the key
@@ -145,6 +213,7 @@ fn main() -> ExitCode {
         Command::Schema { command } => schema(command),
         Command::Site { command } => site(command),
         Command::Key { command } => key(command),
+        Command::Settings { command } => settings_command(command),
     }
 }
 
@@ -242,6 +311,19 @@ fn with_store(
     args: &StoreArgs,
     work: impl FnOnce(&dyn MetaStore, &mut std::io::StdoutLock<'_>, &mut std::io::StderrLock<'_>) -> u8,
 ) -> ExitCode {
+    with_config_store(args, |_, meta, out, err| work(meta, out, err))
+}
+
+/// The same, for work that also needs the configuration.
+fn with_config_store(
+    args: &StoreArgs,
+    work: impl FnOnce(
+        &Config,
+        &dyn MetaStore,
+        &mut std::io::StdoutLock<'_>,
+        &mut std::io::StderrLock<'_>,
+    ) -> u8,
+) -> ExitCode {
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     let config = match load_config(args.config.clone()) {
         Ok(config) => config,
@@ -261,7 +343,51 @@ fn with_store(
             return ExitCode::from(meta_cli::UNUSABLE);
         }
     };
-    ExitCode::from(work(&store, &mut out, &mut err))
+    ExitCode::from(work(&config, &store, &mut out, &mut err))
+}
+
+fn settings_command(command: SettingsCommand) -> ExitCode {
+    let now = || i64::try_from(collect::system_clock()).unwrap_or(i64::MAX / 2);
+    match command {
+        SettingsCommand::List { store } => with_config_store(&store, |config, meta, out, err| {
+            meta_cli::settings_list(
+                meta,
+                &config.tuning,
+                &config.tuning_origins,
+                now(),
+                out,
+                err,
+            )
+        }),
+        SettingsCommand::Get { name, store } => {
+            with_config_store(&store, |config, meta, out, err| {
+                meta_cli::settings_get(
+                    meta,
+                    &config.tuning,
+                    &config.tuning_origins,
+                    now(),
+                    &name,
+                    out,
+                    err,
+                )
+            })
+        }
+        SettingsCommand::Set {
+            name,
+            value,
+            when,
+            store,
+        } => with_config_store(&store, |config, meta, _, err| {
+            let moment = (now(), when.delay_ms(config));
+            meta_cli::settings_set(meta, &name, &value, moment, err)
+        }),
+        SettingsCommand::Unset { name, when, store } => {
+            with_config_store(&store, |config, meta, _, err| {
+                let moment = (now(), when.delay_ms(config));
+                meta_cli::settings_unset(meta, &name, moment, err)
+            })
+        }
+    }
 }
 
 fn site(command: SiteCommand) -> ExitCode {

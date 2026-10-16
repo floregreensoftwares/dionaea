@@ -717,3 +717,19 @@ fn a_database_made_by_maxmind_gives_countries_for_v4_and_v6_addresses() {
         Enrichment::of_request(None, Some("216.160.83.56".parse().unwrap()), Some(&lookup));
     assert_eq!(enrichment.country, "US");
 }
+
+#[test]
+fn a_memory_started_off_keeps_a_journal_so_turning_it_on_later_survives_a_restart() {
+    let path = journal_path("started-off");
+    {
+        let seen = Deduper::open(0, 1_000_000, &path, 0).unwrap();
+        seen.remember([1], 10);
+        assert!(seen.is_empty(), "off remembers nothing");
+        seen.reconfigure(10, 1_000_000);
+        seen.remember([2, 3], 20);
+        seen.sync().unwrap();
+    }
+    let again = Deduper::open(10, 1_000_000, &path, 100).unwrap();
+    assert!(!again.contains(1, 100));
+    assert!(again.contains(2, 100) && again.contains(3, 100));
+}
