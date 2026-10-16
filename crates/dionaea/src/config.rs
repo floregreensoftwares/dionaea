@@ -45,6 +45,11 @@ pub(crate) struct Config {
     /// that holds it. The same on every server that shares the metadata.
     pub(crate) erasure_key: Secret,
     pub(crate) erasure_key_file: Option<PathBuf>,
+    /// Earlier keys that erasures were made with, after the key was replaced:
+    /// a comma-separated list in the environment, an array in the file, and a
+    /// file with one key per line.
+    pub(crate) erasure_previous_keys: Vec<Secret>,
+    pub(crate) erasure_previous_keys_file: Option<PathBuf>,
     /// A MaxMind country database (`.mmdb`); without it events have no country.
     pub(crate) geoip_path: Option<PathBuf>,
     pub(crate) tuning: Tuning,
@@ -94,6 +99,8 @@ const FILE_KEYS: &[&str] = &[
     "metadata_path",
     "erasure_key",
     "erasure_key_file",
+    "erasure_previous_keys",
+    "erasure_previous_keys_file",
     "geoip_path",
     "log_level",
     "log_format",
@@ -114,6 +121,8 @@ struct FileConfig {
     metadata_path: Option<PathBuf>,
     erasure_key: Option<String>,
     erasure_key_file: Option<PathBuf>,
+    erasure_previous_keys: Option<Vec<String>>,
+    erasure_previous_keys_file: Option<PathBuf>,
     geoip_path: Option<PathBuf>,
     log_level: Option<String>,
     log_format: Option<LogFormat>,
@@ -246,6 +255,24 @@ impl Config {
 
         let erasure_key = Secret(source.text("ERASURE_KEY", file.erasure_key, ""));
         let erasure_key_file = source.path("ERASURE_KEY_FILE", file.erasure_key_file);
+        let erasure_previous_keys: Vec<Secret> = match source.var("ERASURE_PREVIOUS_KEYS") {
+            Some(list) => list
+                .split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(|key| Secret(key.to_owned()))
+                .collect(),
+            None => file
+                .erasure_previous_keys
+                .unwrap_or_default()
+                .into_iter()
+                .map(Secret)
+                .collect(),
+        };
+        let erasure_previous_keys_file = source.path(
+            "ERASURE_PREVIOUS_KEYS_FILE",
+            file.erasure_previous_keys_file,
+        );
         let log_level = source.text("LOG_LEVEL", file.log_level, "info");
         let log_format = match source.var("LOG_FORMAT") {
             Some(value) => match value.as_str() {
@@ -275,6 +302,8 @@ impl Config {
             metadata_path,
             erasure_key,
             erasure_key_file,
+            erasure_previous_keys,
+            erasure_previous_keys_file,
             geoip_path,
             tuning,
             tuning_origins,
@@ -301,14 +330,51 @@ impl Config {
         }
     }
 
-    /// Opens the metadata store with the erasure key, if there is one.
+    /// The earlier keys, from the list and the file; each is checked like the
+    /// current one and a problem names its position, never the secret.
+    pub(crate) fn erasure_previous_keys(&self) -> Result<Vec<HashKey>, String> {
+        let mut secrets: Vec<String> = self
+            .erasure_previous_keys
+            .iter()
+            .map(|secret| secret.0.clone())
+            .collect();
+        if let Some(path) = &self.erasure_previous_keys_file {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                format!(
+                    "cannot read the previous erasure keys file {}: {e}",
+                    path.display()
+                )
+            })?;
+            secrets.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_owned),
+            );
+        }
+        secrets
+            .iter()
+            .enumerate()
+            .map(|(index, secret)| {
+                HashKey::from_secret(secret)
+                    .map_err(|e| format!("previous erasure key number {}: {e}", index + 1))
+            })
+            .collect()
+    }
+
+    /// Opens the metadata store with the erasure keys, if there are any.
     pub(crate) fn open_meta(&self) -> Result<SqliteMeta, String> {
         let meta = SqliteMeta::open(&self.metadata_path)
             .map_err(|e| format!("cannot open {}: {e}", self.metadata_path.display()))?;
-        Ok(match self.erasure_key()? {
-            Some(key) => meta.with_hash_key(key),
-            None => meta,
-        })
+        let previous = self.erasure_previous_keys()?;
+        match self.erasure_key()? {
+            Some(key) => Ok(meta.with_hash_key(key).with_previous_keys(previous)),
+            None if previous.is_empty() => Ok(meta),
+            None => Err(
+                "previous erasure keys are set but `erasure_key` is not; set the current key"
+                    .to_owned(),
+            ),
+        }
     }
 }
 
@@ -555,6 +621,43 @@ mod tests {
         let missing =
             Config::resolve(Some("erasure_key_file = \"/no/such/file\"\n"), |_| None).unwrap();
         assert!(missing.erasure_key().unwrap_err().contains("cannot read"));
+    }
+
+    #[test]
+    fn previous_erasure_keys_come_from_a_list_an_array_or_a_file_and_are_checked() {
+        let current = "0123456789abcdef0123456789abcdef";
+        let old = "fedcba9876543210fedcba9876543210";
+        let older = "abcdefabcdefabcdefabcdefabcdefab";
+        let env = |name: &str| match name {
+            "DIONAEA_ERASURE_KEY" => Some(current.to_owned()),
+            "DIONAEA_ERASURE_PREVIOUS_KEYS" => Some(format!(" {old} , {older},")),
+            _ => None,
+        };
+        let config = Config::resolve(None, env).unwrap();
+        assert_eq!(config.erasure_previous_keys().unwrap().len(), 2);
+        assert!(!format!("{config:?}").contains(old));
+
+        let from_file = Config::resolve(
+            Some(&format!("erasure_previous_keys = [\"{old}\"]\n")),
+            |name| (name == "DIONAEA_ERASURE_KEY").then(|| current.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(from_file.erasure_previous_keys().unwrap().len(), 1);
+
+        let bad = Config::resolve(None, |name| match name {
+            "DIONAEA_ERASURE_KEY" => Some(current.to_owned()),
+            "DIONAEA_ERASURE_PREVIOUS_KEYS" => Some(format!("{old},short")),
+            _ => None,
+        })
+        .unwrap();
+        let error = bad.erasure_previous_keys().unwrap_err();
+        assert!(
+            error.contains("number 2") && !error.contains("short"),
+            "{error}"
+        );
+
+        let none = Config::resolve(None, |_| None).unwrap();
+        assert!(none.erasure_previous_keys().unwrap().is_empty());
     }
 
     #[test]

@@ -1431,7 +1431,7 @@ fn a_server_with_another_key_or_none_refuses_to_read_or_add_tombstones() {
             .request_erasure(site_id, "u_2", "ops")
             .unwrap_err()
             .to_string()
-            .contains("not the one"),
+            .contains("not configured"),
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1559,4 +1559,116 @@ fn giving_up_and_retrying_set_and_clear_the_time_of_failure() {
         0,
         "not failed any more"
     );
+}
+
+// Replacing the key.
+
+const NEW_SECRET: &str = "fedcba9876543210fedcba9876543210";
+
+fn new_key() -> HashKey {
+    HashKey::from_secret(NEW_SECRET).unwrap()
+}
+
+#[test]
+fn after_the_key_is_replaced_old_tombstones_are_still_found_and_new_ones_use_the_new_key() {
+    let dir = std::env::temp_dir().join(format!("dionaea-meta-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meta.db");
+    let site_id = {
+        let store = reopened(&path, Some(SECRET));
+        let site = site(&store);
+        store.request_erasure(site.id, "u_old", "ops").unwrap();
+        site.id
+    };
+
+    // The new key is current and the old one is kept as a previous key.
+    let rotated = SqliteMeta::open(&path)
+        .unwrap()
+        .with_hash_key(new_key())
+        .with_previous_keys(vec![key()]);
+    let held = Tombstones::default();
+    held.load_from(&rotated).unwrap();
+    assert!(held.user_erased(site_id, "u_old"), "made under the old key");
+
+    let request = rotated.request_erasure(site_id, "u_new", "ops").unwrap();
+    rotated
+        .add_erasure_anons(request.id, &["dev_new".to_owned()])
+        .unwrap();
+    held.load_from(&rotated).unwrap();
+    assert!(held.user_erased(site_id, "u_new") && held.anon_erased(site_id, "dev_new"));
+    assert!(!held.user_erased(site_id, "u_other"));
+    assert_eq!(
+        request.user_hash,
+        new_key().tombstone_hash(site_id, IdKind::User, "u_new"),
+        "new tombstones use the new key"
+    );
+
+    // Everything is found by a server that has both, and the old key alone
+    // no longer understands the new tombstones.
+    let both = Tombstones::default();
+    both.load_from(&rotated).unwrap();
+    assert_eq!(both.len(), 3);
+    let old_only = reopened(&path, Some(SECRET));
+    let error = Tombstones::default().load_from(&old_only).unwrap_err();
+    assert!(error.to_string().contains("not configured"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dropping_a_key_that_tombstones_were_made_with_is_refused_and_says_which() {
+    let dir = std::env::temp_dir().join(format!("dionaea-meta-drop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meta.db");
+    let site_id = {
+        let store = reopened(&path, Some(SECRET));
+        let site = site(&store);
+        store.request_erasure(site.id, "u_old", "ops").unwrap();
+        site.id
+    };
+    // A new current key without the old one anywhere.
+    let lonely = SqliteMeta::open(&path).unwrap().with_hash_key(new_key());
+    let error = Tombstones::default().load_from(&lonely).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("not configured") && message.contains("erasure_previous_keys"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&key().check()[..8]),
+        "names it by its check: {message}"
+    );
+    assert!(!message.contains(SECRET));
+    assert!(lonely.request_erasure(site_id, "u_new", "ops").is_err());
+    assert!(lonely.add_erasure_anons(1, &["a".to_owned()]).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_previous_key_without_a_current_one_does_nothing() {
+    let store = SqliteMeta::open_in_memory()
+        .unwrap()
+        .with_previous_keys(vec![key()]);
+    assert!(store.erasure_keys().current().is_none());
+    assert!(store.request_erasure(1, "u_1", "ops").is_err());
+}
+
+#[test]
+fn every_configured_key_is_tried_on_a_lookup_and_a_wrong_one_finds_nothing() {
+    let store = store();
+    let site = site(&store);
+    store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let batch = store.tombstones_since(0, 10).unwrap();
+    assert_eq!(batch.entries.len(), 1);
+    assert_eq!(
+        store.erasure_keys().all().count(),
+        1,
+        "only the current key here"
+    );
+    let keys = HashKeys::new(new_key(), vec![key()]);
+    assert_eq!(keys.all().count(), 2);
+    assert_eq!(keys.current(), Some(&new_key()));
+    assert!(keys.knows(&key().check()) && keys.knows(&new_key().check()));
+    assert!(!keys.knows("0000"));
 }
