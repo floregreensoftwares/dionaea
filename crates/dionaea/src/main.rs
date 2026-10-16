@@ -202,7 +202,11 @@ fn serve(path: Option<PathBuf>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(server::run(&config, server::shutdown_signal())) {
+    let served = runtime.block_on(async {
+        let stop = server::shutdown_signal();
+        server::run(&config, stop).await
+    });
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "server stopped with an error");

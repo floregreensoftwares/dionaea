@@ -201,26 +201,43 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Resolves on Ctrl+C or, on Unix, SIGTERM.
-pub(crate) async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+/// Registers the handlers now and returns a future that resolves on Ctrl+C or,
+/// on Unix, SIGTERM. Registering before the server says it is listening means a
+/// signal sent right after cannot reach the process while its default action,
+/// ending it at once, is still in place. Call it inside the runtime.
+// Not an `async fn` on purpose: the handlers must be registered when it is
+// called, not when it is first polled (on Windows there is nothing to register).
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn shutdown_signal() -> impl Future<Output = ()> + Send + 'static {
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
+    let (mut interrupt, mut terminate) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::interrupt()).ok(),
+            signal(SignalKind::terminate()).ok(),
+        )
     };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => info!("interrupt received"),
-        () = terminate => info!("terminate received"),
+    async move {
+        #[cfg(unix)]
+        {
+            async fn wait(signal: &mut Option<tokio::signal::unix::Signal>) {
+                match signal {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }
+            tokio::select! {
+                () = wait(&mut interrupt) => info!("interrupt received"),
+                () = wait(&mut terminate) => info!("terminate received"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("interrupt received");
+        }
     }
 }
 
