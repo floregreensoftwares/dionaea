@@ -97,6 +97,9 @@ impl Node {
             collect = collect.with_country_lookup(Arc::new(lookup));
             info!("country database loaded");
         }
+        let collect = collect
+            .with_dedup_journal(&config.spool_dir.join("dedup.journal"))
+            .map_err(|e| format!("cannot open the event id journal: {e}"))?;
         let collect = Arc::new(collect);
         let stop = Arc::new(AtomicBool::new(false));
         let batcher = Arc::new(Mutex::new(None));
@@ -109,8 +112,27 @@ impl Node {
             thread::Builder::new()
                 .name("dionaea-refresh".to_owned())
                 .spawn(move || {
+                    // The journal is made durable every second whatever the
+                    // refresh interval is, so a crash loses at most a second of
+                    // remembered ids; drop counts are written on their own timer.
+                    let tick = every.min(Duration::from_secs(1));
+                    let mut last_refresh = Instant::now();
+                    let mut last_flush = Instant::now();
                     while !stop.load(Ordering::Acquire) {
-                        nap(every, &stop);
+                        nap(tick, &stop);
+                        if let Err(error) = collect.sync_dedup() {
+                            warn!(%error, "cannot write the event id journal");
+                        }
+                        if collect.drops_full()
+                            || last_flush.elapsed() >= collect.drop_flush_every()
+                        {
+                            last_flush = Instant::now();
+                            collect.flush_drops();
+                        }
+                        if last_refresh.elapsed() < every {
+                            continue;
+                        }
+                        last_refresh = Instant::now();
                         match collect.cache.refresh(&meta) {
                             Ok(reloaded) => {
                                 status.metadata_failing.store(false, Ordering::Relaxed);
@@ -133,6 +155,7 @@ impl Node {
             max_records: tuning.batch_max_records,
             max_bytes: tuning.batch_max_bytes,
             min_interval: tuning.batch_min_interval,
+            shared_dedup: tuning.shared_dedup,
             ..BatcherConfig::default()
         };
         // The tables must exist before anything is inserted: a missing table
@@ -238,6 +261,7 @@ pub(crate) async fn run(
         header_timeout: config.tuning.header_timeout,
     };
     let public_counters = Arc::new(NetCounters::default());
+    let collect_for_stop = Arc::clone(&collect);
     let ops_state = Arc::new(Ops {
         collect: Arc::clone(&collect),
         status,
@@ -282,6 +306,10 @@ pub(crate) async fn run(
             wait_ops
         ),
     );
+    {
+        let collect = Arc::clone(&collect_for_stop);
+        let _ = tokio::task::spawn_blocking(move || collect.flush_drops()).await;
+    }
     let _ = tokio::task::spawn_blocking(move || node.stop()).await;
     info!("shutdown complete");
     Ok(())

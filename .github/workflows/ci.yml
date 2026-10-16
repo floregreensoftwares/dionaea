@@ -135,8 +135,15 @@ jobs:
           docker compose -f compose.yaml -f compose.tls.yaml up -d --wait
       - name: Run the tests that need it
         run: cargo test -p dionaea-store --test clickhouse --locked -- --ignored
+      - name: Fetch MaxMind's test database
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/GeoIP2-Country-Test.mmdb" \
+            https://github.com/maxmind/MaxMind-DB/raw/main/test-data/GeoIP2-Country-Test.mmdb
+          echo "DIONAEA_TEST_GEOIP=$RUNNER_TEMP/GeoIP2-Country-Test.mmdb" >> "$GITHUB_ENV"
       - name: Run the ingest path tests against it
-        run: cargo test -p dionaea-ingest --test clickhouse --locked -- --ignored
+        run: |
+          cargo test -p dionaea-ingest --test clickhouse --locked -- --ignored
+          cargo test -p dionaea-ingest --lib --locked -- --ignored
       - name: Run the server against it
         run: cargo test -p dionaea --test serve --locked -- --ignored
       - name: Stop ClickHouse

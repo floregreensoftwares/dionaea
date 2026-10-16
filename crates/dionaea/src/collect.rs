@@ -25,8 +25,8 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, 
 use axum::routing::any;
 use dionaea_core::MAX_BODY_LEN;
 use dionaea_ingest::{
-    Admission, Cache, Context, CountryLookup, Deduper, Enrichment, Limits, Processed, RateLimiter,
-    Refusal, RetryAfter, enqueue, process_with,
+    Admission, Cache, Context, CountryLookup, Deduper, DropAggregator, Enrichment, Limits,
+    Processed, RateLimiter, Refusal, RetryAfter, enqueue, enqueue_drop_rows, process_with,
 };
 use dionaea_meta::is_write_key_shape;
 use dionaea_spool::{Spool, SpoolError};
@@ -40,6 +40,9 @@ pub(crate) const KEY_HEADER: &str = "x-dionaea-key";
 pub(crate) const KEY_PARAM: &str = "key";
 
 type Clock = dyn Fn() -> u64 + Send + Sync;
+
+/// Distinct drop counts held before they are written early.
+const DROP_KEYS: usize = 20_000;
 
 /// How the endpoint is bounded.
 #[derive(Debug, Clone)]
@@ -61,6 +64,7 @@ pub(crate) struct Settings {
     pub(crate) client_address_header: String,
     pub(crate) dedup_capacity: usize,
     pub(crate) dedup_window: Duration,
+    pub(crate) drop_flush: Duration,
 }
 
 impl Default for Settings {
@@ -78,6 +82,7 @@ impl Default for Settings {
             client_address_header: "x-forwarded-for".to_owned(),
             dedup_capacity: 1_000_000,
             dedup_window: Duration::from_secs(600),
+            drop_flush: Duration::from_secs(5),
         }
     }
 }
@@ -101,6 +106,7 @@ impl Settings {
             client_address_header: tuning.client_address_header.clone(),
             dedup_capacity: tuning.dedup_capacity,
             dedup_window: tuning.dedup_window,
+            drop_flush: tuning.drop_flush,
         }
     }
 }
@@ -151,6 +157,7 @@ pub(crate) struct Collect {
     key_limiter: RateLimiter<String>,
     address_limiter: RateLimiter<IpAddr>,
     deduper: Deduper,
+    drops: DropAggregator,
     geo: Option<Arc<dyn CountryLookup>>,
     settings: Settings,
     clock: Box<Clock>,
@@ -183,6 +190,7 @@ impl Collect {
                 settings.tracked,
             ),
             deduper: Deduper::new(settings.dedup_capacity, window),
+            drops: DropAggregator::new(DROP_KEYS),
             geo: None,
             cache,
             spool,
@@ -197,6 +205,42 @@ impl Collect {
     pub(crate) fn with_country_lookup(mut self, lookup: Arc<dyn CountryLookup>) -> Self {
         self.geo = Some(lookup);
         self
+    }
+
+    /// Keeps the remembered event ids in a file as well, so a restart does not
+    /// forget them.
+    pub(crate) fn with_dedup_journal(mut self, path: &std::path::Path) -> std::io::Result<Self> {
+        let window = u64::try_from(self.settings.dedup_window.as_millis()).unwrap_or(u64::MAX);
+        self.deduper = Deduper::open(self.settings.dedup_capacity, window, path, (self.clock)())?;
+        Ok(self)
+    }
+
+    /// Makes the journal durable; the refresher calls it regularly.
+    pub(crate) fn sync_dedup(&self) -> std::io::Result<()> {
+        self.deduper.sync()
+    }
+
+    /// Writes the drop counts of requests that kept no event to the spool.
+    /// Counts that cannot be written stay for the next call.
+    pub(crate) fn flush_drops(&self) {
+        let rows = self.drops.take();
+        if rows.is_empty() {
+            return;
+        }
+        if let Err((error, rest)) = enqueue_drop_rows(&self.spool, rows) {
+            tracing::warn!(%error, "cannot write drop counts to the spool");
+            self.drops.restore(rest);
+        }
+    }
+
+    /// How often the refresher flushes drop counts.
+    pub(crate) fn drop_flush_every(&self) -> Duration {
+        self.settings.drop_flush
+    }
+
+    /// Whether enough distinct drop counts are held to flush them early.
+    pub(crate) fn drops_full(&self) -> bool {
+        self.drops.len() >= DROP_KEYS
     }
 
     /// How many event ids are remembered for the duplicate check.
@@ -530,6 +574,16 @@ fn store(
             Err(error) => return Outcome::Refused(error.as_str()),
         };
     let dropped: u64 = processed.drops.iter().map(|d| d.count).sum();
+    if processed.accepted.is_empty() {
+        // Nothing to make durable: only counts, merged and written every few
+        // seconds instead of one spool record per request.
+        collect.drops.add(admission.site_id, &processed.drops, now);
+        collect.counters.add_drops(&processed, 0);
+        return Outcome::Stored {
+            accepted: 0,
+            dropped,
+        };
+    }
     match enqueue(&collect.spool, &processed, admission.site_id, now) {
         Ok(stored) => {
             // Only now are the events durable, so only now may a retry of
@@ -922,10 +976,12 @@ mod tests {
     #[tokio::test]
     async fn a_full_spool_answers_503_with_retry_after() {
         let w = world(&[], Settings::default(), Some(4_000));
-        let batch = body(&[event(1, "checkout", json!({"items": 1}))]);
         let mut refused = None;
-        for _ in 0..200 {
-            let (status, headers, answer) = send(&w, post(Some(&w.key), batch.clone())).await;
+        for n in 0..200 {
+            // A different event each time: a repeated id would be dropped as a
+            // duplicate and never fill the spool.
+            let batch = body(&[event(n, "checkout", json!({"items": 1}))]);
+            let (status, headers, answer) = send(&w, post(Some(&w.key), batch)).await;
             if status == StatusCode::SERVICE_UNAVAILABLE {
                 refused = Some((headers, answer));
                 break;

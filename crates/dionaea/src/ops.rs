@@ -266,6 +266,12 @@ fn render(ops: &Ops) -> String {
                 stats.skipped_records(),
             ),
             (
+                "dionaea_batcher_duplicates_total",
+                "counter",
+                "Events left out because another node or batch already stored them.",
+                stats.duplicates(),
+            ),
+            (
                 "dionaea_batcher_failing",
                 "gauge",
                 "1 while the last insert failed.",

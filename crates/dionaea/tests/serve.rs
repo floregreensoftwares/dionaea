@@ -210,18 +210,14 @@ fn an_acknowledged_event_is_in_the_spool_after_the_server_is_killed() {
     let records = spool.read(100, usize::MAX).expect("read");
     assert_eq!(
         records.len(),
-        4,
-        "every acknowledged request is a durable record"
+        3,
+        "every request that kept an event is a durable record; the one that kept none only added to the drop counts held in memory"
     );
     let text: String = records
         .iter()
         .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
         .collect();
     assert!(text.contains("01890000-0000-7000-8000-000000000001"));
-    assert!(
-        text.contains("invalid_required_field"),
-        "the drop count rode with its request"
-    );
 }
 
 #[test]
@@ -320,7 +316,7 @@ fn the_operator_endpoints_report_health_readiness_and_what_happened() {
         ),
         1
     );
-    assert!(metric(&metrics, "dionaea_spool_appended_records_total") >= 4);
+    assert!(metric(&metrics, "dionaea_spool_appended_records_total") >= 3);
     assert_eq!(metric(&metrics, "dionaea_spool_failed "), 0);
     assert_eq!(
         metric(&metrics, "dionaea_clickhouse_ready "),
@@ -475,6 +471,84 @@ fn bots_and_retried_events_are_counted_and_not_stored_twice() {
         1
     );
     assert_eq!(metric(&metrics, "dionaea_dedup_remembered_ids "), 1);
+}
+
+#[test]
+fn requests_that_keep_no_event_do_not_cost_a_spool_record_each() {
+    let dir = dir("drop-only");
+    let key = bootstrap(&dir);
+    let server = server_with(&dir, &[("DROP_FLUSH_SECS", "2")]);
+    let records = |server: &Server| {
+        metric(
+            &server.ops("/metrics").1,
+            "dionaea_spool_appended_records_total",
+        )
+    };
+    let before = records(&server);
+    for n in 0..30 {
+        let (status, response) = server.request(
+            &format!("{}\r\nUser-Agent: Googlebot/2.1", collect_head(&key)),
+            &batch(n, 1),
+        );
+        assert_eq!(status, 202);
+        assert!(
+            response.contains("{\"accepted\":0,\"dropped\":1}"),
+            "{response}"
+        );
+    }
+    assert_eq!(
+        records(&server),
+        before,
+        "thirty bot requests wrote nothing"
+    );
+    let metrics = server.ops("/metrics").1;
+    assert_eq!(
+        metric(&metrics, "dionaea_events_dropped_total{reason=\"bot\"}"),
+        30
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while records(&server) == before {
+        assert!(Instant::now() < deadline, "the counts were never written");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        records(&server) - before <= 2,
+        "merged into one or two records"
+    );
+}
+
+#[test]
+fn a_retried_event_is_still_recognized_after_a_restart() {
+    let dir = dir("dedup-restart");
+    let key = bootstrap(&dir);
+    let same = batch(7, 1);
+    {
+        let server = server_with(&dir, &[]);
+        let first = server.request(&collect_head(&key), &same);
+        assert!(
+            first.1.contains("{\"accepted\":1,\"dropped\":0}"),
+            "{}",
+            first.1
+        );
+        // The journal is made durable every second.
+        std::thread::sleep(Duration::from_millis(1800));
+        drop(server);
+    }
+    let server = server_with(&dir, &[]);
+    let retry = server.request(&collect_head(&key), &same);
+    assert!(
+        retry.1.contains("{\"accepted\":0,\"dropped\":1}"),
+        "{}",
+        retry.1
+    );
+    assert_eq!(
+        metric(
+            &server.ops("/metrics").1,
+            "dionaea_events_dropped_total{reason=\"duplicate_event\"}"
+        ),
+        1
+    );
 }
 
 /// Against the ClickHouse of `compose.yaml` (`docker compose up -d`): the
@@ -645,5 +719,195 @@ fn events_reach_clickhouse_over_tls() {
     assert_eq!(
         metric(&untrusting.ops("/metrics").1, "dionaea_clickhouse_ready "),
         0
+    );
+}
+
+/// A database of its own on the ClickHouse of `compose.yaml`, dropped when the
+/// guard goes out of scope.
+struct ScratchDatabase {
+    admin: dionaea_store::Store,
+    name: String,
+}
+
+impl ScratchDatabase {
+    fn new(tag: &str) -> Self {
+        let name = format!("dionaea_serve_{tag}_{}", std::process::id());
+        let admin = Self::store("default");
+        admin
+            .raw_query(&format!("CREATE DATABASE {name}"))
+            .expect("create the database");
+        Self { admin, name }
+    }
+
+    fn store(database: &str) -> dionaea_store::Store {
+        let mut config = dionaea_store::Config::new("127.0.0.1", 8123, database);
+        config.user = "dionaea".to_owned();
+        config.password = "dionaea-dev".to_owned();
+        dionaea_store::Store::new(config).expect("a valid config")
+    }
+
+    fn number(&self, sql: &str) -> u64 {
+        Self::store(&self.name)
+            .raw_query(sql)
+            .map_or(0, |text| text.trim().parse().unwrap_or(0))
+    }
+
+    fn text(&self, sql: &str) -> String {
+        Self::store(&self.name)
+            .raw_query(sql)
+            .map(|text| text.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn wait_for(&self, what: &str, sql: &str, expected: u64) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.number(sql) != expected {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for ScratchDatabase {
+    fn drop(&mut self) {
+        let _ = self
+            .admin
+            .raw_query(&format!("DROP DATABASE IF EXISTS {}", self.name));
+    }
+}
+
+fn in_clickhouse(dir: &Path, database: &str) -> Command {
+    command_for(dir, "http://127.0.0.1:8123", Some(database))
+}
+
+/// Two servers with their own spools and one ClickHouse, as two replicas
+/// behind a balancer: a batch the SDK sent to one and then sent again to the
+/// other is stored once.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retry_that_lands_on_another_replica_is_stored_once() {
+    let database = ScratchDatabase::new("replicas");
+    let dir = dir("replicas");
+    let key = {
+        let run_here = |args: &[&str]| {
+            let output = in_clickhouse(&dir, &database.name)
+                .args(args)
+                .output()
+                .expect("run the binary");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_here(&["site", "create", "shop"]);
+        let schema = dir.join("schema.toml");
+        std::fs::write(&schema, SCHEMA).expect("write the schema");
+        run_here(&[
+            "schema",
+            "push",
+            "--site",
+            "1",
+            schema.to_str().expect("utf-8"),
+        ]);
+        run_here(&["key", "issue", "--site", "1"])
+    };
+
+    // The second replica shares the metadata and has a spool and an event id
+    // journal of its own.
+    let mut second_command = in_clickhouse(&dir, &database.name);
+    second_command.env("DIONAEA_SPOOL_DIR", dir.join("spool-b"));
+    let first = Server::start_with(in_clickhouse(&dir, &database.name));
+    let second = Server::start_with(second_command);
+
+    let events: Vec<String> = (0..3).map(|n| batch(n, 1)).collect();
+    for body in &events {
+        assert_eq!(first.request(&collect_head(&key), body).0, 202);
+    }
+    database.wait_for(
+        "the first replica",
+        "SELECT uniqExact(event_id) FROM events",
+        3,
+    );
+    database.wait_for("their ids", "SELECT count() FROM event_ids", 3);
+
+    // The retries reach the other replica, which has never seen them.
+    for body in &events {
+        let answer = second.request(&collect_head(&key), body);
+        assert!(
+            answer.1.contains("{\"accepted\":1,\"dropped\":0}"),
+            "{}",
+            answer.1
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while metric(
+        &second.ops("/metrics").1,
+        "dionaea_batcher_duplicates_total",
+    ) < 3
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the second replica never left them out"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(
+        database.number("SELECT count() FROM events"),
+        3,
+        "each event once"
+    );
+    assert_eq!(database.number("SELECT uniqExact(event_id) FROM events"), 3);
+}
+
+/// The enrichment end to end with MaxMind's own test database in
+/// `DIONAEA_TEST_GEOIP`: the country of the forwarded client address and the
+/// browser from the user agent are stored; the address is not.
+#[test]
+#[ignore = "needs ClickHouse and a MaxMind database in DIONAEA_TEST_GEOIP"]
+fn the_country_and_browser_of_a_client_are_stored_and_its_address_is_not() {
+    let geoip = std::env::var("DIONAEA_TEST_GEOIP").expect("DIONAEA_TEST_GEOIP names the file");
+    let database = ScratchDatabase::new("enrich");
+    let dir = dir("enrich");
+    let key = {
+        let run_here = |args: &[&str]| {
+            let output = in_clickhouse(&dir, &database.name)
+                .args(args)
+                .output()
+                .expect("run the binary");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        run_here(&["site", "create", "shop"]);
+        let schema = dir.join("schema.toml");
+        std::fs::write(&schema, SCHEMA).expect("write the schema");
+        run_here(&[
+            "schema",
+            "push",
+            "--site",
+            "1",
+            schema.to_str().expect("utf-8"),
+        ]);
+        run_here(&["key", "issue", "--site", "1"])
+    };
+    let mut command = in_clickhouse(&dir, &database.name);
+    command
+        .env("DIONAEA_GEOIP_PATH", &geoip)
+        .env("DIONAEA_TRUSTED_PROXY_HOPS", "1");
+    let server = Server::start_with(command);
+
+    let firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0";
+    let head = format!(
+        "{}\r\nX-Forwarded-For: 216.160.83.56\r\nUser-Agent: {firefox}",
+        collect_head(&key)
+    );
+    assert_eq!(server.request(&head, &batch(1, 1)).0, 202);
+    database.wait_for("the event", "SELECT count() FROM events", 1);
+    assert_eq!(
+        database.text("SELECT concat(country, '|', platform, '|', os, '|', browser, '|', device_class) FROM events"),
+        "US|web|linux|firefox|desktop"
+    );
+    let everything = database.text("SELECT toJSONString(tuple(*)) FROM events");
+    assert!(
+        !everything.contains("216.160.83.56"),
+        "the address is not stored: {everything}"
     );
 }
