@@ -5,10 +5,25 @@ use serde::Deserialize;
 
 const ENV_PREFIX: &str = "DIONAEA_";
 
+/// A secret that never shows in `Debug` output, so it cannot reach a log.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub(crate) struct Secret(pub(crate) String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<hidden>")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
     pub(crate) listen: SocketAddr,
     pub(crate) clickhouse_url: String,
+    pub(crate) clickhouse_user: String,
+    pub(crate) clickhouse_password: Secret,
+    pub(crate) clickhouse_database: String,
+    pub(crate) spool_dir: PathBuf,
+    pub(crate) spool_quota_bytes: u64,
     pub(crate) metadata_path: PathBuf,
     pub(crate) log_level: String,
     pub(crate) log_format: LogFormat,
@@ -43,6 +58,11 @@ impl std::error::Error for ConfigError {}
 struct FileConfig {
     listen: Option<String>,
     clickhouse_url: Option<String>,
+    clickhouse_user: Option<String>,
+    clickhouse_password: Option<String>,
+    clickhouse_database: Option<String>,
+    spool_dir: Option<PathBuf>,
+    spool_quota_bytes: Option<u64>,
     metadata_path: Option<PathBuf>,
     log_level: Option<String>,
     log_format: Option<LogFormat>,
@@ -80,6 +100,36 @@ impl Config {
             reason,
         })?;
 
+        let clickhouse_user = var("CLICKHOUSE_USER")
+            .or(file.clickhouse_user)
+            .unwrap_or_else(|| "default".to_owned());
+        let clickhouse_password = Secret(
+            var("CLICKHOUSE_PASSWORD")
+                .or(file.clickhouse_password)
+                .unwrap_or_default(),
+        );
+        let clickhouse_database = var("CLICKHOUSE_DATABASE")
+            .or(file.clickhouse_database)
+            .unwrap_or_else(|| "dionaea".to_owned());
+
+        let spool_dir = var("SPOOL_DIR")
+            .map(PathBuf::from)
+            .or(file.spool_dir)
+            .unwrap_or_else(|| PathBuf::from("spool"));
+        let spool_quota_bytes = match var("SPOOL_QUOTA_BYTES") {
+            Some(text) => text.parse().map_err(|_| ConfigError::Invalid {
+                key: "spool_quota_bytes",
+                reason: "expected a number of bytes".to_owned(),
+            })?,
+            None => file.spool_quota_bytes.unwrap_or(1 << 30),
+        };
+        if spool_quota_bytes < (1 << 20) {
+            return Err(ConfigError::Invalid {
+                key: "spool_quota_bytes",
+                reason: "at least 1048576 (1 MiB)".to_owned(),
+            });
+        }
+
         let metadata_path = var("METADATA_PATH")
             .map(PathBuf::from)
             .or(file.metadata_path)
@@ -106,6 +156,11 @@ impl Config {
         Ok(Self {
             listen,
             clickhouse_url,
+            clickhouse_user,
+            clickhouse_password,
+            clickhouse_database,
+            spool_dir,
+            spool_quota_bytes,
             metadata_path,
             log_level,
             log_format,
@@ -201,6 +256,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn spool_and_clickhouse_settings_have_defaults_and_overrides() {
+        let config = Config::resolve(None, no_env).unwrap();
+        assert_eq!(config.spool_dir, PathBuf::from("spool"));
+        assert_eq!(config.spool_quota_bytes, 1 << 30);
+        assert_eq!(config.clickhouse_user, "default");
+        assert_eq!(config.clickhouse_database, "dionaea");
+
+        let file = "spool_dir = \"/var/spool/d\"\nspool_quota_bytes = 5000000\nclickhouse_user = \"ingest\"\n";
+        let env = |name: &str| (name == "DIONAEA_SPOOL_QUOTA_BYTES").then(|| "7000000".to_owned());
+        let config = Config::resolve(Some(file), env).unwrap();
+        assert_eq!(config.spool_dir, PathBuf::from("/var/spool/d"));
+        assert_eq!(config.spool_quota_bytes, 7_000_000);
+        assert_eq!(config.clickhouse_user, "ingest");
+    }
+
+    #[test]
+    fn a_bad_or_tiny_spool_quota_is_a_typed_error() {
+        for value in ["abc", "-1", "1000"] {
+            let env = |name: &str| (name == "DIONAEA_SPOOL_QUOTA_BYTES").then(|| value.to_owned());
+            let error = Config::resolve(None, env).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::Invalid {
+                        key: "spool_quota_bytes",
+                        ..
+                    }
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clickhouse_password_never_shows_in_debug_output() {
+        let env = |name: &str| {
+            (name == "DIONAEA_CLICKHOUSE_PASSWORD").then(|| "hunter2-secret".to_owned())
+        };
+        let config = Config::resolve(None, env).unwrap();
+        assert_eq!(config.clickhouse_password.0, "hunter2-secret");
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("<hidden>"));
     }
 
     #[test]

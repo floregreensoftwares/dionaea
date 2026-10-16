@@ -8,9 +8,14 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn sigterm_stops_the_server_after_an_orderly_shutdown() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_dionaea"))
         .arg("serve")
         .env("DIONAEA_LISTEN", "127.0.0.1:0")
+        .env("DIONAEA_METADATA_PATH", dir.join("meta.db"))
+        .env("DIONAEA_SPOOL_DIR", dir.join("spool"))
         .env("DIONAEA_LOG_FORMAT", "json")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

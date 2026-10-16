@@ -108,6 +108,43 @@ order and the first failure names the reason:
 The schema guard then adds `unknown_event`, `too_many_properties` (for traits),
 `missing_required_field` and `invalid_required_field`.
 
+### Sending the request
+
+- **The write key** goes in the header `X-Dionaea-Key`, or in the query
+  parameter `key` for clients that cannot set headers (`navigator.sendBeacon`).
+  If both are present they must be equal, or the request is refused with 400.
+  The key is a public identifier: it ships inside apps and pages, and what
+  protects the endpoint is the schema, the limits and the origin list.
+- **The body** is JSON, sent as `application/json` or as `text/plain` (the type
+  `sendBeacon` uses); any other type is refused with 415.
+- **Origins.** A key that lists web origins is accepted only with an `Origin`
+  header that matches one of them. A key without origins (a native app) is
+  accepted with or without one. The answer to an admitted request carries
+  `Access-Control-Allow-Origin` with that origin and `Vary: Origin`. A
+  preflight `OPTIONS` request is answered with 204 only for a valid key and an
+  allowed origin.
+
+| Status | Body | When |
+|---|---|---|
+| 202 | `{"accepted":n,"dropped":m}` | The events are durable. `n` were kept and `m` were dropped (invalid, undeclared or out of the time window) |
+| 400 | `{"error":"<reason>"}` | The envelope is invalid (`not_json`, `not_an_object`, `invalid_field`, `too_many_events`) or the key was given twice with different values (`conflicting_keys`) |
+| 401 | `{"error":"unknown_key"}` | No key, a key of the wrong shape, an unknown key or a revoked one |
+| 403 | `{"error":"origin_not_allowed"}` | The key lists origins and the request's is not one |
+| 405 | `{"error":"method_not_allowed"}` | Not `POST` or `OPTIONS` |
+| 408 | `{"error":"body_timeout"}` | The body did not arrive in time |
+| 413 | `{"error":"body_too_large"}` | The body is over 256 KiB, by `Content-Length` or by what arrived |
+| 415 | `{"error":"unsupported_media_type"}` | The body type is not accepted |
+| 429 | `{"error":"rate_limited"}` and `Retry-After` | A limit per key or per client address was reached |
+| 503 | `{"error":"unavailable"}` and `Retry-After` | The server cannot make the events durable now (its queue is full or failing); keep the batch and retry |
+
+An SDK keeps a batch it could not deliver (network error, 408, 429, 503) and
+sends it again with the same `event_id`s; it drops a batch refused with 400,
+401, 403, 413 or 415, which retrying cannot fix.
+
+A kept event's time is corrected by the difference between the arrival time and
+`sent_at`; an event whose corrected time is more than 30 days in the past or
+one hour in the future is dropped.
+
 ## `POST /v1/identify`
 
 ```json

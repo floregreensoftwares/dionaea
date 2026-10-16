@@ -1,4 +1,4 @@
-mod clickhouse;
+mod collect;
 mod config;
 mod meta_cli;
 mod schema_cli;
