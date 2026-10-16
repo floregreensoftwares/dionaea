@@ -468,6 +468,62 @@ fn encode(
 mod tests {
     use super::*;
 
+    fn roles(ingest_user: &str, password: &str) -> Roles {
+        Roles {
+            ingest_user: ingest_user.to_owned(),
+            ingest_password: password.to_owned(),
+            query_user: "query_a".to_owned(),
+            query_password: "0123456789abcdef0123".to_owned(),
+        }
+    }
+
+    #[test]
+    fn passwords_must_be_safe_to_put_in_a_statement() {
+        for good in ["0123456789abcdef", "a.b_c~d-0123456789", &"x".repeat(128)] {
+            assert!(valid_secret(good), "{good}");
+        }
+        for bad in [
+            "",
+            "short",
+            "0123456789abcde",
+            "has space 0123456789",
+            "quote' 0123456789ab",
+            "back\\slash0123456789",
+            "semi;colon0123456789",
+            "é0123456789abcdef",
+            &"x".repeat(129),
+        ] {
+            assert!(!valid_secret(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn provisioning_rejects_bad_names_and_passwords_before_any_request() {
+        let mut config = Config::new("127.0.0.1", 1, "dionaea");
+        config.timeout = std::time::Duration::from_millis(200);
+        let store = Store::new(config).unwrap();
+        let good = "0123456789abcdef0123";
+        for roles in [
+            roles("bad name", good),
+            roles("ok_user", "short"),
+            roles("x; DROP USER y", good),
+            roles("ok_user", "quote'quote'quote'quote'"),
+        ] {
+            assert!(
+                matches!(store.provision_roles(&roles), Err(Error::InvalidName(_))),
+                "{roles:?}"
+            );
+        }
+        assert_eq!(store.connections_opened(), 0);
+    }
+
+    #[test]
+    fn roles_never_show_their_passwords() {
+        let shown = format!("{:?}", roles("ingest_a", "SECRET-0123456789abcdef"));
+        assert!(shown.contains("ingest_a"));
+        assert!(!shown.contains("SECRET"), "{shown}");
+    }
+
     #[test]
     fn identifiers_and_tokens_are_checked() {
         for good in ["dionaea", "_x", "a1_b2"] {
