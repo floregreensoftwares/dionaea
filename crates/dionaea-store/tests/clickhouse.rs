@@ -56,6 +56,15 @@ impl Scratch {
         scratch.store.migrate().expect("migrate");
         scratch
     }
+
+    /// Another handle to the same database, as a second node would have.
+    fn fresh(&self) -> Store {
+        let (host, port, user, password) = server();
+        let mut config = Config::new(host, port, &self.database);
+        config.user = user;
+        config.password = password;
+        Store::new(config).expect("a valid config")
+    }
 }
 
 impl Drop for Scratch {
@@ -115,7 +124,7 @@ fn migrate_creates_the_tables_and_is_idempotent() {
         .expect("tables");
     assert_eq!(
         tables.lines().collect::<Vec<_>>(),
-        vec!["_migrations", "drops_daily", "events"]
+        vec!["_migrations", "drops_daily", "event_ids", "events"]
     );
 }
 
@@ -156,7 +165,7 @@ fn two_nodes_migrating_at_once_both_succeed() {
             ))
             .expect("count")
             .trim(),
-        "3"
+        "4"
     );
     let _ = scratch
         .admin
@@ -548,7 +557,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 1);
+    assert_eq!(count(&scratch.store, "_migrations"), 2);
 }
 
 #[test]
@@ -639,4 +648,95 @@ fn lines_encoded_earlier_insert_the_same_rows_and_dedupe_by_token() {
             .trim(),
         "3"
     );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn recorded_ids_are_found_by_any_node_and_recording_twice_stores_them_once() {
+    let scratch = Scratch::new();
+    let a = "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e";
+    let b = "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6f";
+    let c = "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d70";
+    let lines = Store::encode_event_ids([(7, a), (8, b)], now_ms()).expect("encode");
+    scratch
+        .store
+        .insert_event_id_lines(&lines, "ids-1")
+        .expect("insert");
+    scratch
+        .store
+        .insert_event_id_lines(&lines, "ids-1")
+        .expect("retry");
+    assert_eq!(
+        count(&scratch.store, "event_ids"),
+        2,
+        "the retry stored nothing"
+    );
+
+    // Another handle (another node) sees them; the site is part of the key.
+    let other = scratch.fresh();
+    let known = other
+        .known_event_ids(&[(7, a), (7, b), (8, b), (8, c), (9, a)])
+        .expect("lookup");
+    let mut found: Vec<_> = known.into_iter().collect();
+    found.sort();
+    assert_eq!(found, [(7, a.to_owned()), (8, b.to_owned())]);
+    assert!(other.known_event_ids(&[]).expect("empty").is_empty());
+
+    // A lookup of the largest size works.
+    let many: Vec<(u32, String)> = (0..dionaea_store::MAX_IDS_PER_LOOKUP)
+        .map(|n| (u32::MAX, format!("0190f7e2-7c3e-7a52-9a0e-{n:012x}")))
+        .collect();
+    let keys: Vec<(u32, &str)> = many.iter().map(|(s, i)| (*s, i.as_str())).collect();
+    assert!(
+        other
+            .known_event_ids(&keys)
+            .expect("large lookup")
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_ingest_user_can_read_the_event_ids_and_nothing_else() {
+    let scratch = Scratch::new();
+    let roles = roles("ids");
+    let _cleanup = UsersGuard(
+        &scratch.admin,
+        vec![roles.ingest_user.clone(), roles.query_user.clone()],
+    );
+    scratch.store.provision_roles(&roles).expect("provision");
+    let ingest = user_store(
+        &scratch.database,
+        &roles.ingest_user,
+        &roles.ingest_password,
+    );
+    let id = "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e";
+    let lines = Store::encode_event_ids([(7, id)], now_ms()).expect("encode");
+    ingest
+        .insert_event_id_lines(&lines, "role-ids")
+        .expect("the ingest user records ids");
+    let known = ingest
+        .known_event_ids(&[(7, id)])
+        .expect("and looks them up");
+    assert!(known.contains(&(7, id.to_owned())));
+    for sql in [
+        "SELECT count() FROM events",
+        "ALTER TABLE event_ids DELETE WHERE 1",
+        "DROP TABLE event_ids",
+    ] {
+        let error = ingest.raw_query(sql).expect_err(sql);
+        assert!(denied(&error), "{sql}: {error:?}");
+    }
+}
+
+/// The current time in milliseconds. Recorded ids expire after a day (a TTL
+/// that ClickHouse also applies on insert), so these tests record "now".
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_millis(),
+    )
+    .expect("fits")
 }

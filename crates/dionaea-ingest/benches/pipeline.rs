@@ -5,7 +5,9 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use dionaea_ingest::{Admission, Cache, Limits, RateLimiter, enqueue, process};
+use dionaea_ingest::{
+    Admission, Cache, Deduper, Limits, RateLimiter, enqueue, parse_user_agent, process,
+};
 use dionaea_meta::{MetaStore, SqliteMeta};
 
 const SCHEMA: &str = r#"
@@ -72,6 +74,22 @@ fn batch(events: usize, valid: bool) -> Vec<u8> {
 }
 
 fn benches(c: &mut Criterion) {
+    let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    c.bench_function("user agent: a browser", |b| {
+        b.iter(|| black_box(parse_user_agent(black_box(chrome))));
+    });
+    c.bench_function("user agent: a crawler", |b| {
+        b.iter(|| {
+            black_box(parse_user_agent(black_box(
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            )))
+        });
+    });
+    let seen = Deduper::new(1_000_000, 600_000);
+    seen.remember(0..500_000u128, 0);
+    c.bench_function("duplicate check", |b| {
+        b.iter(|| black_box(seen.contains(black_box(250_000), 1_000)));
+    });
     let (cache, key, admission) = admission();
     c.bench_function("admit", |b| {
         b.iter(|| black_box(cache.admit(black_box(&key), Some("https://app.example"))));

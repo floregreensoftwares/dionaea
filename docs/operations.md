@@ -56,6 +56,8 @@ the status listed in `wire-format.md`.
 | `refresh_secs` | 2 | 1 to 3600 | How often keys and schemas are checked for changes; a revoked key stops working within this time |
 | `batch_max_records`, `batch_max_bytes`, `batch_min_interval_ms` | 1000, 8 MiB, 200 | 1 to 1000, 64 KiB to 64 MiB, 0 to 60000 | How events are grouped into ClickHouse inserts |
 | `dedup_capacity`, `dedup_window_secs` | 1000000, 600 (about 80 MB at the default capacity) | 0 to 100000000 (0 is off), 1 to 86400 | Event ids remembered to drop an event sent again |
+| `shared_dedup` | true | true or false | Ask ClickHouse which events another node stored, and record this node's ids |
+| `drop_flush_secs` | 5 | 1 to 300 | How often the drop counts of requests that kept no event are written |
 
 ## Behind a reverse proxy
 
@@ -70,13 +72,39 @@ reachable directly: a client could otherwise choose its own address.
 ## What is added to events
 
 The `User-Agent` header gives the platform, operating system, browser and
-device class. Requests from known automated clients (crawlers, headless
-browsers, command-line tools) are answered normally, but their events are
-counted as dropped with the reason `bot`. With `geoip_path` set, the country
-of the client address is stored. The address itself is used for the lookup and
-the rate limit and is never stored or logged.
+device class. The rules cover the common browsers and systems and use the
+woothee dataset for the long tail; an agent nobody recognizes gets empty
+fields, never a guess. Requests from known automated clients (crawlers,
+headless browsers, command-line tools) are answered normally, but their events
+are counted as dropped with the reason `bot`. With `geoip_path` set, the
+country of the client address is stored. The address itself is used for the
+lookup and the rate limit and is never stored or logged.
 
-An event whose id was already stored in the last `dedup_window_secs` on this
-node is dropped as `duplicate_event`, so an SDK can retry a batch after a lost
-response. The memory is per node and per process: a retry that reaches another
-replica, or arrives after a restart, is stored again.
+A request that kept no event (a crawler, a stale schema, a batch sent again)
+costs no spool write: its drop counts are merged in memory and written every
+`drop_flush_secs`. A crash loses the counts of that last interval, never an
+event.
+
+## Events sent twice
+
+An SDK that loses a response sends the batch again with the same event ids.
+Three layers keep the copy out of the tables:
+
+1. Each node remembers the ids it stored in the last `dedup_window_secs`
+   (up to `dedup_capacity`), in memory and in a journal next to the spool, so a
+   restart does not forget them. The id is remembered only after the request
+   is durable, so a request that failed with 503 can be sent again.
+2. Before each insert the batcher asks ClickHouse which of the batch's ids
+   another node already stored (table `event_ids`, one day of ids, no user or
+   device identifier), leaves those out, and records the ids of the events it
+   stores. This is what closes the gap between replicas. It costs one query
+   and one small insert per batch; a single node can turn it off with
+   `shared_dedup = false`.
+3. The insert itself carries a token made from the batch's position in the
+   spool, so a batch repeated after a failure is stored once.
+
+What remains is a race: the same event arriving at two replicas at the same
+moment, before either has recorded it, is stored twice. An SDK retry follows a
+timeout, so the usual gap between the copies is far longer than a batch
+interval. The ingest database user needs `SELECT` on `event_ids`; `dionaea`
+grants it when it creates the users.

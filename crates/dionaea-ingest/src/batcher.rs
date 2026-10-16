@@ -17,6 +17,7 @@
 //! still rejected is skipped and counted, so one poison request cannot block
 //! the queue forever.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -32,6 +33,17 @@ use crate::sink;
 pub trait Destination: Send + Sync + 'static {
     fn insert_event_lines(&self, lines: &str, token: &str) -> Result<(), Error>;
     fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error>;
+
+    /// Which of these (site, event id) pairs another node already stored.
+    /// The default knows none, which turns the cross-node check off.
+    fn known_event_ids(&self, _keys: &[(u32, &str)]) -> Result<HashSet<(u32, String)>, Error> {
+        Ok(HashSet::new())
+    }
+
+    /// Records the ids of events that were stored. The default records none.
+    fn insert_event_id_lines(&self, _lines: &str, _token: &str) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 impl Destination for Store {
@@ -41,6 +53,14 @@ impl Destination for Store {
 
     fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
         Store::insert_drop_lines(self, lines, token)
+    }
+
+    fn known_event_ids(&self, keys: &[(u32, &str)]) -> Result<HashSet<(u32, String)>, Error> {
+        Store::known_event_ids(self, keys)
+    }
+
+    fn insert_event_id_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        Store::insert_event_id_lines(self, lines, token)
     }
 }
 
@@ -58,6 +78,9 @@ pub struct BatcherConfig {
     /// The first wait after a transient failure; it doubles up to `backoff_max`.
     pub backoff_min: Duration,
     pub backoff_max: Duration,
+    /// Whether to leave out events another node already stored, and record
+    /// the ids of the ones this node stores, through the store.
+    pub shared_dedup: bool,
 }
 
 impl Default for BatcherConfig {
@@ -69,6 +92,7 @@ impl Default for BatcherConfig {
             poll: Duration::from_millis(50),
             backoff_min: Duration::from_millis(200),
             backoff_max: Duration::from_secs(30),
+            shared_dedup: true,
         }
     }
 }
@@ -81,6 +105,7 @@ pub struct BatcherStats {
     drop_rows: AtomicU64,
     retries: AtomicU64,
     skipped_records: AtomicU64,
+    duplicates: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -102,6 +127,12 @@ impl BatcherStats {
     /// Attempts repeated after a transient failure.
     pub fn retries(&self) -> u64 {
         self.retries.load(Ordering::Relaxed)
+    }
+
+    /// Events left out because another node, or an earlier batch, already
+    /// stored them.
+    pub fn duplicates(&self) -> u64 {
+        self.duplicates.load(Ordering::Relaxed)
     }
 
     /// Records, or the event or drop lines of a record, given up on:
@@ -270,11 +301,20 @@ enum Part {
 }
 
 fn token(records: &[Record], part: Part) -> String {
-    let (first, last) = (&records[0].id, &records[records.len() - 1].next);
     let suffix = match part {
         Part::Events => 'e',
         Part::Drops => 'd',
     };
+    positions(records, suffix)
+}
+
+/// The token under which the ids of a batch's events are recorded.
+fn ids_token(records: &[Record]) -> String {
+    positions(records, 'i')
+}
+
+fn positions(records: &[Record], suffix: char) -> String {
+    let (first, last) = (&records[0].id, &records[records.len() - 1].next);
     format!(
         "{}.{}-{}.{}-{suffix}",
         first.segment, first.offset, last.segment, last.offset
@@ -311,6 +351,104 @@ fn deliver(
     Delivered::Done
 }
 
+/// How an attempt that may be repeated ended.
+enum Attempt<T> {
+    Done(T),
+    /// The store refused it for good.
+    Permanent(Error),
+    /// The batcher was asked to stop while waiting to try again.
+    Stopped,
+}
+
+/// Runs `operation`, repeating transient failures with growing waits.
+fn retry<T>(
+    config: &BatcherConfig,
+    stop: &AtomicBool,
+    stats: &BatcherStats,
+    backoff: &mut Duration,
+    mut operation: impl FnMut() -> Result<T, Error>,
+) -> Attempt<T> {
+    loop {
+        match operation() {
+            Ok(value) => return Attempt::Done(value),
+            Err(error) if error.is_permanent() => return Attempt::Permanent(error),
+            Err(error) => {
+                stats.retries.fetch_add(1, Ordering::Relaxed);
+                stats.set_error(Some(error.to_string()));
+                pause(*backoff, stop);
+                *backoff = (*backoff * 2).min(config.backoff_max);
+                if stopped(stop) {
+                    return Attempt::Stopped;
+                }
+            }
+        }
+    }
+}
+
+/// Removes from `lines` the events another node already stored (their ids are
+/// in the store's table of recent ids) and the ones repeated inside the batch.
+/// Returns the lines to insert, the keys of those events (to record once they
+/// are stored) and how many were removed.
+/// What is left of a batch after the events stored elsewhere are removed.
+struct Filtered {
+    lines: String,
+    keys: Vec<(u32, String)>,
+    removed: u64,
+}
+
+fn remove_known(destination: &dyn Destination, lines: &str) -> Result<Filtered, Error> {
+    let entries: Vec<(&str, Option<(u32, &str)>)> = lines
+        .split_inclusive('\n')
+        .map(|line| (line, dionaea_store::event_key(line)))
+        .collect();
+
+    // The first occurrence of each key in this batch.
+    let mut first_seen: HashSet<(u32, String)> = HashSet::with_capacity(entries.len());
+    let mut unique: Vec<(u32, String)> = Vec::new();
+    for (_, key) in &entries {
+        if let Some((site, id)) = key {
+            let key = (*site, id.to_ascii_lowercase());
+            if first_seen.insert(key.clone()) {
+                unique.push(key);
+            }
+        }
+    }
+    let mut known: HashSet<(u32, String)> = HashSet::new();
+    for chunk in unique.chunks(dionaea_store::MAX_IDS_PER_LOOKUP) {
+        let asked: Vec<(u32, &str)> = chunk.iter().map(|(s, i)| (*s, i.as_str())).collect();
+        known.extend(destination.known_event_ids(&asked)?);
+    }
+
+    let mut kept = String::with_capacity(lines.len());
+    let mut kept_keys = Vec::new();
+    let mut taken: HashSet<(u32, String)> = HashSet::new();
+    let mut removed = 0;
+    for (line, key) in entries {
+        let Some((site, id)) = key else {
+            kept.push_str(line);
+            continue;
+        };
+        let key = (site, id.to_ascii_lowercase());
+        if known.contains(&key) || !taken.insert(key.clone()) {
+            removed += 1;
+            continue;
+        }
+        kept.push_str(line);
+        kept_keys.push(key);
+    }
+    Ok(Filtered {
+        lines: kept,
+        keys: kept_keys,
+        removed,
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn deliver_part(
     records: &[Record],
     part: Part,
@@ -332,48 +470,87 @@ fn deliver_part(
         return Delivered::Done;
     }
     let token = token(records, part);
-    loop {
-        let result = match part {
-            Part::Events => destination.insert_event_lines(&lines, &token),
-            Part::Drops => destination.insert_drop_lines(&lines, &token),
-        };
-        match result {
-            Ok(()) => {
-                stats.batches.fetch_add(1, Ordering::Relaxed);
-                let rows = match part {
-                    Part::Events => &stats.event_rows,
-                    Part::Drops => &stats.drop_rows,
-                };
-                rows.fetch_add(count_lines(&lines), Ordering::Relaxed);
-                stats.set_error(None);
-                *backoff = config.backoff_min;
-                return Delivered::Done;
+
+    // Events another node already stored are left out; a failure to ask is
+    // retried, never answered by inserting without looking. Only a request the
+    // store rejects for good lets the batch through unfiltered, since storing
+    // an event twice is better than losing it.
+    let (lines, keys) = if matches!(part, Part::Events) && config.shared_dedup {
+        match retry(config, stop, stats, backoff, || {
+            remove_known(destination, &lines)
+        }) {
+            Attempt::Done(filtered) => {
+                stats
+                    .duplicates
+                    .fetch_add(filtered.removed, Ordering::Relaxed);
+                (filtered.lines, filtered.keys)
             }
-            Err(error) if error.is_permanent() => {
+            Attempt::Permanent(error) => {
                 stats.set_error(Some(error.to_string()));
-                if records.len() > 1 {
-                    for record in records {
-                        let one = std::slice::from_ref(record);
-                        if let Delivered::Stopped =
-                            deliver_part(one, part, destination, config, stop, stats, backoff)
-                        {
-                            return Delivered::Stopped;
-                        }
+                (lines, Vec::new())
+            }
+            Attempt::Stopped => return Delivered::Stopped,
+        }
+    } else {
+        (lines, Vec::new())
+    };
+    if lines.is_empty() {
+        // Every event of the batch was already stored elsewhere.
+        stats.set_error(None);
+        return Delivered::Done;
+    }
+
+    let inserted = retry(config, stop, stats, backoff, || match part {
+        Part::Events => destination.insert_event_lines(&lines, &token),
+        Part::Drops => destination.insert_drop_lines(&lines, &token),
+    });
+    match inserted {
+        Attempt::Done(()) => {
+            stats.batches.fetch_add(1, Ordering::Relaxed);
+            let rows = match part {
+                Part::Events => &stats.event_rows,
+                Part::Drops => &stats.drop_rows,
+            };
+            rows.fetch_add(count_lines(&lines), Ordering::Relaxed);
+            stats.set_error(None);
+            *backoff = config.backoff_min;
+        }
+        Attempt::Permanent(error) => {
+            stats.set_error(Some(error.to_string()));
+            if records.len() > 1 {
+                for record in records {
+                    let one = std::slice::from_ref(record);
+                    if let Delivered::Stopped =
+                        deliver_part(one, part, destination, config, stop, stats, backoff)
+                    {
+                        return Delivered::Stopped;
                     }
-                } else {
-                    stats.skipped_records.fetch_add(1, Ordering::Relaxed);
                 }
-                return Delivered::Done;
+            } else {
+                stats.skipped_records.fetch_add(1, Ordering::Relaxed);
             }
-            Err(error) => {
-                stats.retries.fetch_add(1, Ordering::Relaxed);
-                stats.set_error(Some(error.to_string()));
-                pause(*backoff, stop);
-                *backoff = (*backoff * 2).min(config.backoff_max);
-                if stopped(stop) {
-                    return Delivered::Stopped;
-                }
+            return Delivered::Done;
+        }
+        Attempt::Stopped => return Delivered::Stopped,
+    }
+
+    // Record the ids only now that the events are stored: an id recorded
+    // earlier would make the retry of an unstored event look like a duplicate.
+    if !keys.is_empty() {
+        let ids =
+            Store::encode_event_ids(keys.iter().map(|(site, id)| (*site, id.as_str())), now_ms());
+        let ids_token = ids_token(records);
+        // Retried like any insert, but an id that cannot be recorded for good
+        // only loses the cross-node check for these events.
+        if let Ok(ids) = ids {
+            match retry(config, stop, stats, backoff, || {
+                destination.insert_event_id_lines(&ids, &ids_token)
+            }) {
+                Attempt::Stopped => return Delivered::Stopped,
+                Attempt::Permanent(error) => stats.set_error(Some(error.to_string())),
+                Attempt::Done(()) => {}
             }
         }
     }
+    Delivered::Done
 }

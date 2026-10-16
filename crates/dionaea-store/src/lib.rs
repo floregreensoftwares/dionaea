@@ -21,12 +21,13 @@ mod migrations;
 mod rows;
 mod time;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use rows::{DropRow, EventRow};
+pub use rows::{DropRow, EventRow, event_key};
 
 /// Most rows one insert call accepts.
 pub const MAX_ROWS_PER_INSERT: usize = 100_000;
@@ -387,6 +388,9 @@ impl Store {
             ),
             format!("GRANT INSERT ON {database}.events TO {ingest}"),
             format!("GRANT INSERT ON {database}.drops_daily TO {ingest}"),
+            // The ids of recent events, so a node can tell that another stored
+            // an event it is about to insert. Only that table is readable.
+            format!("GRANT INSERT, SELECT ON {database}.event_ids TO {ingest}"),
             format!(
                 "CREATE USER IF NOT EXISTS {query} IDENTIFIED WITH sha256_password BY '{}'",
                 roles.query_password
@@ -435,6 +439,52 @@ impl Store {
         self.insert("events", &lines, token)
     }
 
+    /// The lines recording that these events were stored at `seen_ms`, for
+    /// [`insert_event_id_lines`](Self::insert_event_id_lines). Each key is a
+    /// site id and the canonical text of an event id.
+    pub fn encode_event_ids<'a>(
+        keys: impl IntoIterator<Item = (u32, &'a str)>,
+        seen_ms: u64,
+    ) -> Result<String, Error> {
+        let seen = time::format_datetime(seen_ms);
+        let mut out = String::new();
+        for (site, id) in keys {
+            if !rows::is_uuid(id) {
+                return Err(Error::InvalidRow(
+                    "the event id is not a canonical UUID".to_owned(),
+                ));
+            }
+            out.push_str(&format!(
+                "{{\"site_id\":{site},\"event_id\":\"{id}\",\"seen_at\":\"{seen}\"}}\n"
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Records event ids as stored. The same `token` twice stores them once.
+    pub fn insert_event_id_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
+        self.insert("event_ids", lines, token)
+    }
+
+    /// Which of these (site, event id) pairs were already recorded by any
+    /// node. At most [`MAX_IDS_PER_LOOKUP`] at a time.
+    pub fn known_event_ids(&self, keys: &[(u32, &str)]) -> Result<HashSet<(u32, String)>, Error> {
+        if keys.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let sql = known_ids_sql(keys)?;
+        let answer = self.execute(&sql)?;
+        let mut known = HashSet::with_capacity(keys.len().min(1024));
+        for line in answer.lines() {
+            if let Some((site, id)) = line.split_once('\t')
+                && let Ok(site) = site.parse()
+            {
+                known.insert((site, id.trim().to_owned()));
+            }
+        }
+        Ok(known)
+    }
+
     /// Inserts daily counts of dropped events.
     pub fn insert_drops(&self, rows: &[DropRow], token: &str) -> Result<(), Error> {
         let lines = encode(rows.iter().map(DropRow::to_json_line), rows.len())?;
@@ -465,6 +515,36 @@ impl Store {
     pub fn raw_query(&self, sql: &str) -> Result<String, Error> {
         self.execute(sql)
     }
+}
+
+/// The most ids one [`Store::known_event_ids`] call takes.
+/// Kept under the 256 KiB `max_query_size` a ClickHouse server allows by
+/// default: each id is about 53 characters in the statement.
+pub const MAX_IDS_PER_LOOKUP: usize = 4_000;
+
+/// The statement that looks up `keys`. Every id is checked to be a canonical
+/// UUID before it is written into the text, and a site id is a number, so no
+/// part of it comes from outside unchecked.
+fn known_ids_sql(keys: &[(u32, &str)]) -> Result<String, Error> {
+    if keys.len() > MAX_IDS_PER_LOOKUP {
+        return Err(Error::TooManyRows);
+    }
+    let mut sql = String::from(
+        "SELECT site_id, toString(event_id) FROM event_ids WHERE (site_id, event_id) IN (",
+    );
+    for (index, (site, id)) in keys.iter().enumerate() {
+        if !rows::is_uuid(id) {
+            return Err(Error::InvalidRow(
+                "the event id is not a canonical UUID".to_owned(),
+            ));
+        }
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({site},'{id}')"));
+    }
+    sql.push(')');
+    Ok(sql)
 }
 
 fn encode(
@@ -681,3 +761,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod id_tests;

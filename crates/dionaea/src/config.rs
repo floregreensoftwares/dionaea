@@ -59,6 +59,13 @@ pub(crate) struct Tuning {
     /// for how long. 0 turns the check off.
     pub(crate) dedup_capacity: usize,
     pub(crate) dedup_window: Duration,
+    /// Whether the batcher leaves out events another node already stored, and
+    /// records the ids of the ones it stores, in ClickHouse. A single node can
+    /// turn it off to save one query and one insert per batch.
+    pub(crate) shared_dedup: bool,
+    /// How often the drop counts of requests that kept no event are written
+    /// to the spool. A crash loses the counts of the last interval.
+    pub(crate) drop_flush: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +153,8 @@ struct FileConfig {
     client_address_header: Option<String>,
     dedup_capacity: Option<usize>,
     dedup_window_secs: Option<u64>,
+    shared_dedup: Option<bool>,
+    drop_flush_secs: Option<u64>,
 }
 
 /// Reads one setting: the environment first, then the file, then the default;
@@ -437,6 +446,22 @@ impl Config {
                 |v| (1..=86_400).contains(v),
                 "from 1 to 86400 seconds",
             )?),
+            shared_dedup: source.pick(
+                "SHARED_DEDUP",
+                "shared_dedup",
+                file.shared_dedup,
+                true,
+                |_| true,
+                "true or false",
+            )?,
+            drop_flush: seconds(source.pick(
+                "DROP_FLUSH_SECS",
+                "drop_flush_secs",
+                file.drop_flush_secs,
+                5,
+                |v| (1..=300).contains(v),
+                "from 1 to 300 seconds",
+            )?),
         };
 
         let log_level = source.text("LOG_LEVEL", file.log_level, "info");
@@ -632,7 +657,8 @@ mod tests {
                     max_connections = 77\nheader_timeout_secs = 4\nrefresh_secs = 7\n\
                     batch_max_records = 10\nbatch_max_bytes = 100000\nbatch_min_interval_ms = 0\n\
                     trusted_proxy_hops = 2\nclient_address_header = \"x-real-ip\"\n\
-                    dedup_capacity = 0\ndedup_window_secs = 5\n";
+                    dedup_capacity = 0\ndedup_window_secs = 5\nshared_dedup = false\n\
+                    drop_flush_secs = 9\n";
         let t = Config::resolve(Some(file), no_env).unwrap().tuning;
         assert_eq!((t.key_rate_per_sec, t.key_burst), (1000.5, 2000.0));
         assert_eq!((t.address_rate_per_sec, t.address_burst), (5.0, 10.0));
@@ -646,12 +672,15 @@ mod tests {
         assert_eq!(t.refresh_every, Duration::from_secs(7));
         assert_eq!((t.batch_max_records, t.batch_max_bytes), (10, 100_000));
         assert_eq!(t.batch_min_interval, Duration::ZERO);
+        assert!(!t.shared_dedup);
+        assert_eq!(t.drop_flush, Duration::from_secs(9));
         assert_eq!(t.trusted_proxy_hops, 2);
         assert_eq!(t.client_address_header, "x-real-ip");
         assert_eq!(
             (t.dedup_capacity, t.dedup_window),
             (0, Duration::from_secs(5))
         );
+        assert_eq!(t.drop_flush, Duration::from_secs(9));
 
         for (name, key, bad) in [
             ("KEY_RATE_PER_SEC", "key_rate_per_sec", "0"),
@@ -677,6 +706,8 @@ mod tests {
             ),
             ("DEDUP_CAPACITY", "dedup_capacity", "999999999"),
             ("DEDUP_WINDOW_SECS", "dedup_window_secs", "0"),
+            ("DROP_FLUSH_SECS", "drop_flush_secs", "0"),
+            ("SHARED_DEDUP", "shared_dedup", "sometimes"),
         ] {
             let leaked: &'static str = Box::leak(bad.to_owned().into_boxed_str());
             assert_eq!(
