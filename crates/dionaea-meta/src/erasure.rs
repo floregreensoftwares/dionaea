@@ -82,6 +82,8 @@ pub struct ErasureRequest {
     /// For a request that names a device instead of a user: the device id,
     /// until the request is complete. Such a request has no `user_id`.
     pub device_id: Option<String>,
+    /// The request is for a device, not a user (also after it is complete).
+    pub is_device: bool,
     /// The tombstone hash of the user id (or of the device id for a request
     /// that names a device): the audit record of who was erased.
     pub user_hash: String,
@@ -102,6 +104,14 @@ pub struct ErasureRequest {
     pub attempts: u32,
     /// Seconds since the epoch before which it is not tried again.
     pub retry_after: Option<i64>,
+}
+
+impl ErasureRequest {
+    /// Whether the request has lost track of whom it is for: neither a user id
+    /// nor a device id is left to delete under.
+    pub fn names_nobody(&self) -> bool {
+        self.user_id.is_none() && self.device_id.is_none()
+    }
 }
 
 /// Who an erasure request is for.

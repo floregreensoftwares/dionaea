@@ -430,11 +430,7 @@ fn erasure_line(request: &ErasureRequest) -> String {
         request.anon_count,
         request.user_hash,
         request.attempts,
-        if request.device_id.is_some() {
-            "device"
-        } else {
-            "user"
-        },
+        if request.is_device { "device" } else { "user" },
     )
 }
 

@@ -12,7 +12,8 @@ use crate::sqlite::{bump, id_of, storage};
 use crate::{MAX_LABEL_LEN, MetaError};
 
 const COLUMNS: &str = "id, site_id, user_id, user_hash, state, requested_by, requested_at,
-    hidden_at, completed_at, anon_count, detail, attempts, retry_after, failed_at, device_id";
+    hidden_at, completed_at, anon_count, detail, attempts, retry_after, failed_at, device_id,
+    is_device";
 
 fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)> {
     Ok((
@@ -32,6 +33,7 @@ fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)>
             retry_after: row.get(12)?,
             failed_at: row.get(13)?,
             device_id: row.get(14)?,
+            is_device: row.get(15)?,
         },
     ))
 }
@@ -50,6 +52,7 @@ struct ErasureRequestRest {
     retry_after: Option<i64>,
     failed_at: Option<i64>,
     device_id: Option<String>,
+    is_device: bool,
 }
 
 fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaError> {
@@ -59,6 +62,7 @@ fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaEr
         site_id: id_of(site_id)?,
         user_id: rest.user_id,
         device_id: rest.device_id,
+        is_device: rest.is_device,
         user_hash: rest.user_hash,
         state: ErasureState::parse(&rest.state)
             .ok_or_else(|| MetaError::Corrupt(format!("unknown erasure state `{}`", rest.state)))?,
@@ -127,6 +131,11 @@ fn tombstone(
             ],
         )
         .map_err(storage)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO erasure_keys (key_check) VALUES (?1)",
+        [key.check()],
+    )
+    .map_err(storage)?;
     Ok(added > 0)
 }
 
@@ -152,7 +161,7 @@ pub(crate) fn use_key<'a>(
 /// configured, as the current key or a previous one.
 pub(crate) fn check_keys(tx: &Transaction<'_>, keys: &HashKeys) -> Result<(), MetaError> {
     let mut statement = tx
-        .prepare("SELECT DISTINCT key_check FROM erasure_tombstones")
+        .prepare("SELECT key_check FROM erasure_keys")
         .map_err(storage)?;
     let used: Vec<String> = statement
         .query_map([], |row| row.get(0))
@@ -220,17 +229,20 @@ pub(crate) fn request(
     }
     let key = use_key(tx, keys)?;
     let hash = key.tombstone_hash(site_id, kind, id_text);
-    let open: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM erasure_requests
-             WHERE site_id = ?1 AND user_hash = ?2 AND state IN ('requested', 'hidden')",
-            params![site_id, hash],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(storage)?;
-    if let Some(id) = open {
-        return get(tx, u64::try_from(id).unwrap_or(0));
+    // A request made before the key was replaced is under the old key's hash.
+    for earlier in keys.all() {
+        let open: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM erasure_requests
+                 WHERE site_id = ?1 AND user_hash = ?2 AND state IN ('requested', 'hidden')",
+                params![site_id, earlier.tombstone_hash(site_id, kind, id_text)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some(id) = open {
+            return get(tx, u64::try_from(id).unwrap_or(0));
+        }
     }
     let (user, device) = match subject {
         ErasureSubject::User(id) => (Some(id), None),
@@ -238,9 +250,10 @@ pub(crate) fn request(
     };
     tx.execute(
         "INSERT INTO erasure_requests
-             (site_id, user_id, device_id, user_hash, state, requested_by, requested_at)
-         VALUES (?1, ?2, ?3, ?4, 'requested', ?5, ?6)",
-        params![site_id, user, device, hash, by, at],
+             (site_id, user_id, device_id, is_device, user_hash, state, requested_by,
+              requested_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?7)",
+        params![site_id, user, device, device.is_some(), hash, by, at],
     )
     .map_err(storage)?;
     let id = u64::try_from(tx.last_insert_rowid())

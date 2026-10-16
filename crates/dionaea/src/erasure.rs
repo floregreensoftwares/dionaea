@@ -377,7 +377,7 @@ impl Job {
         // A request names a user (and through them the devices ever linked
         // to them) or one device.
         let user = request.user_id.clone();
-        if user.is_none() && request.device_id.is_none() {
+        if request.names_nobody() {
             self.fail(request.id, "the request names neither a user nor a device");
             return true;
         }
@@ -477,7 +477,7 @@ impl Job {
         let mut ready = Vec::with_capacity(taken.len());
         for (request, anons) in taken {
             let user = request.user_id.clone();
-            if user.is_none() && request.device_id.is_none() {
+            if request.names_nobody() {
                 self.fail(request.id, "the request names neither a user nor a device");
                 continue;
             }
@@ -1152,7 +1152,7 @@ mod tests {
                 second.set(Some(
                     w.meta.request_erasure(w.site, "u2", "ops").unwrap().id,
                 ));
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(1_000));
             }
             true
         });

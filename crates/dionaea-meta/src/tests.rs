@@ -1782,3 +1782,102 @@ fn a_failed_device_request_can_be_retried_while_the_device_is_remembered() {
     assert_eq!(retried.state, ErasureState::Requested);
     assert_eq!(retried.device_id.as_deref(), Some("dev_c"));
 }
+
+// Fixes found in review.
+
+#[test]
+fn a_device_request_still_says_it_is_for_a_device_after_it_completes_or_is_purged() {
+    let (store, _) = clocked();
+    let site = site(&store);
+    let done = store
+        .request_device_erasure(site.id, "dev_a", "ops")
+        .unwrap();
+    assert!(done.is_device);
+    store
+        .advance_erasure(done.id, ErasureState::Hidden, None)
+        .unwrap();
+    let complete = store
+        .advance_erasure(done.id, ErasureState::Complete, None)
+        .unwrap();
+    assert!(complete.is_device && complete.device_id.is_none());
+
+    let failed = store
+        .request_device_erasure(site.id, "dev_b", "ops")
+        .unwrap();
+    store
+        .advance_erasure(failed.id, ErasureState::Failed, None)
+        .unwrap();
+    store.purge_failed_erasures(i64::MAX).unwrap();
+    assert!(store.erasure_request(failed.id).unwrap().is_device);
+
+    let user = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    assert!(!user.is_device);
+    assert!(!user.names_nobody() && complete.names_nobody());
+}
+
+#[test]
+fn asking_again_after_the_key_was_replaced_finds_the_request_made_under_the_old_key() {
+    let dir = std::env::temp_dir().join(format!("dionaea-meta-reask-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meta.db");
+    let (site_id, first) = {
+        let store = reopened(&path, Some(SECRET));
+        let site = site(&store);
+        let first = store.request_erasure(site.id, "u_1", "ops").unwrap();
+        let device = store
+            .request_device_erasure(site.id, "dev_1", "ops")
+            .unwrap();
+        (site.id, (first.id, device.id))
+    };
+    let rotated = SqliteMeta::open(&path)
+        .unwrap()
+        .with_hash_key(new_key())
+        .with_previous_keys(vec![key()]);
+    assert_eq!(
+        rotated.request_erasure(site_id, "u_1", "x").unwrap().id,
+        first.0
+    );
+    assert_eq!(
+        rotated
+            .request_device_erasure(site_id, "dev_1", "x")
+            .unwrap()
+            .id,
+        first.1
+    );
+    assert_eq!(
+        rotated.erasure_requests(None).unwrap().len(),
+        2,
+        "no duplicates"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_keys_in_use_are_listed_apart_so_that_checking_them_reads_no_tombstone() {
+    let dir = std::env::temp_dir().join(format!("dionaea-meta-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meta.db");
+    {
+        let store = reopened(&path, Some(SECRET));
+        let site = site(&store);
+        let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+        let devices: Vec<String> = (0..50).map(|n| format!("d{n}")).collect();
+        store.add_erasure_anons(request.id, &devices).unwrap();
+    }
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let count = |table: &str| -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        (count("erasure_keys"), count("erasure_tombstones")),
+        (1, 51),
+        "one key however many tombstones"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
