@@ -180,3 +180,37 @@ pub(crate) fn decode(payload: &[u8]) -> Option<Lines<'_>> {
         drops: std::str::from_utf8(drops).ok()?,
     })
 }
+
+/// Rows of drop counts per record, so a large flush stays well under the
+/// record limit.
+const DROP_ROWS_PER_RECORD: usize = 5_000;
+
+/// Writes drop counts (no events) to the spool, in as many records as needed.
+/// Returns how many rows were written. If an append fails, the rows of the
+/// records not yet written are returned with the error so the caller can keep
+/// them.
+pub fn enqueue_drop_rows(
+    spool: &Spool,
+    rows: Vec<DropRow>,
+) -> Result<usize, (SpoolError, Vec<DropRow>)> {
+    let mut written = 0;
+    let mut rest = rows;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(DROP_ROWS_PER_RECORD));
+        let lines = match Store::encode_drops(&rest) {
+            Ok(lines) => lines,
+            // A count the store cannot take is lost, not retried forever.
+            Err(_) => {
+                rest = tail;
+                continue;
+            }
+        };
+        if let Err(error) = spool.append(record("", &lines)) {
+            rest.extend(tail);
+            return Err((error, rest));
+        }
+        written += rest.len();
+        rest = tail;
+    }
+    Ok(written)
+}

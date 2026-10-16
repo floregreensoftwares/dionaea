@@ -102,6 +102,13 @@ struct Fake {
     attempts: Mutex<Vec<String>>,
     stored_events: Mutex<Vec<String>>,
     stored_drops: Mutex<Vec<String>>,
+    /// The ids other nodes (and this one) recorded as stored.
+    known: Mutex<HashSet<(u32, String)>>,
+    lookups_to_fail: AtomicUsize,
+    lookup_rejected: std::sync::atomic::AtomicBool,
+    ids_rejected: std::sync::atomic::AtomicBool,
+    /// What happened to the store, in order: `events`, `ids`.
+    log: Mutex<Vec<&'static str>>,
 }
 
 impl Fake {
@@ -153,7 +160,50 @@ impl Fake {
 
 impl Destination for Fake {
     fn insert_event_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
-        self.insert(lines, token, &self.stored_events)
+        self.insert(lines, token, &self.stored_events)?;
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push("events");
+        Ok(())
+    }
+
+    fn known_event_ids(&self, keys: &[(u32, &str)]) -> Result<HashSet<(u32, String)>, Error> {
+        if self
+            .lookups_to_fail
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Error::Io("lookup down".to_owned()));
+        }
+        if self.lookup_rejected.load(Ordering::Relaxed) {
+            return Err(Error::InvalidRow("lookup rejected".to_owned()));
+        }
+        let known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(keys
+            .iter()
+            .map(|(site, id)| (*site, (*id).to_owned()))
+            .filter(|key| known.contains(key))
+            .collect())
+    }
+
+    fn insert_event_id_lines(&self, lines: &str, _token: &str) -> Result<(), Error> {
+        if self.ids_rejected.load(Ordering::Relaxed) {
+            return Err(Error::InvalidRow("ids rejected".to_owned()));
+        }
+        let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
+        for line in lines.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).expect("a json line");
+            known.insert((
+                u32::try_from(value["site_id"].as_u64().expect("a site")).expect("fits"),
+                value["event_id"].as_str().expect("an id").to_owned(),
+            ));
+        }
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push("ids");
+        Ok(())
     }
 
     fn insert_drop_lines(&self, lines: &str, token: &str) -> Result<(), Error> {
@@ -534,4 +584,251 @@ fn the_largest_valid_request_is_always_one_record() {
         .collect();
     let done = enqueue(&spool, &request(events, 3), 7, NOW).unwrap();
     assert_eq!((done.events, done.records), (100, 1));
+}
+
+#[test]
+fn drop_rows_become_records_with_only_drop_lines_and_reach_the_destination() {
+    let dir = spool_dir("drop-rows");
+    let spool = open(&dir);
+    let rows: Vec<dionaea_store::DropRow> = (0..7)
+        .map(|n| dionaea_store::DropRow {
+            site_id: 7,
+            event_name: format!("e{n}"),
+            reason: "bot".to_owned(),
+            at_ms: NOW,
+            count: 2,
+        })
+        .collect();
+    assert_eq!(enqueue_drop_rows(&spool, rows).unwrap(), 7);
+    let records = spool.read(10, usize::MAX).unwrap();
+    assert_eq!(records.len(), 1);
+    let lines = sink::decode(&records[0].payload).unwrap();
+    assert!(lines.events.is_empty());
+    assert_eq!(lines.drops.lines().count(), 7);
+
+    spool.rewind();
+    let fake = Arc::new(Fake::default());
+    let batcher = start(&spool, &fake);
+    wait_for("the drop rows", || batcher.stats().drop_rows() == 7);
+    assert_eq!(batcher.stats().event_rows(), 0);
+    batcher.stop();
+    assert_eq!(fake.stored_drops.lock().unwrap().len(), 7);
+}
+
+#[test]
+fn drop_rows_that_cannot_be_written_come_back_to_the_caller() {
+    let dir = spool_dir("drop-rows-full");
+    let mut config = SpoolConfig::new(&dir);
+    config.sync = false;
+    config.quota_bytes = 600;
+    config.segment_bytes = 300;
+    let spool = Spool::open(config).unwrap();
+    let rows: Vec<dionaea_store::DropRow> = (0..40_000)
+        .map(|n| dionaea_store::DropRow {
+            site_id: 7,
+            event_name: format!("event_{n}"),
+            reason: "bot".to_owned(),
+            at_ms: NOW,
+            count: 1,
+        })
+        .collect();
+    let (error, rest) = enqueue_drop_rows(&spool, rows).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            dionaea_spool::SpoolError::Full | dionaea_spool::SpoolError::TooLarge
+        ),
+        "{error:?}"
+    );
+    assert!(!rest.is_empty(), "nothing is lost");
+}
+
+// Events another node already stored.
+
+fn same_event(n: u32) -> Processed {
+    request(vec![accepted(n, 1)], 0)
+}
+
+fn keys_of(fake: &Fake) -> Vec<(u32, String)> {
+    let mut keys: Vec<_> = fake
+        .known
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn an_event_another_node_already_stored_is_left_out() {
+    let (dir_a, dir_b) = (spool_dir("node-a"), spool_dir("node-b"));
+    let (spool_a, spool_b) = (open(&dir_a), open(&dir_b));
+    // The same event reached two nodes (an SDK retry through a balancer).
+    enqueue(&spool_a, &same_event(1), 7, NOW).unwrap();
+    enqueue(&spool_b, &same_event(1), 7, NOW).unwrap();
+    enqueue(&spool_b, &same_event(2), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+
+    let first = start(&spool_a, &store);
+    wait_for("node a", || first.stats().event_rows() == 1);
+    first.stop();
+    assert_eq!(keys_of(&store).len(), 1, "its id is recorded");
+
+    let second = start(&spool_b, &store);
+    wait_for("node b", || second.stats().duplicates() == 1);
+    wait_for("node b to drain", || second.stats().event_rows() == 1);
+    second.stop();
+    assert_eq!(store.events().len(), 2, "event 1 once, event 2 once");
+    assert_eq!(keys_of(&store).len(), 2);
+    drop((spool_a, spool_b));
+    assert_eq!(
+        pending(&dir_b),
+        0,
+        "the duplicate was confirmed, not left behind"
+    );
+}
+
+#[test]
+fn the_same_event_twice_in_one_batch_is_stored_once() {
+    let dir = spool_dir("in-batch");
+    let spool = open(&dir);
+    enqueue(&spool, &same_event(5), 7, NOW).unwrap();
+    enqueue(&spool, &same_event(5), 7, NOW).unwrap();
+    enqueue(&spool, &same_event(6), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    let batcher = start(&spool, &store);
+    wait_for("the rows", || batcher.stats().event_rows() >= 2);
+    let stats = batcher.stats_handle();
+    batcher.stop();
+    assert_eq!(store.events().len(), 2);
+    assert_eq!(stats.duplicates(), 1);
+}
+
+#[test]
+fn ids_are_recorded_only_after_the_events_are_stored() {
+    let dir = spool_dir("order");
+    let spool = open(&dir);
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    store.transient_failures.store(3, Ordering::SeqCst);
+    let batcher = start(&spool, &store);
+    wait_for("the rows", || batcher.stats().event_rows() == 1);
+    wait_for("the ids", || keys_of(&store).len() == 1);
+    batcher.stop();
+    let log = store.log.lock().unwrap().clone();
+    assert_eq!(
+        log,
+        ["events", "ids"],
+        "no id was recorded for the failed attempts"
+    );
+}
+
+#[test]
+fn a_failed_lookup_is_retried_and_never_answered_by_inserting_blindly() {
+    let dir = spool_dir("lookup-retry");
+    let spool = open(&dir);
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    // The event is already stored elsewhere, but the lookup fails three times.
+    store
+        .known
+        .lock()
+        .unwrap()
+        .insert((7, "01890000-0000-7000-8000-000000000001".to_owned()));
+    store.lookups_to_fail.store(3, Ordering::SeqCst);
+    let batcher = start(&spool, &store);
+    wait_for("the duplicate", || batcher.stats().duplicates() == 1);
+    let stats = batcher.stats_handle();
+    batcher.stop();
+    assert!(
+        store.events().is_empty(),
+        "nothing was inserted while the lookup failed"
+    );
+    assert!(stats.retries() >= 3);
+}
+
+#[test]
+fn a_lookup_the_store_rejects_for_good_lets_the_batch_through() {
+    let dir = spool_dir("lookup-rejected");
+    let spool = open(&dir);
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    store.lookup_rejected.store(true, Ordering::Relaxed);
+    let batcher = start(&spool, &store);
+    wait_for("the row", || batcher.stats().event_rows() == 1);
+    batcher.stop();
+    assert_eq!(
+        store.events().len(),
+        1,
+        "an event stored twice beats one lost"
+    );
+}
+
+#[test]
+fn ids_that_cannot_be_recorded_for_good_do_not_lose_or_block_events() {
+    let dir = spool_dir("ids-rejected");
+    let spool = open(&dir);
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    enqueue(&spool, &same_event(2), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    store.ids_rejected.store(true, Ordering::Relaxed);
+    let batcher = start(&spool, &store);
+    wait_for("the rows", || batcher.stats().event_rows() == 2);
+    batcher.stop();
+    assert_eq!(store.events().len(), 2);
+    drop(spool);
+    assert_eq!(pending(&dir), 0);
+}
+
+#[test]
+fn with_the_shared_check_off_every_event_is_inserted() {
+    let dir = spool_dir("shared-off");
+    let spool = open(&dir);
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    store
+        .known
+        .lock()
+        .unwrap()
+        .insert((7, "01890000-0000-7000-8000-000000000001".to_owned()));
+    let config = BatcherConfig {
+        shared_dedup: false,
+        ..fast()
+    };
+    let batcher = Batcher::start(
+        spool.clone(),
+        Arc::clone(&store) as Arc<dyn Destination>,
+        config,
+    )
+    .expect("thread");
+    wait_for("the row", || batcher.stats().event_rows() == 1);
+    let stats = batcher.stats_handle();
+    batcher.stop();
+    assert_eq!(stats.duplicates(), 0);
+    assert_eq!(
+        store.log.lock().unwrap().as_slice(),
+        ["events"],
+        "no ids recorded either"
+    );
+}
+
+#[test]
+fn a_site_is_part_of_the_key() {
+    let dir = spool_dir("sites");
+    let spool = open(&dir);
+    let mut other_site = accepted(1, 1);
+    other_site.site_id = 8;
+    enqueue(&spool, &same_event(1), 7, NOW).unwrap();
+    enqueue(&spool, &request(vec![other_site], 0), 8, NOW).unwrap();
+    let store = Arc::new(Fake::default());
+    let batcher = start(&spool, &store);
+    wait_for("the rows", || batcher.stats().event_rows() == 2);
+    batcher.stop();
+    assert_eq!(
+        store.events().len(),
+        2,
+        "the same id under two sites is two events"
+    );
 }

@@ -17,9 +17,10 @@ use std::path::Path;
 /// Longest user agent looked at, in bytes; the rest is ignored.
 const MAX_USER_AGENT: usize = 512;
 
-/// Tokens that mark automated clients. Matched case-insensitively.
+/// Tokens that mark automated clients, matched case-insensitively. A bare
+/// `bot` is not one of them: it appears inside the names of phones (`Cubot`),
+/// so `bot` counts only where it ends a product name.
 const BOT_TOKENS: &[&str] = &[
-    "bot",
     "crawler",
     "spider",
     "slurp",
@@ -35,25 +36,67 @@ const BOT_TOKENS: &[&str] = &[
     "curl/",
     "wget/",
     "libwww",
-    "httpclient",
     "scrapy",
-    "monitor",
+];
+
+/// Where `bot` ends a product name: `Googlebot/2.1`, `(bingbot;`, `_bot_`.
+const BOT_ENDINGS: &[&str] = &[
+    "bot/", "bot;", "bot)", "bot,", "bot+", "-bot", "_bot", "/bot", "bots",
 ];
 
 /// What a user agent says, as short fixed names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UserAgent {
     /// `web`, `ios` or `android`; empty when unknown.
-    pub platform: &'static str,
-    pub os: &'static str,
-    pub browser: &'static str,
+    pub platform: String,
+    pub os: String,
+    pub browser: String,
     /// `phone`, `tablet` or `desktop`; empty when unknown.
-    pub device_class: &'static str,
+    pub device_class: String,
     pub bot: bool,
 }
 
 fn has(haystack: &str, needle: &str) -> bool {
     haystack.contains(needle)
+}
+
+/// A product name as a short lowercase identifier.
+fn identifier(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().take(48) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    out.trim_end_matches('_').chars().take(32).collect()
+}
+
+fn browser_from(name: &str) -> String {
+    match identifier(name).as_str() {
+        "internet_explorer" => "ie".to_owned(),
+        "samsung_browser" | "samsung_internet" | "samsungbrowser" => "samsung".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn os_from(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("windows phone") {
+        "windows_phone".to_owned()
+    } else if lower.starts_with("windows") {
+        "windows".to_owned()
+    } else if lower.starts_with("mac") {
+        "macos".to_owned()
+    } else if ["iphone", "ipad", "ipod", "ios"]
+        .iter()
+        .any(|ios| lower.starts_with(ios))
+    {
+        "ios".to_owned()
+    } else {
+        identifier(name)
+    }
 }
 
 /// Reads a `User-Agent` header value.
@@ -62,17 +105,27 @@ pub fn parse_user_agent(user_agent: &str) -> UserAgent {
     while !user_agent.is_char_boundary(end) {
         end -= 1;
     }
-    let lower = user_agent[..end].to_ascii_lowercase();
+    let original = &user_agent[..end];
+    let lower = original.to_ascii_lowercase();
     let ua = lower.as_str();
     if ua.is_empty() {
         return UserAgent::default();
     }
-    let bot = BOT_TOKENS.iter().any(|token| has(ua, token));
+
+    // The rules below name the common cases; the woothee dataset adds the long
+    // tail of crawlers, browsers and systems.
+    let known = woothee::parser::Parser::new().parse(original);
+    let crawler = known.as_ref().is_some_and(|r| r.category == "crawler");
+    let bot = crawler
+        || BOT_TOKENS.iter().any(|token| has(ua, token))
+        || BOT_ENDINGS.iter().any(|ending| has(ua, ending));
 
     let os = if has(ua, "android") {
         "android"
     } else if has(ua, "iphone") || has(ua, "ipad") || has(ua, "ipod") || has(ua, "cfnetwork") {
         "ios"
+    } else if has(ua, "windows phone") {
+        "windows_phone"
     } else if has(ua, "windows") {
         "windows"
     } else if has(ua, "mac os x") || has(ua, "macintosh") {
@@ -105,6 +158,30 @@ pub fn parse_user_agent(user_agent: &str) -> UserAgent {
         ""
     };
 
+    // A browser the dataset names more specifically (Vivaldi, UC Browser) wins
+    // over the generic "chrome" or "safari" the rules fall back on; the
+    // system is only filled in when the rules found none.
+    let mut browser = browser.to_owned();
+    let mut os = os.to_owned();
+    if let Some(result) = known
+        .as_ref()
+        .filter(|r| r.browser_type == "browser" && r.category != "crawler")
+    {
+        let named = browser_from(result.name);
+        if !named.is_empty() && named != "unknown" {
+            let generic = matches!(named.as_str(), "chrome" | "safari");
+            if browser.is_empty() || !generic {
+                browser = named;
+            }
+        }
+        if os.is_empty() {
+            let named = os_from(result.os);
+            if !named.is_empty() && named != "unknown" {
+                os = named;
+            }
+        }
+    }
+
     let platform = if !browser.is_empty() {
         "web"
     } else if has(ua, "okhttp") || has(ua, "dalvik") {
@@ -122,17 +199,17 @@ pub fn parse_user_agent(user_agent: &str) -> UserAgent {
     } else if has(ua, "android") {
         // Android phones say "Mobile"; tablets do not.
         "tablet"
-    } else if matches!(os, "windows" | "macos" | "linux" | "chromeos") {
+    } else if matches!(os.as_str(), "windows" | "macos" | "linux" | "chromeos") {
         "desktop"
     } else {
         ""
     };
 
     UserAgent {
-        platform,
+        platform: platform.to_owned(),
         os,
         browser,
-        device_class,
+        device_class: device_class.to_owned(),
         bot,
     }
 }
@@ -214,10 +291,10 @@ impl Enrichment {
             .unwrap_or_default();
         Self {
             country,
-            platform: parsed.platform.to_owned(),
-            os: parsed.os.to_owned(),
-            browser: parsed.browser.to_owned(),
-            device_class: parsed.device_class.to_owned(),
+            platform: parsed.platform,
+            os: parsed.os,
+            browser: parsed.browser,
+            device_class: parsed.device_class,
             bot: parsed.bot,
         }
     }

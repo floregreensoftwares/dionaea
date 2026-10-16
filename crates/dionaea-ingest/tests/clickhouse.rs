@@ -264,3 +264,49 @@ fn an_outage_loses_nothing_and_the_spool_drains_when_clickhouse_returns() {
         "nothing was stored twice"
     );
 }
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retry_that_reaches_another_node_is_stored_once() {
+    let scratch = Scratch::new();
+    let (cache, key) = site();
+    let (spool_a, _dir_a) = spool("node-a");
+    let (spool_b, _dir_b) = spool("node-b");
+
+    // The SDK sent this batch to node A, lost the answer and sent it again; the
+    // balancer chose node B. Each node has its own memory, spool and batcher.
+    let batch = [
+        event(1, "checkout", json!({"items": 1})),
+        event(2, "checkout", json!({"items": 2})),
+    ];
+    collect(&cache, &key, &spool_a, &batch);
+    let a = Batcher::start(spool_a.clone(), Arc::new(scratch.store()), fast()).expect("thread");
+    wait_for("node a", || {
+        scratch.number("SELECT count() FROM events") == 2
+            && scratch.number("SELECT count() FROM event_ids") == 2
+    });
+
+    collect(&cache, &key, &spool_b, &batch);
+    collect(
+        &cache,
+        &key,
+        &spool_b,
+        &[event(3, "checkout", json!({"items": 3}))],
+    );
+    let b = Batcher::start(spool_b.clone(), Arc::new(scratch.store()), fast()).expect("thread");
+    wait_for("node b", || {
+        scratch.number("SELECT count() FROM events") == 3
+    });
+    wait_for("node b to confirm", || b.stats().duplicates() == 2);
+    wait_for("node b to drain", || b.stats().event_rows() == 1);
+    a.stop();
+    b.stop();
+
+    assert_eq!(
+        scratch.number("SELECT uniqExact(event_id) FROM events"),
+        3,
+        "each event once, although event 1 and 2 reached two nodes"
+    );
+    assert_eq!(scratch.number("SELECT count() FROM events"), 3);
+    assert_eq!(scratch.number("SELECT count() FROM event_ids"), 3);
+}

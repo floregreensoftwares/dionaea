@@ -58,7 +58,7 @@ fn the_memory_never_passes_its_capacity() {
 
 // The user agent.
 
-fn ua(text: &str) -> (&'static str, &'static str, &'static str, &'static str, bool) {
+fn ua(text: &str) -> (String, String, String, String, bool) {
     let parsed = parse_user_agent(text);
     (
         parsed.platform,
@@ -67,6 +67,21 @@ fn ua(text: &str) -> (&'static str, &'static str, &'static str, &'static str, bo
         parsed.device_class,
         parsed.bot,
     )
+}
+
+fn same(agent: &str, expected: (&str, &str, &str, &str, bool)) {
+    let (platform, os, browser, device_class, bot) = ua(agent);
+    assert_eq!(
+        (
+            platform.as_str(),
+            os.as_str(),
+            browser.as_str(),
+            device_class.as_str(),
+            bot
+        ),
+        expected,
+        "{agent}"
+    );
 }
 
 #[test]
@@ -114,16 +129,16 @@ fn common_browsers_and_systems_are_named() {
         ),
     ];
     for (agent, expected) in cases {
-        assert_eq!(ua(agent), expected, "{agent}");
+        same(agent, expected);
     }
 }
 
 #[test]
 fn native_http_stacks_give_a_platform_and_no_browser() {
-    assert_eq!(ua("okhttp/4.12.0"), ("android", "", "", "", false));
-    assert_eq!(
-        ua("MyApp/1.0 CFNetwork/1494.0.7 Darwin/23.4.0"),
-        ("ios", "ios", "", "", false)
+    same("okhttp/4.12.0", ("android", "", "", "", false));
+    same(
+        "MyApp/1.0 CFNetwork/1494.0.7 Darwin/23.4.0",
+        ("ios", "ios", "", "", false),
     );
 }
 
@@ -441,4 +456,264 @@ fn an_invalid_duplicate_is_counted_for_its_own_reason_not_as_a_duplicate() {
         ),
         1
     );
+}
+
+// The journal.
+
+fn journal_path(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("dionaea-dedup-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("dedup.journal")
+}
+
+#[test]
+fn remembered_ids_survive_a_restart() {
+    let path = journal_path("restart");
+    {
+        let seen = Deduper::open(100, 1_000_000, &path, 0).unwrap();
+        seen.remember([1, 2, 3], 10);
+        seen.sync().unwrap();
+        // No orderly shutdown needed beyond the sync: the file is what counts.
+        std::mem::forget(seen);
+    }
+    let again = Deduper::open(100, 1_000_000, &path, 500).unwrap();
+    assert!(again.contains(1, 500) && again.contains(2, 500) && again.contains(3, 500));
+    assert_eq!(again.len(), 3);
+}
+
+#[test]
+fn expired_ids_and_ids_over_capacity_are_not_loaded() {
+    let path = journal_path("expired");
+    {
+        let seen = Deduper::open(100, 1_000, &path, 0).unwrap();
+        seen.remember([1], 0);
+        seen.remember([2], 900);
+        seen.remember([3], 950);
+        seen.sync().unwrap();
+    }
+    let later = Deduper::open(100, 1_000, &path, 1_500).unwrap();
+    assert!(!later.contains(1, 1_500), "expired while down");
+    assert!(later.contains(2, 1_500) && later.contains(3, 1_500));
+
+    let small = Deduper::open(1, 1_000, &path, 1_500).unwrap();
+    assert_eq!(small.len(), 1);
+    assert!(small.contains(3, 1_500), "the newest is kept");
+}
+
+#[test]
+fn a_torn_last_record_and_a_missing_file_are_harmless() {
+    let path = journal_path("torn");
+    std::fs::write(&path, [0u8; 24 * 2 + 7]).unwrap();
+    let seen = Deduper::open(10, 1_000_000, &path, 0).unwrap();
+    assert!(seen.len() <= 2, "{}", seen.len());
+    let fresh = Deduper::open(10, 1_000, &journal_path("missing"), 0).unwrap();
+    assert!(fresh.is_empty());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len() % 24,
+        0,
+        "rewritten whole"
+    );
+}
+
+#[test]
+fn the_journal_is_rewritten_before_it_grows_without_bound() {
+    let path = journal_path("compact");
+    let seen = Deduper::open(10, u64::MAX, &path, 0).unwrap();
+    for n in 0..1_000u128 {
+        seen.remember([n], n as u64);
+        if n % 25 == 0 {
+            seen.sync().unwrap();
+        }
+    }
+    seen.sync().unwrap();
+    let records = std::fs::metadata(&path).unwrap().len() / 24;
+    assert!(
+        records <= 10 * 2 + 25,
+        "{records} records for a capacity of 10"
+    );
+    drop(seen);
+    let again = Deduper::open(10, u64::MAX, &path, 2_000).unwrap();
+    assert_eq!(again.len(), 10);
+    assert!(again.contains(999, 2_000) && !again.contains(0, 2_000));
+}
+
+#[test]
+fn a_memory_without_a_journal_syncs_to_nothing() {
+    let seen = Deduper::new(10, 1_000);
+    seen.remember([1], 0);
+    seen.sync().unwrap();
+    assert_eq!(seen.len(), 1);
+    let off = Deduper::open(0, 1_000, &journal_path("off"), 0).unwrap();
+    off.sync().unwrap();
+}
+
+// Drop counts of requests that kept no event.
+
+fn counts(reason: Reason, name: &str, count: u64) -> DropCount {
+    DropCount {
+        event_name: name.to_owned(),
+        reason,
+        count,
+    }
+}
+
+#[test]
+fn drop_counts_are_merged_by_site_event_reason_and_day() {
+    let day = 86_400_000;
+    let aggregator = DropAggregator::new(100);
+    let bot = Reason::Bot;
+    aggregator.add(
+        1,
+        &[counts(bot, "checkout", 2), counts(bot, "screen", 1)],
+        day + 5,
+    );
+    aggregator.add(1, &[counts(bot, "checkout", 3)], day + 9);
+    aggregator.add(2, &[counts(bot, "checkout", 4)], day + 9);
+    aggregator.add(1, &[counts(bot, "checkout", 1)], 2 * day);
+    assert_eq!(aggregator.len(), 4);
+    let mut rows = aggregator.take();
+    rows.sort_by(|a, b| {
+        (a.site_id, &a.event_name, a.at_ms).cmp(&(b.site_id, &b.event_name, b.at_ms))
+    });
+    let summary: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.site_id,
+                r.event_name.as_str(),
+                r.reason.as_str(),
+                r.at_ms,
+                r.count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (1, "checkout", "bot", day, 5),
+            (1, "checkout", "bot", 2 * day, 1),
+            (1, "screen", "bot", day, 1),
+            (2, "checkout", "bot", day, 4),
+        ]
+    );
+    assert!(aggregator.is_empty(), "taking empties it");
+}
+
+#[test]
+fn restored_rows_are_added_back_and_a_full_table_asks_for_a_flush() {
+    let aggregator = DropAggregator::new(2);
+    assert!(!aggregator.add(1, &[counts(Reason::Bot, "a", 1)], 0));
+    assert!(
+        aggregator.add(1, &[counts(Reason::Duplicate, "a", 1)], 0),
+        "two keys reach the bound"
+    );
+    let rows = aggregator.take();
+    aggregator.add(1, &[counts(Reason::Bot, "a", 5)], 0);
+    aggregator.restore(rows);
+    let mut rows = aggregator.take();
+    rows.sort_by(|a, b| a.reason.cmp(&b.reason));
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.reason.as_str(), r.count))
+            .collect::<Vec<_>>(),
+        [("bot", 6), ("duplicate_event", 1)]
+    );
+}
+
+// The wider dataset and the bot rules.
+
+#[test]
+fn a_harmless_agent_with_a_bot_like_word_is_not_a_bot() {
+    for agent in [
+        "Mozilla/5.0 (Linux; Android 11; CUBOT X30) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 11; CUBOT_X30) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+        "MyApp/2 Apache-HttpClient/4.5.13 (Java/17)",
+        "MyApp/3 monitor-widget/1.0 CFNetwork/1494.0.7 Darwin/23.4.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36 Abbott-Portal",
+    ] {
+        assert!(!parse_user_agent(agent).bot, "{agent}");
+    }
+}
+
+#[test]
+fn crawlers_the_dataset_knows_are_bots_even_without_a_telltale_word() {
+    for agent in [
+        "Mozilla/5.0 (compatible; MJ12bot/v1.4.8; http://mj12bot.com/)",
+        "Mozilla/5.0 (compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)",
+        "Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)",
+        "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+        "Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
+    ] {
+        assert!(parse_user_agent(agent).bot, "{agent}");
+    }
+}
+
+#[test]
+fn a_browser_the_rules_do_not_know_is_named_by_the_dataset() {
+    same(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Vivaldi/6.8",
+        ("web", "windows", "vivaldi", "desktop", false),
+    );
+    let phone = parse_user_agent(
+        "Mozilla/5.0 (Windows Phone 10.0; Android 6.0.1; Microsoft; Lumia 950) AppleWebKit/537.36 Chrome/52.0 Mobile Safari/537.36 Edge/15.15254",
+    );
+    assert_eq!(phone.browser, "edge");
+    assert_eq!(phone.device_class, "phone");
+    let long_tail = parse_user_agent(
+        "Mozilla/5.0 (X11; U; Linux x86_64; en-US) AppleWebKit/533 (KHTML, like Gecko) Midori/0.5 Safari/533",
+    );
+    assert_eq!(
+        (long_tail.platform.as_str(), long_tail.os.as_str()),
+        ("web", "linux")
+    );
+    assert!(!long_tail.browser.is_empty(), "the dataset names it");
+}
+
+#[test]
+fn names_from_the_dataset_stay_short_lowercase_identifiers() {
+    for agent in [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36 Vivaldi/6.8",
+        "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Trident/5.0)",
+        "Mozilla/5.0 (X11; U; Linux x86_64; en-US) AppleWebKit/533 (KHTML, like Gecko) Midori/0.5 Safari/533",
+    ] {
+        let parsed = parse_user_agent(agent);
+        for field in [&parsed.browser, &parsed.os, &parsed.platform] {
+            assert!(field.len() <= 32, "{field}");
+            assert!(
+                field
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{field}"
+            );
+        }
+    }
+}
+
+/// MaxMind's own test database (`GeoIP2-Country-Test.mmdb` from the
+/// MaxMind-DB repository), not kept in this repository: the path comes from
+/// `DIONAEA_TEST_GEOIP`, and CI downloads the file.
+#[test]
+#[ignore = "needs a MaxMind database in DIONAEA_TEST_GEOIP"]
+fn a_database_made_by_maxmind_gives_countries_for_v4_and_v6_addresses() {
+    let path = std::env::var("DIONAEA_TEST_GEOIP").expect("DIONAEA_TEST_GEOIP names the file");
+    let lookup = MaxMind::open(std::path::Path::new(&path)).expect("a real database");
+    for (address, country) in [
+        ("2001:218::1", Some("JP")),
+        ("2001:250::1", Some("CN")),
+        ("2a02:ff00::1", Some("IT")),
+        ("81.2.69.142", Some("GB")),
+        ("89.160.20.112", Some("SE")),
+        ("216.160.83.56", Some("US")),
+        ("10.0.0.1", None),
+        ("2001:db8::1", None),
+    ] {
+        let address: IpAddr = address.parse().unwrap();
+        assert_eq!(lookup.country(address).as_deref(), country, "{address}");
+    }
+    let mapped: IpAddr = "::ffff:81.2.69.142".parse().unwrap();
+    let _ = lookup.country(mapped); // an IPv4-mapped address must not panic
+    let enrichment =
+        Enrichment::of_request(None, Some("216.160.83.56".parse().unwrap()), Some(&lookup));
+    assert_eq!(enrichment.country, "US");
 }
