@@ -38,6 +38,10 @@ fn json_value() -> impl Strategy<Value = Value> {
                 Just('\u{3164}'),
                 Just('\u{00a0}'),
                 Just('\u{2800}'),
+                Just('\u{034f}'),
+                Just('\u{17b4}'),
+                Just('\u{180b}'),
+                Just('\u{fe0f}'),
                 Just('\u{1f600}'),
                 Just('a'),
                 Just(' '),
@@ -169,10 +173,19 @@ proptest! {
                     let invisible = text.chars().any(|c| {
                         matches!(
                             c,
-                            '\u{202e}' | '\u{200b}' | '\u{3164}' | '\u{00a0}' | '\u{2800}'
+                            '\u{202e}'
+                                | '\u{200b}'
+                                | '\u{3164}'
+                                | '\u{00a0}'
+                                | '\u{2800}'
+                                | '\u{034f}'
+                                | '\u{17b4}'
+                                | '\u{180b}'
                         )
                     });
                     prop_assert!(!invisible);
+                    // Variation selectors survive, but never as the whole value.
+                    prop_assert!(!text.chars().all(|c| matches!(u32::from(c), 0xFE00..=0xFE0F)));
                 }
                 ("u", FieldValue::Unit(number)) => {
                     prop_assert!((0.0..=1.0).contains(number));

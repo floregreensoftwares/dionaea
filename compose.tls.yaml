@@ -1,0 +1,10 @@
+# Adds an HTTPS port (127.0.0.1:8443) to the development ClickHouse. Make the
+# certificates first with scripts/gen-dev-certs.sh, then:
+#   docker compose -f compose.yaml -f compose.tls.yaml up -d --wait
+services:
+  clickhouse:
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./.dev-certs:/etc/clickhouse-server/tls:ro
+      - ./docker/clickhouse/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro
