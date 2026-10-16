@@ -18,6 +18,9 @@ workspace = true
 dionaea-core = { path = "../dionaea-core" }
 getrandom = "0.4.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Tombstone hashes of erased identifiers: SHA-256 only, no unsafe, pure Rust.
+# Invariant: the hash input is fixed (prefix, kind, site, id) so every node agrees.
+sha2 = "0.11.1"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

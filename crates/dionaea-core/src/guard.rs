@@ -219,7 +219,7 @@ fn is_unsafe_char(c: char) -> bool {
 }
 
 /// The shape of an `id` value: `[A-Za-z0-9_.:-]`, 1 to 64 characters.
-pub(crate) fn is_id(text: &str) -> bool {
+pub fn is_id(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_ID_LEN
         && text

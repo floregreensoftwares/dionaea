@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use config::{Config, LogFormat};
-use dionaea_meta::{MetaStore, SqliteMeta};
+use dionaea_meta::{ErasureState, MetaStore, SqliteMeta};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -50,6 +50,11 @@ enum Command {
     Settings {
         #[command(subcommand)]
         command: SettingsCommand,
+    },
+    /// Erase every trace of a user: ask for it, follow it, retry a failure
+    Erase {
+        #[command(subcommand)]
+        command: EraseCommand,
     },
 }
 
@@ -110,6 +115,45 @@ enum SiteCommand {
     },
     /// List sites as id, name and organization
     List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum EraseCommand {
+    /// Ask for a user of a site to be erased; prints the request. From this
+    /// moment the server drops anything of that user.
+    Request {
+        #[arg(long)]
+        site: u32,
+        /// The user id the app sent to identify
+        #[arg(long)]
+        user: String,
+        /// Who is asking, for the audit trail
+        #[arg(long, default_value = "cli")]
+        by: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List requests: id, site, state, requested by, requested at, hidden at,
+    /// completed at, devices, hash of the user id
+    List {
+        /// Only requests in this state: requested, hidden, complete or failed
+        #[arg(long)]
+        state: Option<String>,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Show one request and what the job reported about it
+    Show {
+        id: u64,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Put a failed request back to be tried again
+    Retry {
+        id: u64,
         #[command(flatten)]
         store: StoreArgs,
     },
@@ -214,6 +258,42 @@ fn main() -> ExitCode {
         Command::Site { command } => site(command),
         Command::Key { command } => key(command),
         Command::Settings { command } => settings_command(command),
+        Command::Erase { command } => erase(command),
+    }
+}
+
+fn erase(command: EraseCommand) -> ExitCode {
+    match command {
+        EraseCommand::Request {
+            site,
+            user,
+            by,
+            store,
+        } => with_store(&store, |meta, out, err| {
+            meta_cli::erase_request(meta, site, &user, &by, out, err)
+        }),
+        EraseCommand::List { state, store } => with_store(&store, |meta, out, err| {
+            let state = match state.as_deref() {
+                None => None,
+                Some(text) => match ErasureState::parse(text) {
+                    Some(state) => Some(state),
+                    None => {
+                        let _ = writeln!(
+                            err,
+                            "error: `{text}` is not a state; use requested, hidden, complete or failed"
+                        );
+                        return meta_cli::REFUSED;
+                    }
+                },
+            };
+            meta_cli::erase_list(meta, state, out, err)
+        }),
+        EraseCommand::Show { id, store } => with_store(&store, |meta, out, err| {
+            meta_cli::erase_show(meta, id, out, err)
+        }),
+        EraseCommand::Retry { id, store } => with_store(&store, |meta, out, err| {
+            meta_cli::erase_retry(meta, id, out, err)
+        }),
     }
 }
 

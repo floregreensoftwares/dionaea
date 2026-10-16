@@ -14,7 +14,7 @@ mod wire;
 
 pub use builtin::reserved_event_names;
 pub use diff::{Change, ChangeKind, Severity, diff, is_breaking};
-pub use guard::{DropReason, Dropped, FieldValue, Guarded};
+pub use guard::{DropReason, Dropped, FieldValue, Guarded, is_id};
 pub use json_schema::schema_file_json_schema;
 pub use name::{EnumValue, InvalidEnumValue, InvalidName, MAX_NAME_LEN, Name};
 pub use parse::{Diagnostic, MAX_DIAGNOSTICS, MAX_SOURCE_LEN, parse_schema};

@@ -68,4 +68,39 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 3,
+        name: "erasure",
+        sql: "
+        -- A request to erase a user. `user_id` is cleared when it completes;
+        -- `user_hash` stays as the audit record of who was erased.
+        CREATE TABLE erasure_requests (
+            id           INTEGER PRIMARY KEY,
+            site_id      INTEGER NOT NULL REFERENCES sites(id),
+            user_id      TEXT,
+            user_hash    TEXT NOT NULL,
+            state        TEXT NOT NULL
+                         CHECK (state IN ('requested', 'hidden', 'complete', 'failed')),
+            requested_by TEXT NOT NULL,
+            requested_at INTEGER NOT NULL,
+            hidden_at    INTEGER,
+            completed_at INTEGER,
+            anon_count   INTEGER NOT NULL DEFAULT 0,
+            detail       TEXT,
+            claimed_by   TEXT,
+            lease_until  INTEGER
+        );
+        CREATE INDEX erasure_by_state ON erasure_requests (state, id);
+        -- Hashes of erased users and of the devices linked to them. The
+        -- ingest path drops anything that matches.
+        CREATE TABLE erasure_tombstones (
+            site_id    INTEGER NOT NULL,
+            kind       TEXT NOT NULL CHECK (kind IN ('user', 'anon')),
+            hash       TEXT NOT NULL,
+            request_id INTEGER NOT NULL REFERENCES erasure_requests(id),
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (site_id, kind, hash)
+        );
+    ",
+    },
 ];

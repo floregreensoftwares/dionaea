@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use dionaea_core::Severity;
-use dionaea_meta::{MetaError, MetaStore, Organization};
+use dionaea_meta::{ErasureRequest, ErasureState, MetaError, MetaStore, Organization};
 
 use crate::settings::{self, Origin, Tuning};
 
@@ -408,6 +408,95 @@ pub(crate) fn settings_unset(
             if delay_ms > 0 {
                 let _ = writeln!(err, "{name} is removed in {} s", delay_ms.div_euclid(1000));
             }
+            OK
+        }
+        Err(error) => report(&error, "", err),
+    }
+}
+
+fn erasure_line(request: &ErasureRequest) -> String {
+    let time = |value: Option<i64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        request.id,
+        request.site_id,
+        request.state,
+        request.requested_by,
+        request.requested_at,
+        time(request.hidden_at),
+        time(request.completed_at),
+        request.anon_count,
+        request.user_hash,
+    )
+}
+
+/// Asks for a user of a site to be erased. The user id is stored only until
+/// the job has finished; every later listing shows its hash.
+pub(crate) fn erase_request(
+    store: &dyn MetaStore,
+    site_id: u32,
+    user_id: &str,
+    requested_by: &str,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match store.request_erasure(site_id, user_id, requested_by) {
+        Ok(request) => {
+            let _ = writeln!(out, "{}", erasure_line(&request));
+            OK
+        }
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// Lists requests as: id, site, state, requested by, requested at, hidden at,
+/// completed at (seconds since the epoch, `-` when not yet), devices
+/// tombstoned, and the hash of the user id.
+pub(crate) fn erase_list(
+    store: &dyn MetaStore,
+    state: Option<ErasureState>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match store.erasure_requests(state) {
+        Ok(requests) => {
+            for request in &requests {
+                let _ = writeln!(out, "{}", erasure_line(request));
+            }
+            OK
+        }
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// One request: its line, then what the job reported.
+pub(crate) fn erase_show(
+    store: &dyn MetaStore,
+    id: u64,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match store.erasure_request(id) {
+        Ok(request) => {
+            let _ = writeln!(out, "{}", erasure_line(&request));
+            if let Some(detail) = &request.detail {
+                let _ = writeln!(out, "{detail}");
+            }
+            OK
+        }
+        Err(error) => report(&error, "", err),
+    }
+}
+
+pub(crate) fn erase_retry(
+    store: &dyn MetaStore,
+    id: u64,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match store.retry_erasure(id) {
+        Ok(request) => {
+            let _ = writeln!(out, "{}", erasure_line(&request));
             OK
         }
         Err(error) => report(&error, "", err),

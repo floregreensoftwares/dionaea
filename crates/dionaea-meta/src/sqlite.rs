@@ -11,11 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dionaea_core::{Change, Schema, diff, is_breaking, parse_schema};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::erasure_sql;
 use crate::migrations::MIGRATIONS;
 use crate::{
-    KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError,
-    MetaStore, Organization, Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot,
-    StoredSetting, WriteKeyInfo,
+    ErasureRequest, ErasureState, KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN,
+    MAX_SETTING_VALUE_LEN, MetaError, MetaStore, Organization, Published, SchemaVersionInfo, Site,
+    SiteSchemas, Snapshot, StoredSetting, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -38,7 +39,7 @@ impl fmt::Debug for SqliteMeta {
     }
 }
 
-fn storage(error: rusqlite::Error) -> MetaError {
+pub(crate) fn storage(error: rusqlite::Error) -> MetaError {
     MetaError::Storage(error.to_string())
 }
 
@@ -170,7 +171,7 @@ impl SqliteMeta {
     }
 }
 
-fn bump(tx: &Transaction<'_>) -> Result<(), MetaError> {
+pub(crate) fn bump(tx: &Transaction<'_>) -> Result<(), MetaError> {
     tx.execute("UPDATE state SET generation = generation + 1", [])
         .map_err(storage)?;
     Ok(())
@@ -202,7 +203,7 @@ fn generation_of(tx: &Transaction<'_>) -> Result<u64, MetaError> {
     u64::try_from(value).map_err(|_| MetaError::Corrupt("negative generation".to_owned()))
 }
 
-fn id_of(value: i64) -> Result<u32, MetaError> {
+pub(crate) fn id_of(value: i64) -> Result<u32, MetaError> {
     u32::try_from(value).map_err(|_| MetaError::Corrupt(format!("id {value} is out of range")))
 }
 
@@ -747,6 +748,52 @@ impl MetaStore for SqliteMeta {
         })
     }
 
+    fn request_erasure(
+        &self,
+        site_id: u32,
+        user_id: &str,
+        requested_by: &str,
+    ) -> Result<ErasureRequest, MetaError> {
+        self.write(|tx, at| erasure_sql::request(tx, site_id, user_id, requested_by, at))
+    }
+
+    fn erasure_request(&self, id: u64) -> Result<ErasureRequest, MetaError> {
+        self.read(|tx| erasure_sql::get(tx, id))
+    }
+
+    fn erasure_requests(
+        &self,
+        state: Option<ErasureState>,
+    ) -> Result<Vec<ErasureRequest>, MetaError> {
+        self.read(|tx| erasure_sql::list(tx, state))
+    }
+
+    fn claim_erasure(
+        &self,
+        state: ErasureState,
+        worker: &str,
+        lease_secs: i64,
+    ) -> Result<Option<ErasureRequest>, MetaError> {
+        self.write(|tx, at| erasure_sql::claim(tx, state, worker, lease_secs, at))
+    }
+
+    fn add_erasure_anons(&self, id: u64, anon_ids: &[String]) -> Result<u64, MetaError> {
+        self.write(|tx, at| erasure_sql::add_anons(tx, id, anon_ids, at))
+    }
+
+    fn advance_erasure(
+        &self,
+        id: u64,
+        to: ErasureState,
+        detail: Option<&str>,
+    ) -> Result<ErasureRequest, MetaError> {
+        self.write(|tx, at| erasure_sql::advance(tx, id, to, detail, at))
+    }
+
+    fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError> {
+        self.write(|tx, _| erasure_sql::retry(tx, id))
+    }
+
     fn snapshot(&self) -> Result<Snapshot, MetaError> {
         self.read(|tx| {
             let generation = generation_of(tx)?;
@@ -830,6 +877,7 @@ impl MetaStore for SqliteMeta {
                 keys,
                 schemas,
                 settings: settings_of(tx)?,
+                tombstones: erasure_sql::tombstones(tx)?,
             })
         })
     }
