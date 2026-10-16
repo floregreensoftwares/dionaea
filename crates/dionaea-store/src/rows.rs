@@ -51,6 +51,27 @@ fn check_time(ms: u64, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The canonical 36-character form of a UUID.
+fn is_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// Whether a name appears twice. Property maps hold at most a few dozen
+/// entries, so comparing pairs is cheaper than hashing.
+fn has_repeat<'a>(names: impl Iterator<Item = &'a str> + Clone) -> bool {
+    let mut outer = names.clone();
+    while let Some(name) = outer.next() {
+        if outer.clone().any(|other| other == name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Appends `text` as a JSON string, escaping what JSON requires. Runs of
 /// characters that need no escape are copied in one piece.
 fn push_string(out: &mut String, text: &str) {
@@ -97,6 +118,18 @@ impl EventRow {
     pub(crate) fn to_json_line(&self) -> Result<String, Error> {
         check_time(self.ts_ms, "the event time")?;
         check_time(self.received_ms, "the received time")?;
+        // ClickHouse refuses a whole insert for one such row, and a retry would
+        // fail the same way, so they are caught here, row by row.
+        if !is_uuid(&self.event_id) {
+            return Err(Error::InvalidRow(
+                "the event id is not a canonical UUID".to_owned(),
+            ));
+        }
+        if has_repeat(self.props_str.iter().map(|(key, _)| key.as_str()))
+            || has_repeat(self.props_num.iter().map(|(key, _)| key.as_str()))
+        {
+            return Err(Error::InvalidRow("a property name is repeated".to_owned()));
+        }
         let mut out = String::with_capacity(512);
         out.push('{');
         number_field(&mut out, "site_id", self.site_id);
@@ -240,6 +273,39 @@ mod tests {
         row.props_num.clear();
         assert!(serde_json::from_str::<Value>(&row.to_json_line().unwrap()).is_ok());
     }
+    #[test]
+    fn a_row_clickhouse_would_refuse_is_caught_before_sending() {
+        for bad in [
+            "",
+            "x",
+            "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6",
+            "0190f7e27c3e7a529a0e5f3c2a1b4d6e0000",
+            "0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6g",
+        ] {
+            let mut row = event();
+            row.event_id = bad.to_owned();
+            assert!(
+                matches!(row.to_json_line(), Err(Error::InvalidRow(_))),
+                "{bad:?}"
+            );
+        }
+        let mut upper = event();
+        upper.event_id = "0190F7E2-7C3E-7A52-9A0E-5F3C2A1B4D6E".to_owned();
+        assert!(upper.to_json_line().is_ok());
+
+        let mut row = event();
+        row.props_str
+            .push(("coupon".to_owned(), "again".to_owned()));
+        assert!(matches!(row.to_json_line(), Err(Error::InvalidRow(_))));
+        let mut row = event();
+        row.props_num.push(("items".to_owned(), 9.0));
+        assert!(matches!(row.to_json_line(), Err(Error::InvalidRow(_))));
+        // The same name in the string and the number map is two different columns.
+        let mut row = event();
+        row.props_num.push(("coupon".to_owned(), 1.0));
+        assert!(row.to_json_line().is_ok());
+    }
+
     #[test]
     fn times_beyond_clickhouse_are_refused() {
         let mut row = event();

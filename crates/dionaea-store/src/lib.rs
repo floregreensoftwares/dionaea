@@ -97,6 +97,23 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether trying the same call again cannot succeed: the data is refused
+    /// (a 4xx other than a timeout or a rate limit) or the row is invalid. A
+    /// transport failure or a server error may pass on a later try. A batcher
+    /// retries the second kind and sets the first kind aside, or the spool
+    /// would never drain.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::InvalidRow(_) | Self::InvalidName(_) | Self::TooManyRows => true,
+            Self::Server { status, .. } => {
+                (400..500).contains(status) && !matches!(status, 408 | 429)
+            }
+            Self::Io(_) => false,
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error.to_string())
@@ -118,6 +135,16 @@ fn valid_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A host name or address, as it goes into the `Host` header: no whitespace,
+/// no control characters.
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'))
+}
+
 fn valid_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= 128
@@ -126,15 +153,47 @@ fn valid_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
-/// ClickHouse's answer, kept short and on one line, with no row data.
-fn summarize(body: &[u8]) -> String {
+/// ClickHouse's answer, kept short and on one line. With `redact` only the
+/// error code and its name survive: the message of a rejected insert may quote
+/// the row, and a row holds user content that must never reach a log.
+fn summarize(body: &[u8], redact: bool) -> String {
     let text = String::from_utf8_lossy(body);
     let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    one_line.chars().take(400).collect()
+    if !redact {
+        return one_line.chars().take(400).collect();
+    }
+    let code: String = one_line
+        .split_once("Code: ")
+        .map(|(_, rest)| rest.chars().take_while(char::is_ascii_digit).collect())
+        .unwrap_or_default();
+    // The error name closes the message, as in `(INCORRECT_DATA)`, usually
+    // followed by `(version ...)`: take the last `(NAME)` made of capitals.
+    let name = one_line
+        .match_indices('(')
+        .filter_map(|(index, _)| {
+            let tail = &one_line[index + 1..];
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            (!name.is_empty() && tail[name.len()..].starts_with(')')).then_some(name)
+        })
+        .next_back()
+        .unwrap_or_default();
+    match (code.is_empty(), name.is_empty()) {
+        (false, false) => format!("Code: {code} ({name})"),
+        (false, true) => format!("Code: {code}"),
+        _ => "ClickHouse refused the data".to_owned(),
+    }
 }
 
 impl Store {
     pub fn new(config: Config) -> Result<Self, Error> {
+        if !valid_host(&config.host) {
+            return Err(Error::InvalidName(
+                "the host is a name or address of letters, digits, dots, hyphens, colons and brackets".to_owned(),
+            ));
+        }
         if !valid_identifier(&config.database) {
             return Err(Error::InvalidName(
                 "the database is a letter or underscore followed by letters, digits and underscores".to_owned(),
@@ -154,12 +213,12 @@ impl Store {
     }
 
     /// Sends `body` to ClickHouse at `path` and returns the answer text.
-    fn post(&self, path: &str, body: &[u8]) -> Result<String, Error> {
+    fn post(&self, path: &str, body: &[u8], redact: bool) -> Result<String, Error> {
         let response = http::post(&self.endpoint(), path, body)?;
         if response.status != 200 {
             return Err(Error::Server {
                 status: response.status,
-                message: summarize(&response.body),
+                message: summarize(&response.body, redact),
             });
         }
         Ok(String::from_utf8_lossy(&response.body).into_owned())
@@ -168,12 +227,12 @@ impl Store {
     /// Runs one statement in the configured database.
     fn execute(&self, sql: &str) -> Result<String, Error> {
         let path = format!("/?database={}", http::url_encode(&self.config.database));
-        self.post(&path, sql.as_bytes())
+        self.post(&path, sql.as_bytes(), false)
     }
 
     /// Whether ClickHouse answers a trivial query with these credentials.
     pub fn ping(&self) -> Result<(), Error> {
-        self.post("/", b"SELECT 1").map(|_| ())
+        self.post("/", b"SELECT 1", false).map(|_| ())
     }
 
     /// Creates the database and applies the migrations that have not been
@@ -182,6 +241,7 @@ impl Store {
         self.post(
             "/",
             format!("CREATE DATABASE IF NOT EXISTS {}", self.config.database).as_bytes(),
+            false,
         )?;
         self.execute(
             "CREATE TABLE IF NOT EXISTS _migrations (
@@ -248,7 +308,7 @@ impl Store {
             http::url_encode(&self.config.database),
             http::url_encode(token),
         );
-        self.post(&path, lines.as_bytes()).map(|_| ())
+        self.post(&path, lines.as_bytes(), true).map(|_| ())
     }
 
     /// Runs a statement and returns its answer as text. For tests and tools:
@@ -300,6 +360,70 @@ mod tests {
     }
 
     #[test]
+    fn an_insert_error_keeps_the_code_and_name_but_none_of_the_row() {
+        let body = b"Code: 117. DB::Exception: Cannot parse JSON object here: {\"anon_id\":\"secret-user-42\",\"coupon\":\"SAVE\"}: (at row 3): While executing JSONEachRowRowInputFormat. (INCORRECT_DATA) (version 26.8.27.9)\n";
+        let redacted = summarize(body, true);
+        assert_eq!(redacted, "Code: 117 (INCORRECT_DATA)");
+        assert!(!redacted.contains("secret-user-42"));
+        // Other statements carry no row data, so their message is kept.
+        assert!(summarize(body, false).contains("Cannot parse JSON object"));
+        // An answer that is not a ClickHouse error says nothing about the data.
+        assert_eq!(
+            summarize(b"<html>bad gateway with secret-user-42</html>", true),
+            "ClickHouse refused the data"
+        );
+        assert_eq!(summarize(b"", true), "ClickHouse refused the data");
+    }
+
+    #[test]
+    fn only_errors_a_retry_cannot_fix_are_permanent() {
+        let server = |status| Error::Server {
+            status,
+            message: String::new(),
+        };
+        for status in [400, 401, 403, 404, 413, 422] {
+            assert!(server(status).is_permanent(), "{status}");
+        }
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(!server(status).is_permanent(), "{status}");
+        }
+        assert!(!Error::Io("reset".to_owned()).is_permanent());
+        assert!(Error::InvalidRow("x".to_owned()).is_permanent());
+        assert!(Error::InvalidName("x".to_owned()).is_permanent());
+        assert!(Error::TooManyRows.is_permanent());
+    }
+
+    #[test]
+    fn a_host_that_could_alter_the_request_is_refused() {
+        for bad in [
+            "",
+            "a b",
+            "host\r\nX-Evil: 1",
+            "host\n",
+            "ho/st",
+            "ho@st",
+            &"a".repeat(254),
+        ] {
+            let config = Config::new(bad, 8123, "dionaea");
+            assert!(
+                matches!(Store::new(config), Err(Error::InvalidName(_))),
+                "{bad:?}"
+            );
+        }
+        for good in [
+            "localhost",
+            "127.0.0.1",
+            "clickhouse.internal",
+            "[::1]",
+            "ch-1_a",
+        ] {
+            assert!(
+                Store::new(Config::new(good, 8123, "dionaea")).is_ok(),
+                "{good}"
+            );
+        }
+    }
+    #[test]
     fn the_debug_form_hides_the_password() {
         let mut config = Config::new("localhost", 8123, "dionaea");
         config.password = "s3cret-value".to_owned();
@@ -312,10 +436,10 @@ mod tests {
     #[test]
     fn server_errors_are_summarised_on_one_line_without_data() {
         let body = b"Code: 60. DB::Exception: Table dionaea.nope does not exist.\n(UNKNOWN_TABLE) (version 26.8)\n";
-        let summary = summarize(body);
+        let summary = summarize(body, false);
         assert!(!summary.contains('\n'));
         assert!(summary.starts_with("Code: 60."));
-        assert!(summarize(&[b'x'; 5000]).len() <= 400);
+        assert!(summarize(&[b'x'; 5000], false).len() <= 400);
     }
 
     #[test]
