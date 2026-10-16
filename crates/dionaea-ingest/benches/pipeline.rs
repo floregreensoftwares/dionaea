@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use dionaea_ingest::{Admission, Cache, Limits, RateLimiter, process};
+use dionaea_ingest::{Admission, Cache, Limits, RateLimiter, enqueue, process};
 use dionaea_meta::{MetaStore, SqliteMeta};
 
 const SCHEMA: &str = r#"
@@ -100,6 +100,24 @@ fn benches(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // Encoding a request into a spool record and appending it, without fsync
+    // (the spool benchmark measures that part).
+    let dir = std::env::temp_dir().join(format!("dionaea-ingest-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut config = dionaea_spool::Config::new(&dir);
+    config.sync = false;
+    config.quota_bytes = 8 << 30;
+    let spool = dionaea_spool::Spool::open(config).expect("spool");
+    let processed = process(&admission, &batch(100, true), NOW, &limits).expect("batch");
+    let mut group = c.benchmark_group("enqueue");
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("100 events, no fsync", |b| {
+        b.iter(|| black_box(enqueue(&spool, black_box(&processed), 1, NOW)));
+    });
+    group.finish();
+    drop(spool);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 criterion_group!(group, benches);

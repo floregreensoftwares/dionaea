@@ -524,6 +524,8 @@ dependencies = [
  "criterion",
  "dionaea-core",
  "dionaea-meta",
+ "dionaea-spool",
+ "dionaea-store",
  "serde_json",
 ]
 
