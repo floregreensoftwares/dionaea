@@ -68,6 +68,9 @@ pub(crate) struct Tuning {
     /// How long a user stays hidden before the daily physical removal, so a
     /// day of requests share one rewrite of the tables.
     pub(crate) erase_finish_after: Duration,
+    /// How many times in a row trouble that retrying may fix may stop an
+    /// erasure request before it fails.
+    pub(crate) erase_max_attempts: u32,
 }
 
 /// Where a setting's value came from.
@@ -378,6 +381,16 @@ pub(crate) static SPECS: &[Spec] = &[
         |t, v| t.erase_finish_after = Duration::from_secs(v),
         |t| secs(t.erase_finish_after)
     ),
+    spec!(
+        "erase_max_attempts",
+        "10",
+        "from 1 to 100",
+        "how many times in a row an erasure step may meet trouble before the request fails",
+        u32,
+        |v| (1..=100).contains(v),
+        |t, v| t.erase_max_attempts = v,
+        |t| t.erase_max_attempts.to_string()
+    ),
 ];
 
 /// The setting called `name`.
@@ -435,6 +448,7 @@ impl Tuning {
             drop_flush: Duration::ZERO,
             erase_grace: Duration::ZERO,
             erase_finish_after: Duration::ZERO,
+            erase_max_attempts: 1,
         }
     }
 

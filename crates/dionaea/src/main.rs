@@ -138,7 +138,7 @@ enum EraseCommand {
         store: StoreArgs,
     },
     /// List requests: id, site, state, requested by, requested at, hidden at,
-    /// completed at, devices, hash of the user id
+    /// completed at, devices, hash of the user id, failed attempts
     List {
         /// Only requests in this state: requested, hidden, complete or failed
         #[arg(long)]

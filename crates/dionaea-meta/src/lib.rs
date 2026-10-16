@@ -25,7 +25,9 @@ mod sqlite;
 #[cfg(test)]
 mod tests;
 
-pub use erasure::{ErasureRequest, ErasureState, IdKind, Tombstones, tombstone_hash};
+pub use erasure::{
+    ErasureRequest, ErasureState, ErasureSummary, IdKind, Tombstones, tombstone_hash,
+};
 pub use sqlite::SqliteMeta;
 
 /// Most origins one write key may allow.
@@ -289,6 +291,31 @@ pub trait MetaStore: Send + Sync {
 
     /// Puts a failed request back to `requested`.
     fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError>;
+
+    /// Records trouble that retrying may fix on a request that is not
+    /// finished: it is let go and not claimed again for `retry_in_secs`; after
+    /// `max_attempts` troubles in a row it fails with the last message.
+    /// Moving a request on starts the count again.
+    fn record_erasure_trouble(
+        &self,
+        id: u64,
+        message: &str,
+        retry_in_secs: i64,
+        max_attempts: u32,
+    ) -> Result<ErasureRequest, MetaError>;
+
+    /// How many requests are in each state, how many wait to be tried again,
+    /// and how long the oldest unfinished one has waited.
+    fn erasure_summary(&self) -> Result<ErasureSummary, MetaError>;
+
+    /// Takes, or renews, the named lease for `holder` for `lease_secs`. True
+    /// when `holder` has it afterwards. Nodes use it to let one of them at a
+    /// time do the work of a job; a holder that dies loses it by the time
+    /// running out.
+    fn try_lease(&self, name: &str, holder: &str, lease_secs: i64) -> Result<bool, MetaError>;
+
+    /// Lets go of a lease `holder` has, so another node may take it at once.
+    fn release_lease(&self, name: &str, holder: &str) -> Result<(), MetaError>;
 
     /// The live keys and active schema versions of every site.
     fn snapshot(&self) -> Result<Snapshot, MetaError>;

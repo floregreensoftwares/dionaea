@@ -80,6 +80,24 @@ pub struct ErasureRequest {
     pub anon_count: u64,
     /// What the job reports: the rows removed per table, or why it failed.
     pub detail: Option<String>,
+    /// How many times trouble that retrying may fix has stopped this request
+    /// in its current state.
+    pub attempts: u32,
+    /// Seconds since the epoch before which it is not tried again.
+    pub retry_after: Option<i64>,
+}
+
+/// How many requests are where, for the metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ErasureSummary {
+    pub requested: u64,
+    pub hidden: u64,
+    pub complete: u64,
+    pub failed: u64,
+    /// Requests waiting to be tried again after trouble.
+    pub retrying: u64,
+    /// When the oldest unfinished request was asked for, in seconds.
+    pub oldest_open_at: Option<i64>,
 }
 
 /// What an identifier is, for tombstones.

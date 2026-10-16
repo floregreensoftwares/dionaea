@@ -2054,3 +2054,90 @@ fn an_erased_user_disappears_from_clickhouse_and_stays_out() {
         1
     );
 }
+
+/// Two servers share one metadata store and one ClickHouse. Only one does the
+/// erasure work; when it dies the other takes over and finishes the request.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn one_server_does_the_erasures_and_another_takes_over_when_it_dies() {
+    let database = ScratchDatabase::new("leader");
+    let dir = dir("leader");
+    let cli = |args: &[&str]| {
+        let output = in_clickhouse(&dir, &database.name)
+            .args(args)
+            .output()
+            .expect("run the binary");
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    cli(&["site", "create", "shop"]);
+    let schema = dir.join("schema.toml");
+    std::fs::write(&schema, SCHEMA_WITH_TRAITS).expect("write the schema");
+    cli(&[
+        "schema",
+        "push",
+        "--site",
+        "1",
+        schema.to_str().expect("utf-8"),
+    ]);
+    let key = cli(&["key", "issue", "--site", "1"]);
+
+    let start = |spool: &str| {
+        let mut command = in_clickhouse(&dir, &database.name);
+        command
+            .env("DIONAEA_SPOOL_DIR", dir.join(spool))
+            .env("DIONAEA_REFRESH_SECS", "1")
+            .env("DIONAEA_ERASE_GRACE_SECS", "0")
+            .env("DIONAEA_ERASE_FINISH_AFTER_SECS", "0");
+        Server::start_with(command)
+    };
+    let mut servers = vec![start("spool-a"), start("spool-b")];
+    let leads = |server: &Server| metric(&server.ops("/metrics").1, "dionaea_erasure_leader ") == 1;
+
+    // The data of the person to erase, through the first server.
+    let event = batch(1, 1).replace("\"anon_id\":\"a1\"", "\"anon_id\":\"a9\"");
+    assert_eq!(servers[0].request(&collect_head(&key), &event).0, 202);
+    let body = identify_body("a9", "u_gone", "{\"plan\":\"pro\"}");
+    assert_eq!(servers[0].request(&identify_head(&key), &body).0, 202);
+    database.wait_for("the event", "SELECT count() FROM events", 1);
+    database.wait_for("the link", "SELECT count() FROM identity_alias", 1);
+
+    // Exactly one of them leads, and stays the only one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while servers.iter().filter(|s| leads(s)).count() != 1 {
+        assert!(Instant::now() < deadline, "no single leader");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(servers.iter().filter(|s| leads(s)).count(), 1);
+    }
+
+    // The leader dies before the request is made.
+    let leader = servers.iter().position(&leads).expect("a leader");
+    drop(servers.remove(leader));
+    cli(&["erase", "request", "--site", "1", "--user", "u_gone"]);
+
+    // The other one takes over once the lease runs out, and finishes it.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !cli(&["erase", "list", "--state", "complete"]).contains("complete") {
+        assert!(
+            Instant::now() < deadline,
+            "never completed: {}",
+            cli(&["erase", "show", "1"])
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(leads(&servers[0]), "the survivor leads now");
+    assert_eq!(database.number("SELECT count() FROM events"), 0);
+    assert_eq!(database.number("SELECT count() FROM identity_alias"), 0);
+    let metrics = servers[0].ops("/metrics").1;
+    assert_eq!(metric(&metrics, "dionaea_erasure_completed_total"), 1);
+    eventually("the summary", 30, || {
+        metric(
+            &servers[0].ops("/metrics").1,
+            "dionaea_erasure_requests{state=\"complete\"}",
+        ) == 1
+    });
+    assert_eq!(metric(&metrics, "dionaea_erasure_trouble_total"), 0);
+}

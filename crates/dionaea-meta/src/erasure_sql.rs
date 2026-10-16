@@ -4,12 +4,14 @@
 use dionaea_core::is_id;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 
-use crate::erasure::{ErasureRequest, ErasureState, IdKind, Tombstones, tombstone_hash};
+use crate::erasure::{
+    ErasureRequest, ErasureState, ErasureSummary, IdKind, Tombstones, tombstone_hash,
+};
 use crate::sqlite::{bump, id_of, storage};
 use crate::{MAX_LABEL_LEN, MetaError};
 
 const COLUMNS: &str = "id, site_id, user_id, user_hash, state, requested_by, requested_at,
-    hidden_at, completed_at, anon_count, detail";
+    hidden_at, completed_at, anon_count, detail, attempts, retry_after";
 
 fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)> {
     Ok((
@@ -25,6 +27,8 @@ fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)>
             completed_at: row.get(8)?,
             anon_count: row.get(9)?,
             detail: row.get(10)?,
+            attempts: row.get(11)?,
+            retry_after: row.get(12)?,
         },
     ))
 }
@@ -39,6 +43,8 @@ struct ErasureRequestRest {
     completed_at: Option<i64>,
     anon_count: i64,
     detail: Option<String>,
+    attempts: i64,
+    retry_after: Option<i64>,
 }
 
 fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaError> {
@@ -56,6 +62,8 @@ fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaEr
         completed_at: rest.completed_at,
         anon_count: u64::try_from(rest.anon_count).unwrap_or(0),
         detail: rest.detail,
+        attempts: u32::try_from(rest.attempts).unwrap_or(u32::MAX),
+        retry_after: rest.retry_after,
     })
 }
 
@@ -183,6 +191,7 @@ pub(crate) fn claim(
         .query_row(
             "SELECT id FROM erasure_requests
              WHERE state = ?1 AND (lease_until IS NULL OR lease_until <= ?2)
+               AND (retry_after IS NULL OR retry_after <= ?2)
                AND COALESCE(hidden_at, requested_at) <= ?3
              ORDER BY id LIMIT 1",
             params![state.as_str(), at, due_before],
@@ -295,6 +304,7 @@ pub(crate) fn advance(
             completed_at = COALESCE(?4, completed_at),
             detail = COALESCE(?5, detail),
             user_id = CASE WHEN ?2 = 'complete' THEN NULL ELSE user_id END,
+            attempts = 0, retry_after = NULL,
             claimed_by = NULL, lease_until = NULL
          WHERE id = ?1",
         params![
@@ -326,6 +336,7 @@ pub(crate) fn retry(tx: &Transaction<'_>, id: u64) -> Result<ErasureRequest, Met
     }
     tx.execute(
         "UPDATE erasure_requests SET state = 'requested', detail = NULL,
+            attempts = 0, retry_after = NULL,
             claimed_by = NULL, lease_until = NULL WHERE id = ?1",
         [i64::try_from(id).unwrap_or(i64::MAX)],
     )
@@ -361,4 +372,133 @@ pub(crate) fn tombstones(tx: &Transaction<'_>) -> Result<Tombstones, MetaError> 
         all.insert(id_of(site)?, kind, hash);
     }
     Ok(all)
+}
+
+/// Records trouble that retrying may fix: the request is let go, not tried
+/// again for `retry_in_secs`, and after `max_attempts` such troubles in a row
+/// it fails with the last message instead.
+pub(crate) fn trouble(
+    tx: &Transaction<'_>,
+    id: u64,
+    message: &str,
+    retry_in_secs: i64,
+    max_attempts: u32,
+    at: i64,
+) -> Result<ErasureRequest, MetaError> {
+    let current = get(tx, id)?;
+    if !matches!(
+        current.state,
+        ErasureState::Requested | ErasureState::Hidden
+    ) {
+        return Err(MetaError::Conflict(
+            "only a request that is not finished can meet trouble".to_owned(),
+        ));
+    }
+    let attempts = current.attempts.saturating_add(1);
+    let message: String = message.chars().take(300).collect();
+    let id_sql = i64::try_from(id).unwrap_or(i64::MAX);
+    if attempts >= max_attempts.max(1) {
+        tx.execute(
+            "UPDATE erasure_requests SET state = 'failed', attempts = ?2, retry_after = NULL,
+                detail = ?3, claimed_by = NULL, lease_until = NULL WHERE id = ?1",
+            params![
+                id_sql,
+                attempts,
+                format!("gave up after {attempts} attempts: {message}")
+            ],
+        )
+        .map_err(storage)?;
+    } else {
+        tx.execute(
+            "UPDATE erasure_requests SET attempts = ?2, retry_after = ?3, detail = ?4,
+                claimed_by = NULL, lease_until = NULL WHERE id = ?1",
+            params![
+                id_sql,
+                attempts,
+                at.saturating_add(retry_in_secs.max(0)),
+                format!("attempt {attempts} of {max_attempts} failed: {message}")
+            ],
+        )
+        .map_err(storage)?;
+    }
+    get(tx, id)
+}
+
+pub(crate) fn summary(tx: &Transaction<'_>, at: i64) -> Result<ErasureSummary, MetaError> {
+    let mut summary = ErasureSummary::default();
+    let mut statement = tx
+        .prepare("SELECT state, COUNT(*) FROM erasure_requests GROUP BY state")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(storage)?;
+    for row in rows {
+        let (state, count) = row.map_err(storage)?;
+        let count = u64::try_from(count).unwrap_or(0);
+        match ErasureState::parse(&state) {
+            Some(ErasureState::Requested) => summary.requested = count,
+            Some(ErasureState::Hidden) => summary.hidden = count,
+            Some(ErasureState::Complete) => summary.complete = count,
+            Some(ErasureState::Failed) => summary.failed = count,
+            None => {
+                return Err(MetaError::Corrupt(format!(
+                    "unknown erasure state `{state}`"
+                )));
+            }
+        }
+    }
+    summary.retrying = tx
+        .query_row(
+            "SELECT COUNT(*) FROM erasure_requests
+             WHERE state IN ('requested', 'hidden') AND retry_after > ?1",
+            [at],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(storage)
+        .map(|n| u64::try_from(n).unwrap_or(0))?;
+    summary.oldest_open_at = tx
+        .query_row(
+            "SELECT MIN(requested_at) FROM erasure_requests
+             WHERE state IN ('requested', 'hidden')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    Ok(summary)
+}
+
+/// Takes or renews the named lease for `holder`. It succeeds when nobody holds
+/// it, when `holder` does, or when the holder's time ran out.
+pub(crate) fn acquire_lease(
+    tx: &Transaction<'_>,
+    name: &str,
+    holder: &str,
+    lease_secs: i64,
+    at: i64,
+) -> Result<bool, MetaError> {
+    let changed = tx
+        .execute(
+            "INSERT INTO leases (name, holder, until) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET holder = ?2, until = ?3
+             WHERE leases.holder = ?2 OR leases.until <= ?4",
+            params![name, holder, at.saturating_add(lease_secs.max(1)), at],
+        )
+        .map_err(storage)?;
+    Ok(changed > 0)
+}
+
+/// Lets go of a lease `holder` holds, so another node can take it at once.
+pub(crate) fn release_lease(
+    tx: &Transaction<'_>,
+    name: &str,
+    holder: &str,
+) -> Result<(), MetaError> {
+    tx.execute(
+        "DELETE FROM leases WHERE name = ?1 AND holder = ?2",
+        params![name, holder],
+    )
+    .map_err(storage)?;
+    Ok(())
 }

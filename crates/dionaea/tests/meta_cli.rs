@@ -163,6 +163,7 @@ fn an_operator_can_ask_for_an_erasure_list_it_and_retry_a_failed_one() {
     assert_eq!(&fields[..4], &["1", "1", "requested", "ops"], "{line}");
     assert_eq!(&fields[5..8], &["-", "-", "0"]);
     assert_eq!(fields[8].len(), 64, "the hash of the user id");
+    assert_eq!(fields[9], "0", "no trouble yet");
     assert!(!line.contains("u_42"), "the user id is never printed");
 
     // The same user again is the same request.

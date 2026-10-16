@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::collect::Collect;
+use crate::erasure::JobStats;
 use crate::net::NetCounters;
 
 /// What the background threads tell the operator endpoints.
@@ -31,6 +32,8 @@ pub(crate) struct Status {
     /// The last attempt to read keys and schemas failed.
     pub(crate) metadata_failing: AtomicBool,
     pub(crate) batcher: Mutex<Option<Arc<BatcherStats>>>,
+    /// What the erasure job did and the state of the requests.
+    pub(crate) erasure: Arc<JobStats>,
     pub(crate) spool_quota_bytes: u64,
 }
 
@@ -42,6 +45,7 @@ impl Status {
             settings_skipped: AtomicU64::new(0),
             metadata_failing: AtomicBool::new(false),
             batcher: Mutex::new(None),
+            erasure: Arc::default(),
             spool_quota_bytes,
         }
     }
@@ -89,6 +93,81 @@ async fn readyz(State(ops): State<Arc<Ops>>) -> impl IntoResponse {
 fn metric(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+fn render_erasure(out: &mut String, job: &JobStats) {
+    let summary = job.summary();
+    metric(
+        out,
+        "dionaea_erasure_requests",
+        "gauge",
+        "Erasure requests by state, as of the last round of the job.",
+    );
+    for (state, count) in [
+        ("requested", summary.requested),
+        ("hidden", summary.hidden),
+        ("complete", summary.complete),
+        ("failed", summary.failed),
+    ] {
+        let _ = writeln!(out, "dionaea_erasure_requests{{state=\"{state}\"}} {count}");
+    }
+    let age = summary.oldest_open_at.map_or(0, |at| {
+        let now = i64::try_from(crate::collect::system_clock() / 1000).unwrap_or(i64::MAX);
+        now.saturating_sub(at).max(0)
+    });
+    for (name, kind, help, value) in [
+        (
+            "dionaea_erasure_retrying",
+            "gauge",
+            "Requests waiting to be tried again after trouble.",
+            summary.retrying,
+        ),
+        (
+            "dionaea_erasure_oldest_open_seconds",
+            "gauge",
+            "How long the oldest unfinished erasure request has waited.",
+            u64::try_from(age).unwrap_or(0),
+        ),
+        (
+            "dionaea_erasure_leader",
+            "gauge",
+            "1 on the server that does the erasure work.",
+            u64::from(job.leader.load(Ordering::Relaxed)),
+        ),
+        (
+            "dionaea_erasure_hidden_total",
+            "counter",
+            "Requests this server hid.",
+            job.hidden.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_erasure_completed_total",
+            "counter",
+            "Requests this server completed.",
+            job.completed.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_erasure_failed_total",
+            "counter",
+            "Requests this server failed: rejected, rows left, or given up on.",
+            job.failed.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_erasure_trouble_total",
+            "counter",
+            "Steps that met trouble retrying may fix.",
+            job.trouble.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_erasure_gave_up_total",
+            "counter",
+            "Requests given up on after too many troubles in a row.",
+            job.gave_up.load(Ordering::Relaxed),
+        ),
+    ] {
+        metric(out, name, kind, help);
+        let _ = writeln!(out, "{name} {value}");
+    }
 }
 
 fn render(ops: &Ops) -> String {
@@ -348,6 +427,8 @@ fn render(ops: &Ops) -> String {
             stats.identity_rows()
         );
     }
+
+    render_erasure(&mut out, &ops.status.erasure);
 
     metric(
         &mut out,

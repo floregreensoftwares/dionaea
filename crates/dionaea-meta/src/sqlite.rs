@@ -14,9 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::erasure_sql;
 use crate::migrations::MIGRATIONS;
 use crate::{
-    ErasureRequest, ErasureState, KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN,
-    MAX_SETTING_VALUE_LEN, MetaError, MetaStore, Organization, Published, SchemaVersionInfo, Site,
-    SiteSchemas, Snapshot, StoredSetting, WriteKeyInfo,
+    ErasureRequest, ErasureState, ErasureSummary, KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS,
+    MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError, MetaStore, Organization, Published,
+    SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -797,6 +797,29 @@ impl MetaStore for SqliteMeta {
 
     fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError> {
         self.write(|tx, _| erasure_sql::retry(tx, id))
+    }
+
+    fn record_erasure_trouble(
+        &self,
+        id: u64,
+        message: &str,
+        retry_in_secs: i64,
+        max_attempts: u32,
+    ) -> Result<ErasureRequest, MetaError> {
+        self.write(|tx, at| erasure_sql::trouble(tx, id, message, retry_in_secs, max_attempts, at))
+    }
+
+    fn erasure_summary(&self) -> Result<ErasureSummary, MetaError> {
+        let at = (self.clock)();
+        self.read(|tx| erasure_sql::summary(tx, at))
+    }
+
+    fn try_lease(&self, name: &str, holder: &str, lease_secs: i64) -> Result<bool, MetaError> {
+        self.write(|tx, at| erasure_sql::acquire_lease(tx, name, holder, lease_secs, at))
+    }
+
+    fn release_lease(&self, name: &str, holder: &str) -> Result<(), MetaError> {
+        self.write(|tx, _| erasure_sql::release_lease(tx, name, holder))
     }
 
     fn snapshot(&self) -> Result<Snapshot, MetaError> {

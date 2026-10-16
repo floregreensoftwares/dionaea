@@ -447,7 +447,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 3,
+        migrations, 4,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
@@ -1064,4 +1064,166 @@ fn the_devices_are_kept_in_the_clear_only_until_the_request_completes() {
         store.erasure_anons(999),
         Err(MetaError::NotFound("erasure request"))
     ));
+}
+
+// Coordination: one worker at a time, and bounded retries.
+
+#[test]
+fn a_lease_belongs_to_one_holder_until_it_runs_out_or_is_let_go() {
+    let (store, now) = clocked();
+    assert!(store.try_lease("job", "a", 30).unwrap());
+    assert!(!store.try_lease("job", "b", 30).unwrap(), "held by a");
+    assert!(store.try_lease("job", "a", 30).unwrap(), "renewed by a");
+    assert!(
+        store.try_lease("other", "b", 30).unwrap(),
+        "another lease is another lock"
+    );
+
+    now.store(1_000 + 29, Ordering::SeqCst);
+    assert!(
+        !store.try_lease("job", "b", 30).unwrap(),
+        "still within the time"
+    );
+    now.store(1_000 + 30, Ordering::SeqCst);
+    assert!(
+        store.try_lease("job", "b", 30).unwrap(),
+        "a lets go by silence"
+    );
+    assert!(!store.try_lease("job", "a", 30).unwrap(), "now b has it");
+
+    store.release_lease("job", "a").unwrap();
+    assert!(
+        !store.try_lease("job", "a", 30).unwrap(),
+        "a was not the holder"
+    );
+    store.release_lease("job", "b").unwrap();
+    assert!(store.try_lease("job", "a", 30).unwrap(), "let go at once");
+}
+
+#[test]
+fn trouble_delays_a_request_and_after_enough_of_it_the_request_fails() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+
+    let first = store
+        .record_erasure_trouble(request.id, "clickhouse is down", 60, 3)
+        .unwrap();
+    assert_eq!(first.state, ErasureState::Requested);
+    assert_eq!((first.attempts, first.retry_after), (1, Some(1_060)));
+    assert!(first.detail.unwrap().contains("attempt 1 of 3"));
+    assert!(
+        store
+            .claim_erasure(ErasureState::Requested, "w", 60, i64::MAX)
+            .unwrap()
+            .is_none(),
+        "not before the retry time"
+    );
+
+    now.store(1_060, Ordering::SeqCst);
+    let claimed = store
+        .claim_erasure(ErasureState::Requested, "w", 60, i64::MAX)
+        .unwrap()
+        .expect("due again");
+    assert_eq!(claimed.attempts, 1);
+    let second = store
+        .record_erasure_trouble(request.id, "still down", 120, 3)
+        .unwrap();
+    assert_eq!((second.attempts, second.retry_after), (2, Some(1_180)));
+    assert_eq!(second.state, ErasureState::Requested);
+
+    now.store(1_180, Ordering::SeqCst);
+    let third = store
+        .record_erasure_trouble(request.id, "down for good", 240, 3)
+        .unwrap();
+    assert_eq!(third.state, ErasureState::Failed, "the limit was reached");
+    assert_eq!(third.retry_after, None);
+    let detail = third.detail.unwrap();
+    assert!(
+        detail.contains("gave up after 3 attempts") && detail.contains("down for good"),
+        "{detail}"
+    );
+    assert!(matches!(
+        store.record_erasure_trouble(request.id, "x", 1, 3),
+        Err(MetaError::Conflict(_))
+    ));
+}
+
+#[test]
+fn progress_or_a_retry_starts_the_count_again() {
+    let (store, _) = clocked();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    store
+        .record_erasure_trouble(request.id, "down", 0, 5)
+        .unwrap();
+    let hidden = store
+        .advance_erasure(request.id, ErasureState::Hidden, None)
+        .unwrap();
+    assert_eq!((hidden.attempts, hidden.retry_after), (0, None));
+
+    store
+        .record_erasure_trouble(request.id, "down", 0, 2)
+        .unwrap();
+    let failed = store
+        .record_erasure_trouble(request.id, "down", 0, 2)
+        .unwrap();
+    assert_eq!(failed.state, ErasureState::Failed);
+    let again = store.retry_erasure(request.id).unwrap();
+    assert_eq!((again.attempts, again.state), (0, ErasureState::Requested));
+}
+
+#[test]
+fn a_limit_of_one_fails_at_the_first_trouble_and_zero_counts_as_one() {
+    let store = store();
+    let site = site(&store);
+    let a = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    let b = store.request_erasure(site.id, "u_2", "ops").unwrap();
+    assert_eq!(
+        store.record_erasure_trouble(a.id, "x", 1, 1).unwrap().state,
+        ErasureState::Failed
+    );
+    assert_eq!(
+        store.record_erasure_trouble(b.id, "x", 1, 0).unwrap().state,
+        ErasureState::Failed
+    );
+}
+
+#[test]
+fn the_summary_counts_states_waiting_retries_and_the_oldest_open_request() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    assert_eq!(store.erasure_summary().unwrap(), ErasureSummary::default());
+
+    let a = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    now.store(2_000, Ordering::SeqCst);
+    let b = store.request_erasure(site.id, "u_2", "ops").unwrap();
+    let c = store.request_erasure(site.id, "u_3", "ops").unwrap();
+    store
+        .advance_erasure(b.id, ErasureState::Hidden, None)
+        .unwrap();
+    store
+        .advance_erasure(c.id, ErasureState::Failed, Some("x"))
+        .unwrap();
+    store.record_erasure_trouble(a.id, "down", 100, 5).unwrap();
+
+    let summary = store.erasure_summary().unwrap();
+    assert_eq!(
+        (
+            summary.requested,
+            summary.hidden,
+            summary.complete,
+            summary.failed
+        ),
+        (1, 1, 0, 1)
+    );
+    assert_eq!(summary.retrying, 1, "a waits for its time");
+    assert_eq!(summary.oldest_open_at, Some(1_000));
+
+    now.store(2_200, Ordering::SeqCst);
+    assert_eq!(
+        store.erasure_summary().unwrap().retrying,
+        0,
+        "the time came"
+    );
 }
