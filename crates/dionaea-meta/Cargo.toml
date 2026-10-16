@@ -1,0 +1,27 @@
+[package]
+name = "dionaea-meta"
+description = "Metadata for Dionaea: sites, write keys and published schema versions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dionaea-core = { path = "../dionaea-core" }
+getrandom = "0.4.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "snapshot"
+harness = false
