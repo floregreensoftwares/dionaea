@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::routing::get;
 use dionaea_ingest::{Batcher, BatcherConfig, Cache, Destination, MaxMind};
-use dionaea_meta::SqliteMeta;
 use dionaea_spool::{Config as SpoolConfig, Spool};
 use dionaea_store::{Store, TlsConfig};
 use tokio::net::TcpListener;
@@ -205,8 +204,7 @@ impl Node {
         control: &Arc<NetControl>,
     ) -> Result<(Self, Arc<Collect>), String> {
         let endpoint = clickhouse_endpoint(&config.clickhouse_url)?;
-        let meta = SqliteMeta::open(&config.metadata_path)
-            .map_err(|e| format!("cannot open {}: {e}", config.metadata_path.display()))?;
+        let meta = config.open_meta()?;
         let cache = Cache::new();
         cache
             .refresh(&meta)
@@ -341,8 +339,7 @@ impl Node {
         // job has its own connection to the metadata store and its own
         // ClickHouse handle with a long timeout.
         let erasure = {
-            let job_meta = SqliteMeta::open(&config.metadata_path)
-                .map_err(|e| format!("cannot open {}: {e}", config.metadata_path.display()))?;
+            let job_meta = config.open_meta()?;
             let (live, stop, status) = (live.clone(), Arc::clone(&stop), Arc::clone(status));
             let job = Job::new(
                 Arc::new(job_meta),

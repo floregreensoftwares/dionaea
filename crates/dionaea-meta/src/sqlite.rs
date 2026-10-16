@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::erasure_sql;
 use crate::migrations::MIGRATIONS;
 use crate::{
-    ErasureRequest, ErasureState, ErasureSummary, KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS,
+    ErasureRequest, ErasureState, ErasureSummary, HashKey, KeyEntry, MAX_LABEL_LEN, MAX_ORIGINS,
     MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError, MetaStore, Organization, Published,
     SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting, TombstoneBatch, WriteKeyInfo,
 };
@@ -31,6 +31,7 @@ type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 pub struct SqliteMeta {
     connection: Mutex<Connection>,
     clock: Clock,
+    hash_key: Option<HashKey>,
 }
 
 impl fmt::Debug for SqliteMeta {
@@ -87,6 +88,7 @@ impl SqliteMeta {
         let mut store = Self {
             connection: Mutex::new(connection),
             clock: Box::new(now),
+            hash_key: None,
         };
         store.migrate()?;
         Ok(store)
@@ -96,6 +98,14 @@ impl SqliteMeta {
     #[must_use]
     pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
+        self
+    }
+
+    /// Sets the key that keys the tombstone hashes. Without it erasures
+    /// cannot be requested and, once any exist, tombstones cannot be read.
+    #[must_use]
+    pub fn with_hash_key(mut self, key: HashKey) -> Self {
+        self.hash_key = Some(key);
         self
     }
 
@@ -754,7 +764,16 @@ impl MetaStore for SqliteMeta {
         user_id: &str,
         requested_by: &str,
     ) -> Result<ErasureRequest, MetaError> {
-        self.write(|tx, at| erasure_sql::request(tx, site_id, user_id, requested_by, at))
+        self.write(|tx, at| {
+            erasure_sql::request(
+                tx,
+                self.hash_key.as_ref(),
+                site_id,
+                user_id,
+                requested_by,
+                at,
+            )
+        })
     }
 
     fn erasure_request(&self, id: u64) -> Result<ErasureRequest, MetaError> {
@@ -783,7 +802,7 @@ impl MetaStore for SqliteMeta {
     }
 
     fn add_erasure_anons(&self, id: u64, anon_ids: &[String]) -> Result<u64, MetaError> {
-        self.write(|tx, at| erasure_sql::add_anons(tx, id, anon_ids, at))
+        self.write(|tx, at| erasure_sql::add_anons(tx, self.hash_key.as_ref(), id, anon_ids, at))
     }
 
     fn advance_erasure(
@@ -810,7 +829,11 @@ impl MetaStore for SqliteMeta {
     }
 
     fn tombstones_since(&self, after: u64, limit: usize) -> Result<TombstoneBatch, MetaError> {
-        self.read(|tx| erasure_sql::tombstones_since(tx, after, limit))
+        self.read(|tx| erasure_sql::tombstones_since(tx, self.hash_key.as_ref(), after, limit))
+    }
+
+    fn erasure_key(&self) -> Option<HashKey> {
+        self.hash_key.clone()
     }
 
     fn erasure_summary(&self) -> Result<ErasureSummary, MetaError> {

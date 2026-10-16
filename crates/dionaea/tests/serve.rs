@@ -37,6 +37,7 @@ fn command_for(dir: &Path, url: &str, database: Option<&str>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dionaea"));
     command
         .env("DIONAEA_METADATA_PATH", dir.join("meta.db"))
+        .env("DIONAEA_ERASURE_KEY", "0123456789abcdef0123456789abcdef")
         .env("DIONAEA_SPOOL_DIR", dir.join("spool"))
         .env("DIONAEA_CLICKHOUSE_URL", url)
         .env("DIONAEA_CLICKHOUSE_USER", "dionaea")
@@ -2140,4 +2141,80 @@ fn one_server_does_the_erasures_and_another_takes_over_when_it_dies() {
         ) == 1
     });
     assert_eq!(metric(&metrics, "dionaea_erasure_trouble_total"), 0);
+}
+
+/// Runs `serve` with the key given (none removes it) and returns how it
+/// ended and what it printed, or `None` if it was still running after
+/// `seconds`.
+fn serve_outcome(dir: &Path, key: Option<&str>, seconds: u64) -> Option<(bool, String)> {
+    let mut command = command(dir);
+    command.env_remove("DIONAEA_ERASURE_KEY");
+    if let Some(key) = key {
+        command.env("DIONAEA_ERASURE_KEY", key);
+    }
+    let mut child = command
+        .arg("serve")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the server");
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            let mut text = String::new();
+            let _ = child
+                .stdout
+                .take()
+                .expect("stdout")
+                .read_to_string(&mut text);
+            let _ = child
+                .stderr
+                .take()
+                .expect("stderr")
+                .read_to_string(&mut text);
+            return Some((status.success(), text));
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_server_with_another_erasure_key_or_none_refuses_to_start_once_users_were_erased() {
+    let dir = dir("wrong-key");
+    bootstrap(&dir);
+    run(
+        &dir,
+        &["erase", "request", "--site", "1", "--user", "u_gone"],
+    );
+
+    for key in [Some("fedcba9876543210fedcba9876543210"), None] {
+        let (success, text) = serve_outcome(&dir, key, 20)
+            .unwrap_or_else(|| panic!("{key:?}: the server started although it must not"));
+        assert!(!success, "{key:?}: {text}");
+        assert!(text.contains("erasure key"), "{key:?}: {text}");
+        assert!(
+            !text.contains("fedcba9876543210fedcba9876543210"),
+            "the key is not printed"
+        );
+    }
+    // With the right key it starts.
+    assert!(
+        serve_outcome(&dir, Some("0123456789abcdef0123456789abcdef"), 4).is_none(),
+        "the server runs"
+    );
+}
+
+#[test]
+fn a_server_needs_no_erasure_key_until_somebody_is_erased() {
+    let dir = dir("no-key-needed");
+    bootstrap(&dir);
+    assert!(
+        serve_outcome(&dir, None, 4).is_none(),
+        "the server runs without one"
+    );
 }

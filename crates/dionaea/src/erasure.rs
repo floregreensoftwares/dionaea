@@ -667,6 +667,10 @@ mod tests {
         let meta = Arc::new(
             SqliteMeta::open_in_memory()
                 .unwrap()
+                .with_hash_key(
+                    dionaea_meta::HashKey::from_secret("0123456789abcdef0123456789abcdef")
+                        .expect("key"),
+                )
                 .with_clock(move || clock.load(Ordering::SeqCst)),
         );
         let organization = meta.create_organization("o").unwrap();

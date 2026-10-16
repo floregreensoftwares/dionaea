@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use config::{Config, LogFormat};
-use dionaea_meta::{ErasureState, MetaStore, SqliteMeta};
+use dionaea_meta::{ErasureState, MetaStore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -413,14 +413,10 @@ fn with_config_store(
             return ExitCode::from(meta_cli::UNUSABLE);
         }
     };
-    let store = match SqliteMeta::open(&config.metadata_path) {
+    let store = match config.open_meta() {
         Ok(store) => store,
-        Err(error) => {
-            let _ = writeln!(
-                err,
-                "error: cannot open {}: {error}",
-                config.metadata_path.display()
-            );
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
             return ExitCode::from(meta_cli::UNUSABLE);
         }
     };

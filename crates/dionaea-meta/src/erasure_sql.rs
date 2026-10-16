@@ -5,7 +5,7 @@ use dionaea_core::is_id;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 
 use crate::erasure::{
-    ErasureRequest, ErasureState, ErasureSummary, IdKind, TombstoneBatch, tombstone_hash,
+    ErasureRequest, ErasureState, ErasureSummary, HashKey, IdKind, TombstoneBatch,
 };
 use crate::sqlite::{bump, id_of, storage};
 use crate::{MAX_LABEL_LEN, MetaError};
@@ -120,11 +120,76 @@ fn tombstone(
     Ok(added > 0)
 }
 
+/// The key to hash with: the one configured, checked against the value
+/// stored the first time one was used. Without a key nothing is tombstoned.
+pub(crate) fn use_key<'a>(
+    tx: &Transaction<'_>,
+    key: Option<&'a HashKey>,
+) -> Result<&'a HashKey, MetaError> {
+    let key = key.ok_or_else(|| {
+        MetaError::Invalid(
+            "no erasure key is configured; set `erasure_key` (or `erasure_key_file`) \
+             to a random secret of 32 or more characters, the same on every server"
+                .to_owned(),
+        )
+    })?;
+    match stored_check(tx)? {
+        Some(stored) if stored != key.check() => Err(wrong_key()),
+        Some(_) => Ok(key),
+        None => {
+            tx.execute("UPDATE state SET erasure_key_check = ?1", [key.check()])
+                .map_err(storage)?;
+            Ok(key)
+        }
+    }
+}
+
+fn wrong_key() -> MetaError {
+    MetaError::Invalid(
+        "the erasure key is not the one earlier erasures were made with; erasures cannot be \
+         checked or made until the original key is configured again"
+            .to_owned(),
+    )
+}
+
+fn stored_check(tx: &Transaction<'_>) -> Result<Option<String>, MetaError> {
+    tx.query_row("SELECT erasure_key_check FROM state", [], |row| row.get(0))
+        .map_err(storage)
+}
+
+/// Before tombstones are read: if there are any, the configured key must be
+/// the one they were made with.
+pub(crate) fn check_key_for_reading(
+    tx: &Transaction<'_>,
+    key: Option<&HashKey>,
+) -> Result<(), MetaError> {
+    let any: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM erasure_tombstones)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if !any {
+        return Ok(());
+    }
+    match (key, stored_check(tx)?) {
+        (Some(key), Some(stored)) if stored == key.check() => Ok(()),
+        (None, _) => Err(MetaError::Invalid(
+            "erasures exist but no erasure key is configured; set `erasure_key` (or \
+             `erasure_key_file`) to the key they were made with"
+                .to_owned(),
+        )),
+        _ => Err(wrong_key()),
+    }
+}
+
 /// Records a request for a user of a site, and the tombstone that stops new
 /// data of that user at once. A request still unfinished for the same user is
 /// returned instead of a second one.
 pub(crate) fn request(
     tx: &Transaction<'_>,
+    key: Option<&HashKey>,
     site_id: u32,
     user_id: &str,
     requested_by: &str,
@@ -151,7 +216,8 @@ pub(crate) fn request(
     if !site {
         return Err(MetaError::NotFound("site"));
     }
-    let hash = tombstone_hash(site_id, IdKind::User, user_id);
+    let key = use_key(tx, key)?;
+    let hash = key.tombstone_hash(site_id, IdKind::User, user_id);
     let open: Option<i64> = tx
         .query_row(
             "SELECT id FROM erasure_requests
@@ -213,6 +279,7 @@ pub(crate) fn claim(
 /// Tombstones the anonymous ids linked to the user. Returns how many were new.
 pub(crate) fn add_anons(
     tx: &Transaction<'_>,
+    key: Option<&HashKey>,
     id: u64,
     anon_ids: &[String],
     at: i64,
@@ -223,6 +290,7 @@ pub(crate) fn add_anons(
             "anonymous ids are added while a request is still `requested`".to_owned(),
         ));
     }
+    let key = use_key(tx, key)?;
     let mut added = 0;
     for anon in anon_ids {
         if !is_id(anon) {
@@ -230,7 +298,7 @@ pub(crate) fn add_anons(
             // block and nothing to delete under it.
             continue;
         }
-        let hash = tombstone_hash(request.site_id, IdKind::Anon, anon);
+        let hash = key.tombstone_hash(request.site_id, IdKind::Anon, anon);
         tx.execute(
             "INSERT OR IGNORE INTO erasure_anons (request_id, anon_id) VALUES (?1, ?2)",
             params![i64::try_from(id).unwrap_or(i64::MAX), anon],
@@ -347,9 +415,11 @@ pub(crate) fn retry(tx: &Transaction<'_>, id: u64) -> Result<ErasureRequest, Met
 /// The tombstones made after position `after`, oldest first, at most `limit`.
 pub(crate) fn tombstones_since(
     tx: &Transaction<'_>,
+    key: Option<&HashKey>,
     after: u64,
     limit: usize,
 ) -> Result<TombstoneBatch, MetaError> {
+    check_key_for_reading(tx, key)?;
     let mut statement = tx
         .prepare(
             "SELECT rowid, site_id, kind, hash FROM erasure_tombstones

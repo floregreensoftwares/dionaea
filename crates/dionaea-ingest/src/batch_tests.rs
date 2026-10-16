@@ -1066,7 +1066,11 @@ fn rejected_traits_never_repeat_the_link_stored_with_them() {
 /// `gone2`, made the way the server makes them.
 fn erased_set() -> Arc<dionaea_meta::Tombstones> {
     use dionaea_meta::MetaStore;
-    let meta = dionaea_meta::SqliteMeta::open_in_memory().expect("meta");
+    let meta = dionaea_meta::SqliteMeta::open_in_memory()
+        .expect("meta")
+        .with_hash_key(
+            dionaea_meta::HashKey::from_secret("0123456789abcdef0123456789abcdef").expect("key"),
+        );
     let organization = meta.create_organization("o").expect("organization");
     // Sites 1 to 7, so that the erased user belongs to site 7.
     for n in 1..=7 {
