@@ -391,6 +391,27 @@ impl MetaStore for SqliteMeta {
         })
     }
 
+    fn organizations(&self) -> Result<Vec<Organization>, MetaError> {
+        self.read(|tx| {
+            let mut statement = tx
+                .prepare("SELECT id, name FROM organizations ORDER BY id")
+                .map_err(storage)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?;
+            rows.map(|row| {
+                let (id, name) = row.map_err(storage)?;
+                Ok(Organization {
+                    id: id_of(id)?,
+                    name,
+                })
+            })
+            .collect()
+        })
+    }
+
     fn sites(&self) -> Result<Vec<Site>, MetaError> {
         self.read(|tx| {
             let mut statement = tx
