@@ -487,6 +487,12 @@ mod tests {
 
     use super::*;
 
+    fn tombstones_of(meta: &SqliteMeta) -> dionaea_meta::Tombstones {
+        let all = dionaea_meta::Tombstones::default();
+        all.load_from(meta).unwrap();
+        all
+    }
+
     const TABLES: [&str; 3] = ["events", "identity_alias", "user_traits"];
 
     #[derive(Clone)]
@@ -709,11 +715,7 @@ mod tests {
             "{hidden:?}"
         );
         assert!(
-            w.meta
-                .snapshot()
-                .unwrap()
-                .tombstones
-                .anon_erased(w.site, "a1"),
+            tombstones_of(&w.meta).anon_erased(w.site, "a1"),
             "the devices are blocked"
         );
         assert!(!hide(&w), "nothing else to hide");

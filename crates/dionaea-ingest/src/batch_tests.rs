@@ -1078,7 +1078,9 @@ fn erased_set() -> Arc<dionaea_meta::Tombstones> {
         .expect("request");
     meta.add_erasure_anons(request.id, &["gone1".to_owned(), "gone2".to_owned()])
         .expect("anons");
-    Arc::new(meta.snapshot().expect("snapshot").tombstones)
+    let all = dionaea_meta::Tombstones::default();
+    all.load_from(&meta).expect("tombstones");
+    Arc::new(all)
 }
 
 fn source(tombstones: Arc<dionaea_meta::Tombstones>) -> TombstoneSource {
