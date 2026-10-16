@@ -882,3 +882,168 @@ fn the_ingest_user_can_write_identity_and_read_none_of_it() {
     assert_eq!(count(&scratch.store, "identity_alias"), 1);
     assert_eq!(count(&scratch.store, "user_traits"), 1);
 }
+
+fn rows(counts: &[dionaea_store::TableCount]) -> Vec<(&'static str, u64)> {
+    counts.iter().map(|c| (c.table, c.rows)).collect()
+}
+
+/// Two users on one site. u1 has devices a1 and a2, u2 has a3; a2 was also
+/// used once by u2. Another site has a user with the same name.
+fn seed_two_users(scratch: &Scratch) {
+    let t = now_ms();
+    let mut events = Vec::new();
+    for (n, anon, site) in [
+        (1, "a1", 7),
+        (2, "a1", 7),
+        (3, "a2", 7),
+        (4, "a3", 7),
+        (5, "a1", 8),
+    ] {
+        let mut row = event(n);
+        row.anon_id = anon.to_owned();
+        row.site_id = site;
+        events.push(row);
+    }
+    scratch
+        .store
+        .insert_events(&events, "erase-events")
+        .expect("events");
+    let link = |site, anon: &str, user: &str| AliasRow {
+        site_id: site,
+        anon_id: anon.to_owned(),
+        user_id: user.to_owned(),
+        linked_ms: t,
+    };
+    scratch
+        .store
+        .insert_alias_lines(
+            &Store::encode_aliases(&[
+                link(7, "a1", "u1"),
+                link(7, "a2", "u1"),
+                link(7, "a2", "u2"),
+                link(7, "a3", "u2"),
+                link(8, "a1", "u1"),
+            ])
+            .expect("encode"),
+            "erase-aliases",
+        )
+        .expect("aliases");
+    let traits = |site, user: &str| TraitsRow {
+        site_id: site,
+        user_id: user.to_owned(),
+        traits_str: vec![("plan".to_owned(), "pro".to_owned())],
+        traits_num: vec![],
+        updated_ms: t,
+    };
+    scratch
+        .store
+        .insert_traits_lines(
+            &Store::encode_traits(&[traits(7, "u1"), traits(7, "u2"), traits(8, "u1")])
+                .expect("encode"),
+            "erase-traits",
+        )
+        .expect("traits");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_applied() {
+    let scratch = Scratch::new();
+    seed_two_users(&scratch);
+    let store = &scratch.store;
+
+    let anons = store.linked_anon_ids(7, "u1").expect("linked");
+    assert_eq!(anons, vec!["a1", "a2"]);
+    assert_eq!(
+        store.linked_anon_ids(7, "nobody").expect("none"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        rows(
+            &store
+                .count_user_rows(7, "u1", &anons, false)
+                .expect("before")
+        ),
+        vec![("events", 3), ("identity_alias", 3), ("user_traits", 1)],
+        "a1 twice and a2 once; both links of a2 and the link of a1; the traits"
+    );
+
+    store.delete_user_rows(7, "u1", &anons).expect("delete");
+    assert_eq!(
+        rows(&store.count_user_rows(7, "u1", &anons, false).expect("seen")),
+        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
+        "queries no longer see the rows"
+    );
+    // Whether the data is still in the parts here depends on the version: 26.8
+    // keeps it until the mask is applied, 25.8 has already rewritten the parts.
+    // Only that it never exceeds what was there can be asserted.
+    let on_disk = rows(&store.count_user_rows(7, "u1", &anons, true).expect("disk"));
+    assert!(
+        on_disk
+            .iter()
+            .zip([3, 3, 1])
+            .all(|((_, found), before)| *found <= before),
+        "{on_disk:?}"
+    );
+
+    store.remove_deleted_rows().expect("apply the mask");
+    assert_eq!(
+        rows(&store.count_user_rows(7, "u1", &anons, true).expect("gone")),
+        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
+        "now it is gone from disk"
+    );
+
+    // What belongs to anyone else is untouched.
+    assert_eq!(count(store, "events"), 2, "a3 on site 7 and a1 on site 8");
+    assert_eq!(
+        count(store, "identity_alias"),
+        2,
+        "u2 on a3, and u1 on site 8; the link of u2 to a2 went with the device"
+    );
+    assert_eq!(count(store, "user_traits"), 2);
+    assert_eq!(
+        store.linked_anon_ids(8, "u1").expect("site 8"),
+        vec!["a1"],
+        "the same names on another site"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
+    let scratch = Scratch::new();
+    seed_two_users(&scratch);
+    let store = &scratch.store;
+    store
+        .delete_user_rows(7, "ghost", &[])
+        .expect("nothing to delete");
+    store.remove_deleted_rows().expect("nothing to rewrite");
+    assert_eq!(count(store, "events"), 5);
+
+    let anons = store.linked_anon_ids(7, "u2").expect("linked");
+    for _ in 0..2 {
+        store.delete_user_rows(7, "u2", &anons).expect("delete");
+        store.remove_deleted_rows().expect("apply");
+    }
+    assert_eq!(
+        rows(&store.count_user_rows(7, "u2", &anons, true).expect("gone")),
+        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn an_identifier_that_could_alter_the_statement_never_reaches_clickhouse() {
+    let scratch = Scratch::new();
+    seed_two_users(&scratch);
+    let store = &scratch.store;
+    for bad in ["x' OR 1 = 1 --", "a;DROP TABLE events", "", "a b"] {
+        assert!(store.linked_anon_ids(7, bad).is_err(), "{bad:?}");
+        assert!(store.delete_user_rows(7, bad, &[]).is_err(), "{bad:?}");
+        assert!(
+            store.delete_user_rows(7, "u1", &[bad.to_owned()]).is_err(),
+            "{bad:?}"
+        );
+    }
+    assert_eq!(count(store, "events"), 5, "nothing was deleted");
+}

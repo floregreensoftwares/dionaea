@@ -150,6 +150,41 @@ jobs:
         if: always()
         run: docker compose -f compose.yaml -f compose.tls.yaml down -v
 
+  # The same tests on the previous long-term-support ClickHouse, the oldest
+  # version the product claims to work with: erasure relies on lightweight
+  # deletes and on applying the deleted mask, whose behavior differs between
+  # versions. TLS is covered by the job above.
+  store-lts:
+    name: store (ClickHouse LTS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> .cargo-target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/trigger' }}
+      - name: Start ClickHouse 25.8
+        run: |
+          docker run -d --name clickhouse-lts -p 127.0.0.1:8123:8123             -e CLICKHOUSE_USER=dionaea -e CLICKHOUSE_PASSWORD=dionaea-dev             -e CLICKHOUSE_DB=dionaea -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1             --ulimit nofile=262144:262144 clickhouse/clickhouse-server:25.8
+          for i in $(seq 1 60); do
+            curl -fs http://127.0.0.1:8123/ping && break
+            sleep 2
+          done
+          curl -fs http://127.0.0.1:8123/ping
+      - name: Run the store tests
+        run: cargo test -p dionaea-store --test clickhouse --locked -- --ignored --skip tls
+      - name: Run the ingest and server tests
+        run: |
+          cargo test -p dionaea-ingest --test clickhouse --locked -- --ignored
+          cargo test -p dionaea --test serve --locked -- --ignored --skip tls --skip country
+      - name: Stop ClickHouse
+        if: always()
+        run: docker rm -f clickhouse-lts
+
   # The base revision and this one, benchmarked one after the other on the
   # same runner. It reports changes and never fails on a slowdown: shared
   # runners are too noisy for a threshold. It fails only if a benchmark breaks.
@@ -201,7 +236,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [messages, rust, hooks, compose, store, bench]
+    needs: [messages, rust, hooks, compose, store, store-lts, bench]
     runs-on: ubuntu-latest
     steps:
       - name: Check the results

@@ -16,6 +16,7 @@
 //! without storing the batch twice. The token should be derived from the
 //! batch's position in the spool, which is stable across a replay.
 
+mod erase;
 mod http;
 mod migrations;
 mod rows;
@@ -27,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use erase::{IDENTIFIER_TABLES, IdentifierTable, TableCount};
 pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key};
 
 /// Most rows one insert call accepts.
