@@ -72,6 +72,13 @@ fn organizations_and_sites_are_unique_by_name() {
         Err(MetaError::NotFound("organization"))
     ));
     assert_eq!(store.sites().expect("sites"), vec![shop, same_name]);
+    let names: Vec<String> = store
+        .organizations()
+        .expect("organizations")
+        .into_iter()
+        .map(|o| o.name)
+        .collect();
+    assert_eq!(names, ["Acme", "Other"]);
 }
 
 #[test]

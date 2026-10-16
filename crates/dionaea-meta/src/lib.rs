@@ -148,6 +148,8 @@ pub trait MetaStore: Send + Sync {
 
     fn create_organization(&self, name: &str) -> Result<Organization, MetaError>;
 
+    fn organizations(&self) -> Result<Vec<Organization>, MetaError>;
+
     fn create_site(&self, organization_id: u32, name: &str) -> Result<Site, MetaError>;
 
     fn sites(&self) -> Result<Vec<Site>, MetaError>;
