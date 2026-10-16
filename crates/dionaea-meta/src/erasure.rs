@@ -81,6 +81,8 @@ pub struct ErasureRequest {
     pub requested_at: i64,
     pub hidden_at: Option<i64>,
     pub completed_at: Option<i64>,
+    /// When it failed, if it did.
+    pub failed_at: Option<i64>,
     /// How many anonymous ids were linked to the user and tombstoned.
     pub anon_count: u64,
     /// What the job reports: the rows removed per table, or why it failed.

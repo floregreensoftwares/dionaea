@@ -312,6 +312,12 @@ pub trait MetaStore: Send + Sync {
         max_attempts: u32,
     ) -> Result<ErasureRequest, MetaError>;
 
+    /// Forgets the user id and devices that requests which failed at
+    /// `failed_before` (seconds since the epoch) or earlier still hold in the
+    /// clear. They stay tombstoned; asking again starts a new request. Returns
+    /// how many requests were cleared.
+    fn purge_failed_erasures(&self, failed_before: i64) -> Result<u64, MetaError>;
+
     /// How many requests are in each state, how many wait to be tried again,
     /// and how long the oldest unfinished one has waited.
     fn erasure_summary(&self) -> Result<ErasureSummary, MetaError>;

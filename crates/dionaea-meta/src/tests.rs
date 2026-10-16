@@ -455,7 +455,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 5,
+        migrations, 6,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
@@ -1452,5 +1452,111 @@ fn a_tombstone_made_under_one_key_is_not_found_with_the_hash_of_another() {
         batch.entries[0].2,
         other.tombstone_hash(site.id, IdKind::User, "u_1"),
         "what the file holds is of no use without the key"
+    );
+}
+
+// Forgetting what a failed request keeps in the clear.
+
+#[test]
+fn a_request_that_failed_long_ago_forgets_the_user_and_the_devices_but_keeps_blocking_them() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    let old = store.request_erasure(site.id, "u_old", "ops").unwrap();
+    store
+        .add_erasure_anons(old.id, &["dev_old".to_owned()])
+        .unwrap();
+    let failed = store
+        .advance_erasure(old.id, ErasureState::Failed, Some("clickhouse said no"))
+        .unwrap();
+    assert_eq!(failed.failed_at, Some(1_000));
+
+    now.store(5_000, Ordering::SeqCst);
+    let recent = store.request_erasure(site.id, "u_recent", "ops").unwrap();
+    store
+        .advance_erasure(recent.id, ErasureState::Failed, Some("also"))
+        .unwrap();
+    let waiting = store.request_erasure(site.id, "u_waiting", "ops").unwrap();
+
+    // Only what failed at or before the cutoff.
+    assert_eq!(store.purge_failed_erasures(4_999).unwrap(), 1);
+    let purged = store.erasure_request(old.id).unwrap();
+    assert_eq!(purged.user_id, None);
+    assert!(store.erasure_anons(old.id).unwrap().is_empty());
+    let detail = purged.detail.unwrap();
+    assert!(
+        detail.contains("clickhouse said no") && detail.contains("ask again"),
+        "{detail}"
+    );
+    assert_eq!(purged.user_hash, failed.user_hash, "the audit hash stays");
+    assert_eq!(
+        store.erasure_request(recent.id).unwrap().user_id.as_deref(),
+        Some("u_recent")
+    );
+    assert_eq!(
+        store
+            .erasure_request(waiting.id)
+            .unwrap()
+            .user_id
+            .as_deref(),
+        Some("u_waiting"),
+        "an unfinished request is never touched"
+    );
+    assert_eq!(store.purge_failed_erasures(4_999).unwrap(), 0, "once");
+
+    // Still blocked.
+    let blocked = tombstones(&store);
+    assert!(blocked.user_erased(site.id, "u_old"));
+    assert!(blocked.anon_erased(site.id, "dev_old"));
+
+    now.store(9_000, Ordering::SeqCst);
+    assert_eq!(store.purge_failed_erasures(8_000).unwrap(), 1);
+    assert_eq!(
+        store.erasure_request(recent.id).unwrap().user_id,
+        None,
+        "later, the recent one too"
+    );
+}
+
+#[test]
+fn a_purged_request_cannot_be_retried_but_asking_again_works() {
+    let (store, _) = clocked();
+    let site = site(&store);
+    let old = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    store
+        .advance_erasure(old.id, ErasureState::Failed, None)
+        .unwrap();
+    assert_eq!(store.purge_failed_erasures(1_000).unwrap(), 1);
+
+    let error = store.retry_erasure(old.id).unwrap_err();
+    assert!(
+        matches!(error, MetaError::Conflict(_))
+            && error.to_string().contains("ask for the erasure again"),
+        "{error}"
+    );
+    let again = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    assert_ne!(again.id, old.id, "a new request");
+    assert_eq!(again.user_id.as_deref(), Some("u_1"));
+    assert_eq!(again.state, ErasureState::Requested);
+}
+
+#[test]
+fn giving_up_and_retrying_set_and_clear_the_time_of_failure() {
+    let (store, now) = clocked();
+    let site = site(&store);
+    let request = store.request_erasure(site.id, "u_1", "ops").unwrap();
+    now.store(2_000, Ordering::SeqCst);
+    let failed = store
+        .record_erasure_trouble(request.id, "down", 0, 1)
+        .unwrap();
+    assert_eq!(
+        (failed.state, failed.failed_at),
+        (ErasureState::Failed, Some(2_000))
+    );
+    let again = store.retry_erasure(request.id).unwrap();
+    assert_eq!(again.failed_at, None);
+    assert_eq!(
+        store.purge_failed_erasures(i64::MAX).unwrap(),
+        0,
+        "not failed any more"
     );
 }

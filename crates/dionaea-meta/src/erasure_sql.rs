@@ -11,7 +11,7 @@ use crate::sqlite::{bump, id_of, storage};
 use crate::{MAX_LABEL_LEN, MetaError};
 
 const COLUMNS: &str = "id, site_id, user_id, user_hash, state, requested_by, requested_at,
-    hidden_at, completed_at, anon_count, detail, attempts, retry_after";
+    hidden_at, completed_at, anon_count, detail, attempts, retry_after, failed_at";
 
 fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)> {
     Ok((
@@ -29,6 +29,7 @@ fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)>
             detail: row.get(10)?,
             attempts: row.get(11)?,
             retry_after: row.get(12)?,
+            failed_at: row.get(13)?,
         },
     ))
 }
@@ -45,6 +46,7 @@ struct ErasureRequestRest {
     detail: Option<String>,
     attempts: i64,
     retry_after: Option<i64>,
+    failed_at: Option<i64>,
 }
 
 fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaError> {
@@ -60,6 +62,7 @@ fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaEr
         requested_at: rest.requested_at,
         hidden_at: rest.hidden_at,
         completed_at: rest.completed_at,
+        failed_at: rest.failed_at,
         anon_count: u64::try_from(rest.anon_count).unwrap_or(0),
         detail: rest.detail,
         attempts: u32::try_from(rest.attempts).unwrap_or(u32::MAX),
@@ -370,6 +373,7 @@ pub(crate) fn advance(
         "UPDATE erasure_requests SET state = ?2,
             hidden_at = COALESCE(?3, hidden_at),
             completed_at = COALESCE(?4, completed_at),
+            failed_at = CASE WHEN ?2 = 'failed' THEN ?6 ELSE NULL END,
             detail = COALESCE(?5, detail),
             user_id = CASE WHEN ?2 = 'complete' THEN NULL ELSE user_id END,
             attempts = 0, retry_after = NULL,
@@ -380,7 +384,8 @@ pub(crate) fn advance(
             to.as_str(),
             hidden,
             completed,
-            detail
+            detail,
+            at
         ],
     )
     .map_err(storage)?;
@@ -402,8 +407,14 @@ pub(crate) fn retry(tx: &Transaction<'_>, id: u64) -> Result<ErasureRequest, Met
             "only a failed request can be retried".to_owned(),
         ));
     }
+    if current.user_id.is_none() {
+        return Err(MetaError::Conflict(
+            "the user id of this request was forgotten after it failed; ask for the erasure again"
+                .to_owned(),
+        ));
+    }
     tx.execute(
-        "UPDATE erasure_requests SET state = 'requested', detail = NULL,
+        "UPDATE erasure_requests SET state = 'requested', detail = NULL, failed_at = NULL,
             attempts = 0, retry_after = NULL,
             claimed_by = NULL, lease_until = NULL WHERE id = ?1",
         [i64::try_from(id).unwrap_or(i64::MAX)],
@@ -489,11 +500,12 @@ pub(crate) fn trouble(
     if attempts >= max_attempts.max(1) {
         tx.execute(
             "UPDATE erasure_requests SET state = 'failed', attempts = ?2, retry_after = NULL,
-                detail = ?3, claimed_by = NULL, lease_until = NULL WHERE id = ?1",
+                detail = ?3, failed_at = ?4, claimed_by = NULL, lease_until = NULL WHERE id = ?1",
             params![
                 id_sql,
                 attempts,
-                format!("gave up after {attempts} attempts: {message}")
+                format!("gave up after {attempts} attempts: {message}"),
+                at
             ],
         )
         .map_err(storage)?;
@@ -590,4 +602,36 @@ pub(crate) fn release_lease(
     )
     .map_err(storage)?;
     Ok(())
+}
+
+/// Forgets the user id and the devices, which a failed request keeps in the
+/// clear so that it can be retried, of every request that failed at
+/// `failed_before` or earlier. The tombstones stay, so the user and devices
+/// stay blocked; asking again starts a new request. Returns how many requests
+/// were cleared.
+pub(crate) fn purge_failed(tx: &Transaction<'_>, failed_before: i64) -> Result<u64, MetaError> {
+    let ids: Vec<i64> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT id FROM erasure_requests
+                 WHERE state = 'failed' AND user_id IS NOT NULL AND failed_at <= ?1",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([failed_before], |row| row.get(0))
+            .map_err(storage)?;
+        rows.collect::<Result<_, _>>().map_err(storage)?
+    };
+    for id in &ids {
+        tx.execute(
+            "UPDATE erasure_requests SET user_id = NULL,
+                detail = COALESCE(detail, '') || ' (the user id was forgotten; ask again)'
+             WHERE id = ?1",
+            [id],
+        )
+        .map_err(storage)?;
+        tx.execute("DELETE FROM erasure_anons WHERE request_id = ?1", [id])
+            .map_err(storage)?;
+    }
+    Ok(ids.len() as u64)
 }

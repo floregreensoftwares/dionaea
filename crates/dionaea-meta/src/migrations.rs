@@ -136,4 +136,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         ALTER TABLE state ADD COLUMN erasure_key_check TEXT;
     ",
     },
+    Migration {
+        version: 6,
+        name: "erasure_failed_at",
+        sql: "
+        -- When a request failed, so the identifiers it still holds in the clear
+        -- can be forgotten after a while.
+        ALTER TABLE erasure_requests ADD COLUMN failed_at INTEGER;
+    ",
+    },
 ];

@@ -67,6 +67,8 @@ pub(crate) struct JobStats {
     /// many of them.
     pub(crate) trouble: AtomicU64,
     pub(crate) gave_up: AtomicU64,
+    /// Failed requests whose user id and devices were forgotten.
+    pub(crate) purged: AtomicU64,
     /// The requests by state, as of the last round.
     pub(crate) summary: Mutex<ErasureSummary>,
 }
@@ -142,6 +144,8 @@ pub(crate) struct Timing {
     pub(crate) finish_after: Duration,
     /// Troubles in a row after which a request fails.
     pub(crate) max_attempts: u32,
+    /// How long a failed request keeps the identifiers in the clear.
+    pub(crate) failed_keep: Duration,
 }
 
 pub(crate) struct Job {
@@ -279,6 +283,29 @@ impl Job {
         });
         if lost.load(Ordering::Acquire) {
             self.stats.leader.store(false, Ordering::Relaxed);
+            return;
+        }
+        self.forget_old_failures(timing, now_secs);
+    }
+
+    /// A failed request keeps the user id and devices in the clear so that it
+    /// can be retried; after `failed_keep` they are forgotten (the tombstones
+    /// keep blocking, and asking again starts a new request).
+    fn forget_old_failures(&self, timing: Timing, now_secs: i64) {
+        let keep = i64::try_from(timing.failed_keep.as_secs()).unwrap_or(i64::MAX);
+        match self
+            .meta
+            .purge_failed_erasures(now_secs.saturating_sub(keep))
+        {
+            Ok(0) => {}
+            Ok(forgotten) => {
+                self.stats.purged.fetch_add(forgotten, Ordering::Relaxed);
+                info!(
+                    forgotten,
+                    "failed erasure requests forgot their identifiers"
+                );
+            }
+            Err(error) => warn!(%error, "cannot forget the identifiers of old failed requests"),
         }
     }
 
@@ -708,6 +735,7 @@ mod tests {
         grace: Duration::from_secs(7),
         finish_after: Duration::from_secs(100),
         max_attempts: 3,
+        failed_keep: Duration::from_secs(1_000),
     };
 
     struct World {
@@ -1179,5 +1207,41 @@ mod tests {
         assert_eq!(w.fake.rewrites.load(Ordering::SeqCst), 0);
         assert!(w.fake.applied.lock().unwrap().is_empty());
         assert_eq!(w.stats.completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failed_request_forgets_its_identifiers_after_the_time_it_may_keep_them() {
+        let w = world(two_users());
+        let request = w.meta.request_erasure(w.site, "u1", "ops").unwrap();
+        w.fake.fail_next(Error::Server {
+            status: 400,
+            message: "bad statement".to_owned(),
+        });
+        round(&w.job, &w);
+        let failed = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!(failed.state, ErasureState::Failed);
+        assert_eq!(failed.user_id.as_deref(), Some("u1"), "kept for a retry");
+
+        // Not before failed_keep (1000 s) has passed.
+        w.now.store(1_000 + 999, Ordering::SeqCst);
+        round(&w.job, &w);
+        assert!(
+            w.meta
+                .erasure_request(request.id)
+                .unwrap()
+                .user_id
+                .is_some()
+        );
+        assert_eq!(w.stats.purged.load(Ordering::Relaxed), 0);
+
+        w.now.store(1_000 + 1_000, Ordering::SeqCst);
+        round(&w.job, &w);
+        let forgotten = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!(forgotten.user_id, None);
+        assert_eq!(w.stats.purged.load(Ordering::Relaxed), 1);
+        assert!(
+            tombstones_of(&w.meta).user_erased(w.site, "u1"),
+            "still blocked"
+        );
     }
 }

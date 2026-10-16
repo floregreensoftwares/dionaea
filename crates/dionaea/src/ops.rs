@@ -159,6 +159,12 @@ fn render_erasure(out: &mut String, job: &JobStats) {
             job.trouble.load(Ordering::Relaxed),
         ),
         (
+            "dionaea_erasure_purged_total",
+            "counter",
+            "Failed requests that forgot their user id and devices.",
+            job.purged.load(Ordering::Relaxed),
+        ),
+        (
             "dionaea_erasure_gave_up_total",
             "counter",
             "Requests given up on after too many troubles in a row.",
