@@ -455,7 +455,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 6,
+        migrations, 7,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
@@ -1671,4 +1671,114 @@ fn every_configured_key_is_tried_on_a_lookup_and_a_wrong_one_finds_nothing() {
     assert_eq!(keys.current(), Some(&new_key()));
     assert!(keys.knows(&key().check()) && keys.knows(&new_key().check()));
     assert!(!keys.knows("0000"));
+}
+
+// Erasing one device.
+
+#[test]
+fn a_device_request_blocks_the_device_at_once_and_not_a_user() {
+    let store = store();
+    let site = site(&store);
+    let request = store
+        .request_device_erasure(site.id, "dev_9", "ops")
+        .unwrap();
+    assert_eq!(request.state, ErasureState::Requested);
+    assert_eq!(request.user_id, None);
+    assert_eq!(request.device_id.as_deref(), Some("dev_9"));
+    assert_eq!(request.anon_count, 1);
+    assert_eq!(
+        request.user_hash,
+        key().tombstone_hash(site.id, IdKind::Anon, "dev_9"),
+        "the audit hash is the device's"
+    );
+    assert_eq!(store.erasure_anons(request.id).unwrap(), vec!["dev_9"]);
+
+    let blocked = tombstones(&store);
+    assert!(blocked.anon_erased(site.id, "dev_9"));
+    assert!(!blocked.anon_erased(site.id + 1, "dev_9"), "per site");
+    assert!(
+        !blocked.user_erased(site.id, "dev_9"),
+        "a device is not a user"
+    );
+    assert_eq!(blocked.len(), 1);
+}
+
+#[test]
+fn a_device_request_is_not_duplicated_checked_and_independent_of_a_user_with_the_same_name() {
+    let store = store();
+    let site = site(&store);
+    let first = store
+        .request_device_erasure(site.id, "same", "ops")
+        .unwrap();
+    let again = store
+        .request_device_erasure(site.id, "same", "someone else")
+        .unwrap();
+    assert_eq!(first.id, again.id);
+    let user = store.request_erasure(site.id, "same", "ops").unwrap();
+    assert_ne!(user.id, first.id, "a user called `same` is another subject");
+    assert_eq!(user.user_id.as_deref(), Some("same"));
+    assert_eq!(user.device_id, None);
+
+    for bad in ["", "a b", "a@b.c", &"x".repeat(65)] {
+        assert!(
+            matches!(
+                store.request_device_erasure(site.id, bad, "ops"),
+                Err(MetaError::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(
+        store.request_device_erasure(site.id + 9, "d", "ops"),
+        Err(MetaError::NotFound("site"))
+    ));
+}
+
+#[test]
+fn completing_or_purging_a_device_request_forgets_the_device_but_keeps_blocking_it() {
+    let (store, _) = clocked();
+    let site = site(&store);
+    let done = store
+        .request_device_erasure(site.id, "dev_a", "ops")
+        .unwrap();
+    store
+        .advance_erasure(done.id, ErasureState::Hidden, None)
+        .unwrap();
+    let complete = store
+        .advance_erasure(done.id, ErasureState::Complete, None)
+        .unwrap();
+    assert_eq!(complete.device_id, None);
+    assert!(store.erasure_anons(done.id).unwrap().is_empty());
+
+    let failed = store
+        .request_device_erasure(site.id, "dev_b", "ops")
+        .unwrap();
+    store
+        .advance_erasure(failed.id, ErasureState::Failed, Some("no"))
+        .unwrap();
+    assert_eq!(store.purge_failed_erasures(1_000).unwrap(), 1);
+    let purged = store.erasure_request(failed.id).unwrap();
+    assert_eq!(purged.device_id, None);
+    assert!(matches!(
+        store.retry_erasure(failed.id),
+        Err(MetaError::Conflict(_))
+    ));
+
+    let blocked = tombstones(&store);
+    assert!(blocked.anon_erased(site.id, "dev_a") && blocked.anon_erased(site.id, "dev_b"));
+}
+
+#[test]
+fn a_failed_device_request_can_be_retried_while_the_device_is_remembered() {
+    let store = store();
+    let site = site(&store);
+    let request = store
+        .request_device_erasure(site.id, "dev_c", "ops")
+        .unwrap();
+    store
+        .advance_erasure(request.id, ErasureState::Failed, Some("no"))
+        .unwrap();
+    let retried = store.retry_erasure(request.id).unwrap();
+    assert_eq!(retried.state, ErasureState::Requested);
+    assert_eq!(retried.device_id.as_deref(), Some("dev_c"));
 }

@@ -399,3 +399,39 @@ fn the_key_can_be_replaced_when_the_old_one_is_kept_as_a_previous_key() {
         err(&orphan)
     );
 }
+
+#[test]
+fn a_device_can_be_erased_by_its_anonymous_id_and_a_request_names_one_subject() {
+    let dir = dir("erase-device");
+    let db = dir.join("meta.db");
+    assert_eq!(run(&db, &["site", "create", "shop"]).status.code(), Some(0));
+
+    let asked = run(&db, &["erase", "request", "--site", "1", "--anon", "dev_9"]);
+    assert_eq!(asked.status.code(), Some(0), "{}", err(&asked));
+    let line = out(&asked);
+    let fields: Vec<&str> = line.trim_end().split('\t').collect();
+    assert_eq!(&fields[..3], &["1", "1", "requested"], "{line}");
+    assert_eq!(fields[7], "1", "the device is known from the start");
+    assert_eq!(fields[10], "device");
+    assert!(!line.contains("dev_9"), "the id is not printed");
+
+    let again = run(&db, &["erase", "request", "--site", "1", "--anon", "dev_9"]);
+    assert_eq!(out(&again), line, "the same request");
+    let user = run(&db, &["erase", "request", "--site", "1", "--user", "dev_9"]);
+    let user_line = out(&user);
+    assert!(user_line.trim_end().ends_with("\tuser"), "{user_line}");
+    assert_ne!(user_line, line);
+
+    let both = run(
+        &db,
+        &[
+            "erase", "request", "--site", "1", "--user", "u", "--anon", "d",
+        ],
+    );
+    assert_eq!(both.status.code(), Some(2), "clap refuses both");
+    let neither = run(&db, &["erase", "request", "--site", "1"]);
+    assert_eq!(neither.status.code(), Some(2), "and neither");
+    let bad = run(&db, &["erase", "request", "--site", "1", "--anon", "a b"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(err(&bad).contains("device id"), "{}", err(&bad));
+}

@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use config::{Config, LogFormat};
-use dionaea_meta::{ErasureState, MetaStore};
+use dionaea_meta::{ErasureState, ErasureSubject, MetaStore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -128,9 +128,15 @@ enum EraseCommand {
     Request {
         #[arg(long)]
         site: u32,
-        /// The user id the app sent to identify
+        /// The user id the app sent to identify; every device ever linked to
+        /// them is erased too
+        #[arg(long, conflicts_with = "anon", required_unless_present = "anon")]
+        user: Option<String>,
+        /// Erase one device by its anonymous id instead (for a person who
+        /// gives it, or whose device never identified itself); the users it
+        /// was linked to keep their traits
         #[arg(long)]
-        user: String,
+        anon: Option<String>,
         /// Who is asking, for the audit trail
         #[arg(long, default_value = "cli")]
         by: String,
@@ -138,7 +144,7 @@ enum EraseCommand {
         store: StoreArgs,
     },
     /// List requests: id, site, state, requested by, requested at, hidden at,
-    /// completed at, devices, hash of the user id, failed attempts
+    /// completed at, devices, hash of the user id, failed attempts, user or device
     List {
         /// Only requests in this state: requested, hidden, complete or failed
         #[arg(long)]
@@ -268,10 +274,16 @@ fn erase(command: EraseCommand) -> ExitCode {
         EraseCommand::Request {
             site,
             user,
+            anon,
             by,
             store,
         } => with_store(&store, |meta, out, err| {
-            meta_cli::erase_request(meta, site, &user, &by, out, err)
+            let subject = match (&user, &anon) {
+                (Some(user), None) => ErasureSubject::User(user),
+                (None, Some(device)) => ErasureSubject::Device(device),
+                _ => return meta_cli::REFUSED,
+            };
+            meta_cli::erase_request(meta, site, subject, &by, out, err)
         }),
         EraseCommand::List { state, store } => with_store(&store, |meta, out, err| {
             let state = match state.as_deref() {

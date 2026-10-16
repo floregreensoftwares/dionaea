@@ -146,4 +146,14 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         ALTER TABLE erasure_requests ADD COLUMN failed_at INTEGER;
     ",
     },
+    Migration {
+        version: 7,
+        name: "erasure_device",
+        sql: "
+        -- A request may name one device instead of a user: for a person who
+        -- gives the device id, or whose device never identified itself. The
+        -- device id is kept in the clear only until the request completes.
+        ALTER TABLE erasure_requests ADD COLUMN device_id TEXT;
+    ",
+    },
 ];

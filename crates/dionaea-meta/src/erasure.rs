@@ -79,7 +79,11 @@ pub struct ErasureRequest {
     /// The user id, until the request is complete; then `None`, and only the
     /// hash remains.
     pub user_id: Option<String>,
-    /// The tombstone hash of the user id: the audit record of who was erased.
+    /// For a request that names a device instead of a user: the device id,
+    /// until the request is complete. Such a request has no `user_id`.
+    pub device_id: Option<String>,
+    /// The tombstone hash of the user id (or of the device id for a request
+    /// that names a device): the audit record of who was erased.
     pub user_hash: String,
     pub state: ErasureState,
     pub requested_by: String,
@@ -98,6 +102,15 @@ pub struct ErasureRequest {
     pub attempts: u32,
     /// Seconds since the epoch before which it is not tried again.
     pub retry_after: Option<i64>,
+}
+
+/// Who an erasure request is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErasureSubject<'a> {
+    /// A user, and every device ever linked to them.
+    User(&'a str),
+    /// One device and what was stored under it, whoever it was linked to.
+    Device(&'a str),
 }
 
 /// How many requests are where, for the metrics.

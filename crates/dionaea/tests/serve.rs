@@ -2218,3 +2218,83 @@ fn a_server_needs_no_erasure_key_until_somebody_is_erased() {
         "the server runs without one"
     );
 }
+
+/// A device that never identified itself, erased by its id: its events go,
+/// the identified person's stay, and the device is refused afterwards.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_device_that_never_identified_can_be_erased_by_its_id() {
+    let database = ScratchDatabase::new("device");
+    let dir = dir("device");
+    let cli = |args: &[&str]| {
+        let output = in_clickhouse(&dir, &database.name)
+            .args(args)
+            .output()
+            .expect("run the binary");
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    cli(&["site", "create", "shop"]);
+    let schema = dir.join("schema.toml");
+    std::fs::write(&schema, SCHEMA_WITH_TRAITS).expect("write the schema");
+    cli(&[
+        "schema",
+        "push",
+        "--site",
+        "1",
+        schema.to_str().expect("utf-8"),
+    ]);
+    let key = cli(&["key", "issue", "--site", "1"]);
+    let mut command = in_clickhouse(&dir, &database.name);
+    command
+        .env("DIONAEA_REFRESH_SECS", "1")
+        .env("DIONAEA_ERASE_GRACE_SECS", "0")
+        .env("DIONAEA_ERASE_FINISH_AFTER_SECS", "0");
+    let server = Server::start_with(command);
+
+    let event_of = |n: u32, anon: &str| {
+        batch(n, 1).replace("\"anon_id\":\"a1\"", &format!("\"anon_id\":\"{anon}\""))
+    };
+    // Two events of a device nobody linked, one of a device that identified.
+    for (n, anon) in [(1, "free_dev"), (2, "free_dev"), (3, "known_dev")] {
+        assert_eq!(
+            server.request(&collect_head(&key), &event_of(n, anon)).0,
+            202
+        );
+    }
+    let body = identify_body("known_dev", "u_known", "{\"plan\":\"pro\"}");
+    assert_eq!(server.request(&identify_head(&key), &body).0, 202);
+    database.wait_for("the events", "SELECT count() FROM events", 3);
+    database.wait_for("the traits", "SELECT count() FROM user_traits", 1);
+
+    let asked = cli(&["erase", "request", "--site", "1", "--anon", "free_dev"]);
+    assert!(asked.contains("device"), "{asked}");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !cli(&["erase", "list", "--state", "complete"]).contains("complete") {
+        assert!(
+            Instant::now() < deadline,
+            "never completed: {}",
+            cli(&["erase", "show", "1"])
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(database.text("SELECT anon_id FROM events"), "known_dev");
+    assert_eq!(database.number("SELECT count() FROM user_traits FINAL"), 1);
+    assert_eq!(
+        database.number("SELECT count() FROM identity_alias FINAL"),
+        1
+    );
+
+    let (status, answer) = server.request(&collect_head(&key), &event_of(10, "free_dev"));
+    assert_eq!(status, 202);
+    assert!(
+        answer.contains("{\"accepted\":0,\"dropped\":1}"),
+        "{answer}"
+    );
+    assert_eq!(
+        server
+            .request(&collect_head(&key), &event_of(11, "known_dev"))
+            .0,
+        202
+    );
+}
