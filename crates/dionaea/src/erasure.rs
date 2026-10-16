@@ -13,16 +13,23 @@
 //!    that includes marked rows must find none. Then the request is
 //!    `complete`; if rows remain it is `failed` with the counts.
 //!
-//! A failure that retrying could fix (ClickHouse unreachable) leaves the
-//! request where it is: its lease runs out and a worker takes it again. One
-//! that cannot be fixed by retrying fails the request with the reason.
+//! A failure that retrying could fix (ClickHouse unreachable) delays the
+//! request with a growing wait, and after `erase_max_attempts` of them in a
+//! row fails it with the last message. One that cannot be fixed by retrying
+//! fails the request at once with the reason.
+//!
+//! Only one server at a time does this work: they compete for a lease in the
+//! metadata store, renewed while the work runs, and the others stand by until
+//! the holder stops or dies.
 //!
 //! Nothing here logs an identifier: requests are named by their number.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
 use std::time::Duration;
 
-use dionaea_meta::{ErasureRequest, ErasureState, MetaError, MetaStore};
+use dionaea_meta::{ErasureRequest, ErasureState, ErasureSummary, MetaError, MetaStore};
 use dionaea_store::{Error, Store, TableCount};
 use tracing::{info, warn};
 
@@ -30,6 +37,45 @@ use tracing::{info, warn};
 const HIDE_LEASE_SECS: i64 = 600;
 /// How long a worker holds the requests it is finishing.
 const FINISH_LEASE_SECS: i64 = 3600;
+/// The lease that makes one server at a time do the work, how long it lasts
+/// without being renewed, and how often it is renewed while work runs.
+const LEADER_LEASE: &str = "erasure";
+const LEADER_LEASE_SECS: i64 = 30;
+const HEARTBEAT: Duration = Duration::from_secs(10);
+/// The wait after the first trouble with a request; it doubles each time up to
+/// the cap.
+const RETRY_BASE_SECS: i64 = 30;
+const RETRY_CAP_SECS: i64 = 3600;
+
+/// How long to leave a request alone after its `attempts`-th trouble.
+fn backoff(attempts: u32) -> i64 {
+    RETRY_BASE_SECS
+        .saturating_mul(1_i64 << attempts.saturating_sub(1).min(20))
+        .min(RETRY_CAP_SECS)
+}
+
+/// What the job did, for the metrics.
+#[derive(Debug, Default)]
+pub(crate) struct JobStats {
+    /// This server holds the lease and does the work.
+    pub(crate) leader: AtomicBool,
+    pub(crate) hidden: AtomicU64,
+    pub(crate) completed: AtomicU64,
+    /// Requests the job failed: rejected by ClickHouse, or rows that remained.
+    pub(crate) failed: AtomicU64,
+    /// Troubles that retrying may fix, and the requests given up on after too
+    /// many of them.
+    pub(crate) trouble: AtomicU64,
+    pub(crate) gave_up: AtomicU64,
+    /// The requests by state, as of the last round.
+    pub(crate) summary: Mutex<ErasureSummary>,
+}
+
+impl JobStats {
+    pub(crate) fn summary(&self) -> ErasureSummary {
+        *self.summary.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// What the job needs from ClickHouse. [`Store`] is the implementation; tests
 /// use their own.
@@ -77,12 +123,16 @@ pub(crate) struct Timing {
     pub(crate) grace: Duration,
     /// How long a request stays `hidden` before the physical removal.
     pub(crate) finish_after: Duration,
+    /// Troubles in a row after which a request fails.
+    pub(crate) max_attempts: u32,
 }
 
 pub(crate) struct Job {
     meta: Arc<dyn MetaStore>,
     eraser: Arc<dyn Eraser>,
     worker: String,
+    stats: Arc<JobStats>,
+    heartbeat: Duration,
 }
 
 /// The rows per table, as text for a request's report.
@@ -99,31 +149,150 @@ impl Job {
         meta: Arc<dyn MetaStore>,
         eraser: Arc<dyn Eraser>,
         worker: impl Into<String>,
+        stats: Arc<JobStats>,
     ) -> Self {
         Self {
             meta,
             eraser,
             worker: worker.into(),
+            stats,
+            heartbeat: HEARTBEAT,
         }
     }
 
-    /// What to do with a step that failed: leave the request for a later try
-    /// when the cause is transient, fail it when retrying cannot help.
-    fn trouble(&self, request: &ErasureRequest, error: &Error) {
+    /// How often the lease is renewed while work runs; for tests.
+    #[cfg(test)]
+    fn with_heartbeat(mut self, every: Duration) -> Self {
+        self.heartbeat = every;
+        self
+    }
+
+    /// What to do with a step that failed: delay the request when the cause
+    /// is transient (failing it after too many in a row), fail it when
+    /// retrying cannot help.
+    fn trouble(&self, request: &ErasureRequest, error: &Error, timing: Timing) {
         if error.is_permanent() {
             warn!(request = request.id, %error, "an erasure request cannot be carried out");
             self.fail(request.id, &format!("rejected by ClickHouse: {error}"));
-        } else {
-            warn!(request = request.id, %error, "an erasure step failed; it will be tried again");
+            return;
+        }
+        self.stats.trouble.fetch_add(1, Ordering::Relaxed);
+        let wait = backoff(request.attempts.saturating_add(1));
+        match self.meta.record_erasure_trouble(
+            request.id,
+            &error.to_string(),
+            wait,
+            timing.max_attempts,
+        ) {
+            Ok(after) if after.state == ErasureState::Failed => {
+                self.stats.gave_up.fetch_add(1, Ordering::Relaxed);
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    request = request.id,
+                    attempts = after.attempts,
+                    "an erasure request failed too many times; it is given up"
+                );
+            }
+            Ok(after) => warn!(
+                request = request.id,
+                attempts = after.attempts,
+                wait_secs = wait,
+                %error,
+                "an erasure step failed; it will be tried again"
+            ),
+            Err(meta_error) => Self::meta_trouble(request.id, &meta_error),
         }
     }
 
     fn fail(&self, id: u64, why: &str) {
-        if let Err(error) = self
+        match self
             .meta
             .advance_erasure(id, ErasureState::Failed, Some(why))
         {
-            warn!(request = id, %error, "cannot mark an erasure request as failed");
+            Ok(_) => {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => warn!(request = id, %error, "cannot mark an erasure request as failed"),
+        }
+    }
+
+    /// One round of work, if this server may do it: it must hold the lease
+    /// that lets one server at a time work, which a heartbeat renews while the
+    /// work runs. Requests that were just made are hidden, then the ones that
+    /// are due are finished. `wait` sleeps for the grace period and returns
+    /// `false` when the server is stopping.
+    pub(crate) fn run_round(&self, timing: Timing, now_secs: i64, wait: &dyn Fn(Duration) -> bool) {
+        match self.meta.erasure_summary() {
+            Ok(summary) => {
+                *self
+                    .stats
+                    .summary
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = summary;
+            }
+            Err(error) => warn!(%error, "cannot count the erasure requests"),
+        }
+        let lead = self
+            .meta
+            .try_lease(LEADER_LEASE, &self.worker, LEADER_LEASE_SECS);
+        let leading = lead.as_ref().is_ok_and(|held| *held);
+        self.stats.leader.store(leading, Ordering::Relaxed);
+        if let Err(error) = &lead {
+            warn!(%error, "cannot take part in choosing which server does the erasures");
+        }
+        if !leading {
+            return;
+        }
+        let done = AtomicBool::new(false);
+        let lost = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let beat = scope.spawn(|| self.heartbeat(&done, &lost));
+            // A server that lost the lease finishes the statement it is in and
+            // starts nothing more.
+            loop {
+                if lost.load(Ordering::Acquire) || !self.hide_next(timing, now_secs, wait) {
+                    break;
+                }
+            }
+            if !lost.load(Ordering::Acquire) {
+                self.finish_due(timing, now_secs);
+            }
+            done.store(true, Ordering::Release);
+            beat.thread().unpark();
+        });
+        if lost.load(Ordering::Acquire) {
+            self.stats.leader.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Renews the lease while the work runs, so a long statement does not let
+    /// another server in. Sets `lost` if another server holds it by now.
+    fn heartbeat(&self, done: &AtomicBool, lost: &AtomicBool) {
+        loop {
+            thread::park_timeout(self.heartbeat);
+            if done.load(Ordering::Acquire) {
+                return;
+            }
+            match self
+                .meta
+                .try_lease(LEADER_LEASE, &self.worker, LEADER_LEASE_SECS)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("the erasure lease was taken over while work was running");
+                    lost.store(true, Ordering::Release);
+                }
+                Err(error) => warn!(%error, "cannot renew the erasure lease"),
+            }
+        }
+    }
+
+    /// Lets go of the lease, so another server takes over at once. For a
+    /// server that is stopping.
+    pub(crate) fn step_down(&self) {
+        self.stats.leader.store(false, Ordering::Relaxed);
+        if let Err(error) = self.meta.release_lease(LEADER_LEASE, &self.worker) {
+            warn!(%error, "cannot let go of the erasure lease");
         }
     }
 
@@ -171,7 +340,7 @@ impl Job {
         match self.eraser.linked_anon_ids(request.site_id, &user) {
             Ok(found) => anons.extend(found),
             Err(error) => {
-                self.trouble(&request, &error);
+                self.trouble(&request, &error, timing);
                 return true;
             }
         }
@@ -195,7 +364,7 @@ impl Job {
             }) {
             Ok(before) => before,
             Err(error) => {
-                self.trouble(&request, &error);
+                self.trouble(&request, &error, timing);
                 return true;
             }
         };
@@ -204,7 +373,10 @@ impl Job {
             .meta
             .advance_erasure(request.id, ErasureState::Hidden, Some(&report))
         {
-            Ok(_) => info!(request = request.id, "an erasure request is hidden"),
+            Ok(_) => {
+                self.stats.hidden.fetch_add(1, Ordering::Relaxed);
+                info!(request = request.id, "an erasure request is hidden");
+            }
             Err(error) => Self::meta_trouble(request.id, &error),
         }
         true
@@ -252,14 +424,16 @@ impl Job {
             };
             match self.eraser.delete(request.site_id, &user, &anons) {
                 Ok(()) => ready.push((request, user, anons)),
-                Err(error) => self.trouble(&request, &error),
+                Err(error) => self.trouble(&request, &error, timing),
             }
         }
         if ready.is_empty() {
             return 0;
         }
         if let Err(error) = self.eraser.remove_deleted() {
-            warn!(%error, "cannot remove the deleted rows; they will be tried again");
+            for (request, ..) in &ready {
+                self.trouble(request, &error, timing);
+            }
             return 0;
         }
 
@@ -268,7 +442,7 @@ impl Job {
             let counts = match self.eraser.count(request.site_id, &user, &anons, true) {
                 Ok(counts) => counts,
                 Err(error) => {
-                    self.trouble(&request, &error);
+                    self.trouble(&request, &error, timing);
                     continue;
                 }
             };
@@ -280,6 +454,7 @@ impl Job {
                 {
                     Ok(_) => {
                         completed += 1;
+                        self.stats.completed.fetch_add(1, Ordering::Relaxed);
                         info!(request = request.id, "an erasure request is complete");
                     }
                     Err(error) => Self::meta_trouble(request.id, &error),
@@ -333,6 +508,8 @@ mod tests {
         deletes: AtomicUsize,
         /// Rows survive the rewrite, as if it did not work.
         broken_rewrite: Mutex<bool>,
+        /// The next rewrite, and only it, fails.
+        fail_rewrite: Mutex<Option<Error>>,
     }
 
     impl Fake {
@@ -416,6 +593,9 @@ mod tests {
 
         fn remove_deleted(&self) -> Result<(), Error> {
             self.failure()?;
+            if let Some(error) = self.fail_rewrite.lock().unwrap().take() {
+                return Err(error);
+            }
             self.rewrites.fetch_add(1, Ordering::SeqCst);
             if !*self.broken_rewrite.lock().unwrap() {
                 self.rows.lock().unwrap().retain(|r| !r.marked);
@@ -451,14 +631,28 @@ mod tests {
     const TIMING: Timing = Timing {
         grace: Duration::from_secs(7),
         finish_after: Duration::from_secs(100),
+        max_attempts: 3,
     };
 
     struct World {
         meta: Arc<SqliteMeta>,
         fake: Arc<Fake>,
         job: Job,
+        stats: Arc<JobStats>,
         now: Arc<AtomicI64>,
         site: u32,
+    }
+
+    /// Another server on the same metadata store and the same ClickHouse.
+    fn second_server(world: &World) -> (Job, Arc<JobStats>) {
+        let stats = Arc::new(JobStats::default());
+        let job = Job::new(
+            Arc::clone(&world.meta) as Arc<dyn MetaStore>,
+            Arc::clone(&world.fake) as Arc<dyn Eraser>,
+            "second",
+            Arc::clone(&stats),
+        );
+        (job, stats)
     }
 
     fn world(fake: Arc<Fake>) -> World {
@@ -471,15 +665,18 @@ mod tests {
         );
         let organization = meta.create_organization("o").unwrap();
         let site = meta.create_site(organization.id, "s").unwrap().id;
+        let stats = Arc::new(JobStats::default());
         let job = Job::new(
             Arc::clone(&meta) as Arc<dyn MetaStore>,
             Arc::clone(&fake) as Arc<dyn Eraser>,
             "test",
+            Arc::clone(&stats),
         );
         World {
             meta,
             fake,
             job,
+            stats,
             now,
             site,
         }
@@ -662,5 +859,190 @@ mod tests {
             ErasureState::Complete
         );
         assert_eq!(w.fake.total(), 8);
+    }
+
+    fn round(job: &Job, world: &World) {
+        job.run_round(TIMING, now(world), &|_| true);
+    }
+
+    #[test]
+    fn only_one_server_at_a_time_does_the_work() {
+        let w = world(two_users());
+        let (other, other_stats) = second_server(&w);
+        let request = w.meta.request_erasure(w.site, "u1", "ops").unwrap();
+
+        // The first to ask leads.
+        round(&w.job, &w);
+        round(&other, &w);
+        assert!(w.stats.leader.load(Ordering::Relaxed));
+        assert!(!other_stats.leader.load(Ordering::Relaxed));
+        assert_eq!(w.stats.hidden.load(Ordering::Relaxed), 1);
+        assert_eq!(other_stats.hidden.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            w.meta.erasure_request(request.id).unwrap().state,
+            ErasureState::Hidden
+        );
+
+        // The other one does nothing however many times it tries, and the
+        // leader keeps the lease by asking again.
+        w.now.store(1_020, Ordering::SeqCst);
+        round(&w.job, &w);
+        w.now.store(1_040, Ordering::SeqCst);
+        round(&other, &w);
+        assert!(
+            !other_stats.leader.load(Ordering::Relaxed),
+            "renewed at 1020"
+        );
+    }
+
+    #[test]
+    fn another_server_takes_over_when_the_leader_goes_silent_or_steps_down() {
+        let w = world(two_users());
+        let (other, other_stats) = second_server(&w);
+        round(&w.job, &w);
+        assert!(w.stats.leader.load(Ordering::Relaxed));
+
+        // The leader dies: after the lease the other one leads.
+        w.now.store(1_000 + LEADER_LEASE_SECS, Ordering::SeqCst);
+        round(&other, &w);
+        assert!(other_stats.leader.load(Ordering::Relaxed));
+        round(&w.job, &w);
+        assert!(!w.stats.leader.load(Ordering::Relaxed), "now it stands by");
+
+        // A server that stops lets go at once.
+        other.step_down();
+        assert!(!other_stats.leader.load(Ordering::Relaxed));
+        round(&w.job, &w);
+        assert!(w.stats.leader.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn trouble_waits_longer_each_time_and_after_the_limit_the_request_fails() {
+        let w = world(two_users());
+        let request = w.meta.request_erasure(w.site, "u1", "ops").unwrap();
+        let down = || Error::Io("clickhouse is down".to_owned());
+
+        w.fake.fail_next(down());
+        round(&w.job, &w);
+        let first = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!((first.attempts, first.retry_after), (1, Some(1_030)));
+
+        // Not tried before its time.
+        w.fake.fail_next(down());
+        round(&w.job, &w);
+        assert_eq!(w.meta.erasure_request(request.id).unwrap().attempts, 1);
+        w.fake.failure().ok();
+
+        w.now.store(1_030, Ordering::SeqCst);
+        w.fake.fail_next(down());
+        round(&w.job, &w);
+        let second = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!((second.attempts, second.retry_after), (2, Some(1_090)));
+
+        w.now.store(1_090, Ordering::SeqCst);
+        w.fake.fail_next(down());
+        round(&w.job, &w);
+        let last = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!(last.state, ErasureState::Failed);
+        assert!(last.detail.unwrap().contains("gave up after 3 attempts"));
+        assert_eq!(w.stats.trouble.load(Ordering::Relaxed), 3);
+        assert_eq!(w.stats.gave_up.load(Ordering::Relaxed), 1);
+        assert_eq!(w.stats.failed.load(Ordering::Relaxed), 1);
+        round(&w.job, &w);
+        assert_eq!(w.stats.summary().failed, 1, "counted at the next round");
+    }
+
+    #[test]
+    fn the_wait_doubles_up_to_a_cap() {
+        let waits: Vec<i64> = (1..=10).map(backoff).collect();
+        assert_eq!(&waits[..4], &[30, 60, 120, 240]);
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(backoff(10), RETRY_CAP_SECS);
+        assert_eq!(backoff(u32::MAX), RETRY_CAP_SECS, "no overflow");
+        assert_eq!(backoff(0), 30);
+    }
+
+    #[test]
+    fn a_rewrite_that_keeps_failing_fails_every_request_waiting_for_it() {
+        let w = world(two_users());
+        for user in ["u1", "u2"] {
+            w.meta.request_erasure(w.site, user, "ops").unwrap();
+        }
+        round(&w.job, &w);
+        assert_eq!(w.stats.hidden.load(Ordering::Relaxed), 2);
+        let mut at = 5_000;
+        for _ in 0..3 {
+            w.now.store(at, Ordering::SeqCst);
+            // Only the rewrite fails; the deletes before it work.
+            *w.fake.fail_rewrite.lock().unwrap() = Some(Error::Io("timeout".to_owned()));
+            round(&w.job, &w);
+            at += 4_000;
+        }
+        let states: Vec<_> = w
+            .meta
+            .erasure_requests(None)
+            .unwrap()
+            .iter()
+            .map(|r| r.state)
+            .collect();
+        assert_eq!(states, vec![ErasureState::Failed, ErasureState::Failed]);
+        assert_eq!(w.stats.gave_up.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn the_summary_follows_the_requests_for_the_metrics() {
+        let w = world(two_users());
+        w.meta.request_erasure(w.site, "u1", "ops").unwrap();
+        w.meta.request_erasure(w.site, "u2", "ops").unwrap();
+        round(&w.job, &w);
+        assert_eq!(w.stats.summary().requested, 2, "counted before the work");
+        round(&w.job, &w);
+        let summary = w.stats.summary();
+        assert_eq!((summary.requested, summary.hidden), (0, 2));
+        assert_eq!(summary.oldest_open_at, Some(1_000));
+    }
+
+    #[test]
+    fn a_server_that_loses_the_lease_mid_round_starts_nothing_more() {
+        let w = world(two_users());
+        let job = Job::new(
+            Arc::clone(&w.meta) as Arc<dyn MetaStore>,
+            Arc::clone(&w.fake) as Arc<dyn Eraser>,
+            "slow",
+            Arc::clone(&w.stats),
+        )
+        .with_heartbeat(Duration::from_millis(20));
+        let (other, other_stats) = second_server(&w);
+        let first = w.meta.request_erasure(w.site, "u1", "ops").unwrap();
+
+        let second = std::cell::Cell::new(None);
+        // Far enough ahead that a request made during the round is due.
+        job.run_round(TIMING, 10_000, &|_| {
+            if second.get().is_none() {
+                // The server stalls past its lease and another takes it...
+                w.now.store(1_000 + LEADER_LEASE_SECS, Ordering::SeqCst);
+                round(&other, &w);
+                // ...then a request arrives that only the old leader could
+                // still pick up in this round.
+                second.set(Some(
+                    w.meta.request_erasure(w.site, "u2", "ops").unwrap().id,
+                ));
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            true
+        });
+        assert!(other_stats.leader.load(Ordering::Relaxed));
+        assert!(!w.stats.leader.load(Ordering::Relaxed), "it knows it lost");
+        assert_eq!(
+            w.meta.erasure_request(first.id).unwrap().state,
+            ErasureState::Hidden,
+            "the one in progress was finished"
+        );
+        assert_eq!(
+            w.meta.erasure_request(second.get().unwrap()).unwrap().state,
+            ErasureState::Requested,
+            "and nothing was started after the lease was lost"
+        );
+        assert_eq!(w.stats.hidden.load(Ordering::Relaxed), 1);
     }
 }

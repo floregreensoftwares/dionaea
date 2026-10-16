@@ -67,6 +67,7 @@ the status listed in `wire-format.md`.
 | `drop_flush_secs` | 5 | 1 to 300 | How often the drop counts of requests that kept no event are written |
 | `erase_grace_secs` | 10 | 0 to 3600 | How long erasure waits for every server to know a user was erased before deleting (never less than twice `refresh_secs`) |
 | `erase_finish_after_secs` | 86400 | 0 to 604800 | How long an erased user stays hidden before the rows are physically removed, so a day of requests share one rewrite |
+| `erase_max_attempts` | 10 | 1 to 100 | How many times in a row an erasure step may meet trouble that retrying could fix before the request fails |
 
 ## Changing limits while the server runs
 
@@ -214,12 +215,18 @@ A request is recorded in the metadata store and from that moment every server dr
 2. waits for every server to have loaded the hashes, then deletes the user's rows and the rows of those devices from `events`, `identity_alias` and `user_traits` with a lightweight delete. Queries stop returning them at once; the request is `hidden`;
 3. after `erase_finish_after_secs`, deletes once more (a slow server may have inserted some), rewrites the tables without the deleted rows (`APPLY DELETED MASK`, one rewrite for all the requests due together) and counts directly, marked rows included, that none is left. Then the request is `complete`; if any remains it is `failed` with the counts.
 
-Rows that were already in a server's spool are left out when they are inserted, so a replay cannot bring the user back. A failure that retrying could fix (ClickHouse unreachable) is retried by itself; a request ClickHouse rejects fails with the reason and can be put back with `erase retry`. The job needs the ClickHouse user `serve` runs migrations with (it uses `ALTER` and `DELETE`).
+Rows that were already in a server's spool are left out when they are inserted, so a replay cannot bring the user back.
+
+**One server does the work.** Servers that share a metadata store compete for a lease named `erasure` (30 seconds, renewed every 10 while work runs). The holder hides and finishes requests; the others stand by, and take over within the lease time if the holder dies, or at once if it stops cleanly. A server that finds the lease taken while it works (it stalled for longer than the lease) finishes the statement it is in and starts nothing more, and a request is also held by whoever works on it, so two servers never work on one request. `dionaea_erasure_leader` is 1 on the server that leads.
+
+**Trouble is bounded.** A failure that retrying could fix (ClickHouse unreachable, a statement that times out) puts the request off for 30 seconds, then 60, 120 and so on up to an hour, and counts an attempt; after `erase_max_attempts` in a row the request fails with the last message (`gave up after N attempts`). Any progress starts the count again. A request ClickHouse rejects fails at once with the reason. A failed request can be put back with `erase retry`. `dionaea erase list` shows the attempts of each request. The job needs the ClickHouse user `serve` runs migrations with (it uses `ALTER` and `DELETE`).
 
 Guarantee, with the defaults: invisible to queries within a few seconds of the request reaching a server that has reloaded the metadata, and gone from disk within a day and the time one rewrite takes. If a device is shared, erasing one user removes the rows of every device that was ever linked to them, including another user's on the same device.
 
 What the metadata store keeps: the user id and the devices in the clear until the request is complete, then only SHA-256 hashes (not salted: someone holding the metadata file can test whether a guessable id was erased) and an audit line (who asked, when, counts). `event_ids` holds only random event ids and expires after a day; the rollups hold no identifier.
 
 Metrics: `dionaea_identifies_total{result="erased"}`, `dionaea_batcher_erased_rows_total`, and drops with reason `erased` in `dionaea_events_dropped_total`.
+
+The job's own metrics: `dionaea_erasure_requests{state}` (requests by state), `dionaea_erasure_retrying` (waiting for their next attempt), `dionaea_erasure_oldest_open_seconds` (how long the oldest unfinished request has waited; alert on it), `dionaea_erasure_leader`, and the counters `dionaea_erasure_hidden_total`, `_completed_total`, `_failed_total`, `_trouble_total` and `_gave_up_total` of this server.
 
 Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `sessions`, `errors` and `measurements`, which do not exist yet and will join the list of identifier tables a test enforces.

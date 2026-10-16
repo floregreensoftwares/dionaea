@@ -111,4 +111,20 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 4,
+        name: "erasure_coordination",
+        sql: "
+        -- How often a request has met trouble that retrying may fix, and when
+        -- it may be tried again.
+        ALTER TABLE erasure_requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE erasure_requests ADD COLUMN retry_after INTEGER;
+        -- Named leases: one node at a time does the work of a job.
+        CREATE TABLE leases (
+            name   TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            until  INTEGER NOT NULL
+        );
+    ",
+    },
 ];

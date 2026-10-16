@@ -177,6 +177,22 @@ impl Live {
     }
 }
 
+/// A name for this server in the metadata store's leases: the process id, the
+/// start time and 64 random bits, so two servers do not share one even on
+/// different machines.
+fn worker_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    // The standard library seeds every `RandomState` from the system.
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("{}-{started:x}-{random:x}", std::process::id())
+}
+
 /// The time now, in milliseconds since the Unix epoch.
 fn now_ms() -> i64 {
     i64::try_from(collect::system_clock()).unwrap_or(i64::MAX / 2)
@@ -331,7 +347,8 @@ impl Node {
             let job = Job::new(
                 Arc::new(job_meta),
                 Arc::new(eraser) as Arc<dyn Eraser>,
-                format!("pid-{}", std::process::id()),
+                worker_name(),
+                Arc::clone(&status.erasure),
             );
             thread::Builder::new()
                 .name("dionaea-erasure".to_owned())
@@ -348,17 +365,15 @@ impl Node {
                         let timing = Timing {
                             grace: tuning.erase_grace.max(tuning.refresh_every * 2),
                             finish_after: tuning.erase_finish_after,
+                            max_attempts: tuning.erase_max_attempts,
                         };
                         let wait = |grace: Duration| {
                             nap(grace, &stop);
                             !stop.load(Ordering::Acquire)
                         };
-                        while !stop.load(Ordering::Acquire)
-                            && job.hide_next(timing, secs(now_ms()), &wait)
-                        {
-                        }
-                        job.finish_due(timing, secs(now_ms()));
+                        job.run_round(timing, secs(now_ms()), &wait);
                     }
+                    job.step_down();
                 })
                 .map_err(|e| format!("cannot start the erasure thread: {e}"))?
         };

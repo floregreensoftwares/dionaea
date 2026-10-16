@@ -417,7 +417,7 @@ pub(crate) fn settings_unset(
 fn erasure_line(request: &ErasureRequest) -> String {
     let time = |value: Option<i64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         request.id,
         request.site_id,
         request.state,
@@ -427,6 +427,7 @@ fn erasure_line(request: &ErasureRequest) -> String {
         time(request.completed_at),
         request.anon_count,
         request.user_hash,
+        request.attempts,
     )
 }
 
@@ -451,7 +452,8 @@ pub(crate) fn erase_request(
 
 /// Lists requests as: id, site, state, requested by, requested at, hidden at,
 /// completed at (seconds since the epoch, `-` when not yet), devices
-/// tombstoned, and the hash of the user id.
+/// tombstoned, the hash of the user id, and how many times trouble has stopped
+/// the request in its current state.
 pub(crate) fn erase_list(
     store: &dyn MetaStore,
     state: Option<ErasureState>,
