@@ -207,6 +207,7 @@ Retention for both tables is not done yet; erasure covers them (see below).
 
 ```
 dionaea erase request --site 1 --user u_42 --by ops
+dionaea erase request --site 1 --anon <device id>
 dionaea erase list [--state requested|hidden|complete|failed]
 dionaea erase show 3
 dionaea erase retry 3
@@ -226,6 +227,8 @@ Rows that were already in a server's spool are left out when they are inserted, 
 
 Guarantee, with the defaults: invisible to queries within a few seconds of the request reaching a server that has reloaded the metadata, and gone from disk within a day and the time one rewrite takes. If a device is shared, erasing one user removes the rows of every device that was ever linked to them, including another user's on the same device.
 
+**Erasing a device instead of a user.** Events can only be found through a user if the device was linked to one. For a person who gives you their device id, or whose device never identified itself (or was reset before it did), `--anon <device id>` erases that device alone: its events and every link to it, whoever the links were to, and it is blocked from then on. The traits of the users it was linked to stay, since they belong to the user. The request goes through the same states, the same two steps and the same verification as a user's, and `dionaea erase list` shows `device` or `user` in its last column. What cannot be done is to find events of a device nobody names and that never identified: nothing connects them to a person.
+
 Tombstones are never removed, so a server learns of new ones by asking only for what came after the last it saw, in batches, and keeps 128 bits of each hash (a few dozen bytes with the set's overhead: a million erased devices are tens of megabytes). A metadata change that adds none reads none.
 
 **The erasure key.** The hashes kept for erased users and devices are HMAC-SHA-256 under a secret you configure, so someone who has only the metadata file cannot test whether a guessable id such as `u_42` was erased. Make one with `openssl rand -hex 32` and give every server and every `dionaea` command the same value (`DIONAEA_ERASURE_KEY`, or `DIONAEA_ERASURE_KEY_FILE` for a file such as a container secret). Nothing needs it until the first erasure is requested; asking without one is refused with that instruction. The key itself is never stored, only a value derived from it next to each tombstone, and a server or command that lacks a key some tombstone was made with **refuses to start** (or to read or add erasures), naming the first characters of that value, instead of running as if nobody had been erased.
@@ -237,5 +240,7 @@ What the metadata store keeps: the user id and the devices in the clear until th
 Metrics: `dionaea_identifies_total{result="erased"}`, `dionaea_batcher_erased_rows_total`, and drops with reason `erased` in `dionaea_events_dropped_total`.
 
 The job's own metrics: `dionaea_erasure_requests{state}` (requests by state), `dionaea_erasure_retrying` (waiting for their next attempt), `dionaea_erasure_oldest_open_seconds` (how long the oldest unfinished request has waited; alert on it), `dionaea_erasure_leader`, and the counters `dionaea_erasure_hidden_total`, `_completed_total`, `_failed_total`, `_trouble_total` and `_gave_up_total` and `_purged_total` of this server.
+
+Requests are for one subject: `--user` or `--anon`, not both.
 
 Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `sessions`, `errors` and `measurements`, which do not exist yet and will join the list of identifier tables a test enforces.

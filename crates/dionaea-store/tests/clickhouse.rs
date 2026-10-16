@@ -961,23 +961,33 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
     assert_eq!(
         rows(
             &store
-                .count_user_rows(7, "u1", &anons, false)
+                .count_user_rows(7, Some("u1"), &anons, false)
                 .expect("before")
         ),
         vec![("events", 3), ("identity_alias", 3), ("user_traits", 1)],
         "a1 twice and a2 once; both links of a2 and the link of a1; the traits"
     );
 
-    store.delete_user_rows(7, "u1", &anons).expect("delete");
+    store
+        .delete_user_rows(7, Some("u1"), &anons)
+        .expect("delete");
     assert_eq!(
-        rows(&store.count_user_rows(7, "u1", &anons, false).expect("seen")),
+        rows(
+            &store
+                .count_user_rows(7, Some("u1"), &anons, false)
+                .expect("seen")
+        ),
         vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
         "queries no longer see the rows"
     );
     // Whether the data is still in the parts here depends on the version: 26.8
     // keeps it until the mask is applied, 25.8 has already rewritten the parts.
     // Only that it never exceeds what was there can be asserted.
-    let on_disk = rows(&store.count_user_rows(7, "u1", &anons, true).expect("disk"));
+    let on_disk = rows(
+        &store
+            .count_user_rows(7, Some("u1"), &anons, true)
+            .expect("disk"),
+    );
     assert!(
         on_disk
             .iter()
@@ -987,11 +997,15 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
     );
 
     let needed = store
-        .rewrites_needed(7, "u1", &anons)
+        .rewrites_needed(7, Some("u1"), &anons)
         .expect("what to rewrite");
     store.apply_rewrites(&needed).expect("apply the mask");
     assert_eq!(
-        rows(&store.count_user_rows(7, "u1", &anons, true).expect("gone")),
+        rows(
+            &store
+                .count_user_rows(7, Some("u1"), &anons, true)
+                .expect("gone")
+        ),
         vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
         "now it is gone from disk"
     );
@@ -1018,10 +1032,10 @@ fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
     seed_two_users(&scratch);
     let store = &scratch.store;
     store
-        .delete_user_rows(7, "ghost", &[])
+        .delete_user_rows(7, Some("ghost"), &[])
         .expect("nothing to delete");
     let nothing = store
-        .rewrites_needed(7, "ghost", &[])
+        .rewrites_needed(7, Some("ghost"), &[])
         .expect("what to rewrite");
     assert!(nothing.is_empty(), "{nothing:?}");
     store.apply_rewrites(&nothing).expect("nothing to rewrite");
@@ -1029,12 +1043,20 @@ fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
 
     let anons = store.linked_anon_ids(7, "u2").expect("linked");
     for _ in 0..2 {
-        store.delete_user_rows(7, "u2", &anons).expect("delete");
-        let needed = store.rewrites_needed(7, "u2", &anons).expect("needed");
+        store
+            .delete_user_rows(7, Some("u2"), &anons)
+            .expect("delete");
+        let needed = store
+            .rewrites_needed(7, Some("u2"), &anons)
+            .expect("needed");
         store.apply_rewrites(&needed).expect("apply");
     }
     assert_eq!(
-        rows(&store.count_user_rows(7, "u2", &anons, true).expect("gone")),
+        rows(
+            &store
+                .count_user_rows(7, Some("u2"), &anons, true)
+                .expect("gone")
+        ),
         vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
     );
 }
@@ -1047,9 +1069,14 @@ fn an_identifier_that_could_alter_the_statement_never_reaches_clickhouse() {
     let store = &scratch.store;
     for bad in ["x' OR 1 = 1 --", "a;DROP TABLE events", "", "a b"] {
         assert!(store.linked_anon_ids(7, bad).is_err(), "{bad:?}");
-        assert!(store.delete_user_rows(7, bad, &[]).is_err(), "{bad:?}");
         assert!(
-            store.delete_user_rows(7, "u1", &[bad.to_owned()]).is_err(),
+            store.delete_user_rows(7, Some(bad), &[]).is_err(),
+            "{bad:?}"
+        );
+        assert!(
+            store
+                .delete_user_rows(7, Some("u1"), &[bad.to_owned()])
+                .is_err(),
             "{bad:?}"
         );
     }
@@ -1088,8 +1115,12 @@ fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
         .expect("links");
 
     let anons = vec!["a1".to_owned()];
-    store.delete_user_rows(7, "u1", &anons).expect("delete");
-    let needed = store.rewrites_needed(7, "u1", &anons).expect("needed");
+    store
+        .delete_user_rows(7, Some("u1"), &anons)
+        .expect("delete");
+    let needed = store
+        .rewrites_needed(7, Some("u1"), &anons)
+        .expect("needed");
     // Whether the rows are still in the parts depends on the version, but
     // never more than the months of the erased device, and never the month
     // that only the other person has.
@@ -1126,7 +1157,11 @@ fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
         .apply_rewrites(&needed)
         .expect("the same again is harmless");
     assert_eq!(
-        rows(&store.count_user_rows(7, "u1", &anons, true).expect("gone")),
+        rows(
+            &store
+                .count_user_rows(7, Some("u1"), &anons, true)
+                .expect("gone")
+        ),
         vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
     );
     assert_eq!(count(store, "events"), 2, "the other person's two events");
@@ -1141,4 +1176,34 @@ fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
             .is_err(),
         "only identifier tables"
     );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits() {
+    let scratch = Scratch::new();
+    seed_two_users(&scratch);
+    let store = &scratch.store;
+    let device = vec!["a2".to_owned()];
+
+    assert_eq!(
+        rows(
+            &store
+                .count_user_rows(7, None, &device, false)
+                .expect("before")
+        ),
+        vec![("events", 1), ("identity_alias", 2), ("user_traits", 0)],
+        "the event of a2 and both links to it; no user, so no traits"
+    );
+    store.delete_user_rows(7, None, &device).expect("delete");
+    let needed = store.rewrites_needed(7, None, &device).expect("needed");
+    store.apply_rewrites(&needed).expect("rewrite");
+    assert_eq!(
+        rows(&store.count_user_rows(7, None, &device, true).expect("gone")),
+        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
+    );
+    // Everything else stays: the other events, the other links, all traits.
+    assert_eq!(count(store, "events"), 4);
+    assert_eq!(count(store, "identity_alias"), 3);
+    assert_eq!(count(store, "user_traits"), 3);
 }

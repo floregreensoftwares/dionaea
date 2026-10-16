@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use dionaea_core::Severity;
-use dionaea_meta::{ErasureRequest, ErasureState, MetaError, MetaStore, Organization};
+use dionaea_meta::{
+    ErasureRequest, ErasureState, ErasureSubject, MetaError, MetaStore, Organization,
+};
 
 use crate::settings::{self, Origin, Tuning};
 
@@ -417,7 +419,7 @@ pub(crate) fn settings_unset(
 fn erasure_line(request: &ErasureRequest) -> String {
     let time = |value: Option<i64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         request.id,
         request.site_id,
         request.state,
@@ -428,6 +430,7 @@ fn erasure_line(request: &ErasureRequest) -> String {
         request.anon_count,
         request.user_hash,
         request.attempts,
+        if request.is_device { "device" } else { "user" },
     )
 }
 
@@ -436,12 +439,18 @@ fn erasure_line(request: &ErasureRequest) -> String {
 pub(crate) fn erase_request(
     store: &dyn MetaStore,
     site_id: u32,
-    user_id: &str,
+    subject: ErasureSubject<'_>,
     requested_by: &str,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> u8 {
-    match store.request_erasure(site_id, user_id, requested_by) {
+    let asked = match subject {
+        ErasureSubject::User(user) => store.request_erasure(site_id, user, requested_by),
+        ErasureSubject::Device(device) => {
+            store.request_device_erasure(site_id, device, requested_by)
+        }
+    };
+    match asked {
         Ok(request) => {
             let _ = writeln!(out, "{}", erasure_line(&request));
             OK
@@ -452,8 +461,9 @@ pub(crate) fn erase_request(
 
 /// Lists requests as: id, site, state, requested by, requested at, hidden at,
 /// completed at (seconds since the epoch, `-` when not yet), devices
-/// tombstoned, the hash of the user id, and how many times trouble has stopped
-/// the request in its current state.
+/// tombstoned, the hash of the user id (or of the device id), how many times
+/// trouble has stopped the request in its current state, and whether it is for
+/// a `user` or a `device`.
 pub(crate) fn erase_list(
     store: &dyn MetaStore,
     state: Option<ErasureState>,

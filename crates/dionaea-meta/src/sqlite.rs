@@ -14,10 +14,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use crate::erasure_sql;
 use crate::migrations::MIGRATIONS;
 use crate::{
-    ErasureRequest, ErasureState, ErasureSummary, HashKey, HashKeys, KeyEntry, MAX_LABEL_LEN,
-    MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError, MetaStore, Organization,
-    Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting, TombstoneBatch,
-    WriteKeyInfo,
+    ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, KeyEntry,
+    MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError, MetaStore,
+    Organization, Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting,
+    TombstoneBatch, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -779,7 +779,32 @@ impl MetaStore for SqliteMeta {
         requested_by: &str,
     ) -> Result<ErasureRequest, MetaError> {
         self.write(|tx, at| {
-            erasure_sql::request(tx, &self.keys, site_id, user_id, requested_by, at)
+            erasure_sql::request(
+                tx,
+                &self.keys,
+                site_id,
+                ErasureSubject::User(user_id),
+                requested_by,
+                at,
+            )
+        })
+    }
+
+    fn request_device_erasure(
+        &self,
+        site_id: u32,
+        anon_id: &str,
+        requested_by: &str,
+    ) -> Result<ErasureRequest, MetaError> {
+        self.write(|tx, at| {
+            erasure_sql::request(
+                tx,
+                &self.keys,
+                site_id,
+                ErasureSubject::Device(anon_id),
+                requested_by,
+                at,
+            )
         })
     }
 

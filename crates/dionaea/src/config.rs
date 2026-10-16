@@ -253,8 +253,16 @@ impl Config {
 
         let (tuning, tuning_origins) = settings::resolve(&table, &source.env)?;
 
-        let erasure_key = Secret(source.text("ERASURE_KEY", file.erasure_key, ""));
-        let erasure_key_file = source.path("ERASURE_KEY_FILE", file.erasure_key_file);
+        // The environment overrides the file, as for every setting: a key in
+        // the environment replaces a key file named in the file and the other
+        // way round. Only both in the same place is a conflict.
+        let (erasure_key, erasure_key_file) =
+            match (source.var("ERASURE_KEY"), source.var("ERASURE_KEY_FILE")) {
+                (Some(key), file) => (key, file.map(PathBuf::from)),
+                (None, Some(path)) => (String::new(), Some(PathBuf::from(path))),
+                (None, None) => (file.erasure_key.unwrap_or_default(), file.erasure_key_file),
+            };
+        let erasure_key = Secret(erasure_key);
         let erasure_previous_keys: Vec<Secret> = match source.var("ERASURE_PREVIOUS_KEYS") {
             Some(list) => list
                 .split(',')
@@ -615,8 +623,23 @@ mod tests {
         .unwrap();
         assert!(short.erasure_key().unwrap_err().contains("32"));
 
-        let both = Config::resolve(Some("erasure_key_file = \"k\"\n"), from_env).unwrap();
-        assert!(both.erasure_key().unwrap_err().contains("not both"));
+        // The environment wins over the file in either direction.
+        let env_over_file =
+            Config::resolve(Some("erasure_key_file = \"/no/such\"\n"), from_env).unwrap();
+        assert!(env_over_file.erasure_key().unwrap().is_some());
+        let file_both = Config::resolve(
+            Some("erasure_key = \"0123456789abcdef0123456789abcdef\"\nerasure_key_file = \"k\"\n"),
+            |_| None,
+        )
+        .unwrap();
+        assert!(file_both.erasure_key().unwrap_err().contains("not both"));
+        let env_both = Config::resolve(None, |name| match name {
+            "DIONAEA_ERASURE_KEY" => Some(secret.to_owned()),
+            "DIONAEA_ERASURE_KEY_FILE" => Some("k".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(env_both.erasure_key().unwrap_err().contains("not both"));
 
         let missing =
             Config::resolve(Some("erasure_key_file = \"/no/such/file\"\n"), |_| None).unwrap();

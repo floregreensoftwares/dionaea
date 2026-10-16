@@ -5,13 +5,15 @@ use dionaea_core::is_id;
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 
 use crate::erasure::{
-    ErasureRequest, ErasureState, ErasureSummary, HashKey, HashKeys, IdKind, TombstoneBatch,
+    ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, IdKind,
+    TombstoneBatch,
 };
 use crate::sqlite::{bump, id_of, storage};
 use crate::{MAX_LABEL_LEN, MetaError};
 
 const COLUMNS: &str = "id, site_id, user_id, user_hash, state, requested_by, requested_at,
-    hidden_at, completed_at, anon_count, detail, attempts, retry_after, failed_at";
+    hidden_at, completed_at, anon_count, detail, attempts, retry_after, failed_at, device_id,
+    is_device";
 
 fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)> {
     Ok((
@@ -30,6 +32,8 @@ fn request_of(row: &Row<'_>) -> rusqlite::Result<(i64, i64, ErasureRequestRest)>
             attempts: row.get(11)?,
             retry_after: row.get(12)?,
             failed_at: row.get(13)?,
+            device_id: row.get(14)?,
+            is_device: row.get(15)?,
         },
     ))
 }
@@ -47,6 +51,8 @@ struct ErasureRequestRest {
     attempts: i64,
     retry_after: Option<i64>,
     failed_at: Option<i64>,
+    device_id: Option<String>,
+    is_device: bool,
 }
 
 fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaError> {
@@ -55,6 +61,8 @@ fn build(parts: (i64, i64, ErasureRequestRest)) -> Result<ErasureRequest, MetaEr
         id: u64::try_from(id).map_err(|_| MetaError::Corrupt("negative request id".to_owned()))?,
         site_id: id_of(site_id)?,
         user_id: rest.user_id,
+        device_id: rest.device_id,
+        is_device: rest.is_device,
         user_hash: rest.user_hash,
         state: ErasureState::parse(&rest.state)
             .ok_or_else(|| MetaError::Corrupt(format!("unknown erasure state `{}`", rest.state)))?,
@@ -123,6 +131,11 @@ fn tombstone(
             ],
         )
         .map_err(storage)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO erasure_keys (key_check) VALUES (?1)",
+        [key.check()],
+    )
+    .map_err(storage)?;
     Ok(added > 0)
 }
 
@@ -148,7 +161,7 @@ pub(crate) fn use_key<'a>(
 /// configured, as the current key or a previous one.
 pub(crate) fn check_keys(tx: &Transaction<'_>, keys: &HashKeys) -> Result<(), MetaError> {
     let mut statement = tx
-        .prepare("SELECT DISTINCT key_check FROM erasure_tombstones")
+        .prepare("SELECT key_check FROM erasure_keys")
         .map_err(storage)?;
     let used: Vec<String> = statement
         .query_map([], |row| row.get(0))
@@ -178,21 +191,25 @@ pub(crate) fn check_keys(tx: &Transaction<'_>, keys: &HashKeys) -> Result<(), Me
     Ok(())
 }
 
-/// Records a request for a user of a site, and the tombstone that stops new
-/// data of that user at once. A request still unfinished for the same user is
-/// returned instead of a second one.
+/// Records a request for a user (or a device) of a site, and the tombstone
+/// that stops new data of that user at once. A request still unfinished for
+/// the same subject is returned instead of a second one.
 pub(crate) fn request(
     tx: &Transaction<'_>,
     keys: &HashKeys,
     site_id: u32,
-    user_id: &str,
+    subject: ErasureSubject<'_>,
     requested_by: &str,
     at: i64,
 ) -> Result<ErasureRequest, MetaError> {
-    if !is_id(user_id) {
-        return Err(MetaError::Invalid(
-            "a user id is 1 to 64 letters, digits and `_ . : -`".to_owned(),
-        ));
+    let (id_text, kind, what) = match subject {
+        ErasureSubject::User(id) => (id, IdKind::User, "a user id"),
+        ErasureSubject::Device(id) => (id, IdKind::Anon, "a device id"),
+    };
+    if !is_id(id_text) {
+        return Err(MetaError::Invalid(format!(
+            "{what} is 1 to 64 letters, digits and `_ . : -`"
+        )));
     }
     let by = requested_by.trim();
     if by.is_empty() || by.chars().count() > MAX_LABEL_LEN || by.chars().any(char::is_control) {
@@ -211,28 +228,50 @@ pub(crate) fn request(
         return Err(MetaError::NotFound("site"));
     }
     let key = use_key(tx, keys)?;
-    let hash = key.tombstone_hash(site_id, IdKind::User, user_id);
-    let open: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM erasure_requests
-             WHERE site_id = ?1 AND user_hash = ?2 AND state IN ('requested', 'hidden')",
-            params![site_id, hash],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(storage)?;
-    if let Some(id) = open {
-        return get(tx, u64::try_from(id).unwrap_or(0));
+    let hash = key.tombstone_hash(site_id, kind, id_text);
+    // A request made before the key was replaced is under the old key's hash.
+    for earlier in keys.all() {
+        let open: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM erasure_requests
+                 WHERE site_id = ?1 AND user_hash = ?2 AND state IN ('requested', 'hidden')",
+                params![site_id, earlier.tombstone_hash(site_id, kind, id_text)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        if let Some(id) = open {
+            return get(tx, u64::try_from(id).unwrap_or(0));
+        }
     }
+    let (user, device) = match subject {
+        ErasureSubject::User(id) => (Some(id), None),
+        ErasureSubject::Device(id) => (None, Some(id)),
+    };
     tx.execute(
-        "INSERT INTO erasure_requests (site_id, user_id, user_hash, state, requested_by, requested_at)
-         VALUES (?1, ?2, ?3, 'requested', ?4, ?5)",
-        params![site_id, user_id, hash, by, at],
+        "INSERT INTO erasure_requests
+             (site_id, user_id, device_id, is_device, user_hash, state, requested_by,
+              requested_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?7)",
+        params![site_id, user, device, device.is_some(), hash, by, at],
     )
     .map_err(storage)?;
     let id = u64::try_from(tx.last_insert_rowid())
         .map_err(|_| MetaError::Corrupt("negative request id".to_owned()))?;
-    tombstone(tx, site_id, IdKind::User, key, &hash, id, at)?;
+    tombstone(tx, site_id, kind, key, &hash, id, at)?;
+    if let Some(device) = device {
+        // The device is known from the start: the job needs it to delete.
+        tx.execute(
+            "INSERT OR IGNORE INTO erasure_anons (request_id, anon_id) VALUES (?1, ?2)",
+            params![i64::try_from(id).unwrap_or(i64::MAX), device],
+        )
+        .map_err(storage)?;
+        tx.execute(
+            "UPDATE erasure_requests SET anon_count = 1 WHERE id = ?1",
+            [i64::try_from(id).unwrap_or(i64::MAX)],
+        )
+        .map_err(storage)?;
+    }
     bump(tx)?;
     get(tx, id)
 }
@@ -367,6 +406,7 @@ pub(crate) fn advance(
             failed_at = CASE WHEN ?2 = 'failed' THEN ?6 ELSE NULL END,
             detail = COALESCE(?5, detail),
             user_id = CASE WHEN ?2 = 'complete' THEN NULL ELSE user_id END,
+            device_id = CASE WHEN ?2 = 'complete' THEN NULL ELSE device_id END,
             attempts = 0, retry_after = NULL,
             claimed_by = NULL, lease_until = NULL
          WHERE id = ?1",
@@ -398,7 +438,7 @@ pub(crate) fn retry(tx: &Transaction<'_>, id: u64) -> Result<ErasureRequest, Met
             "only a failed request can be retried".to_owned(),
         ));
     }
-    if current.user_id.is_none() {
+    if current.user_id.is_none() && current.device_id.is_none() {
         return Err(MetaError::Conflict(
             "the user id of this request was forgotten after it failed; ask for the erasure again"
                 .to_owned(),
@@ -605,7 +645,8 @@ pub(crate) fn purge_failed(tx: &Transaction<'_>, failed_before: i64) -> Result<u
         let mut statement = tx
             .prepare(
                 "SELECT id FROM erasure_requests
-                 WHERE state = 'failed' AND user_id IS NOT NULL AND failed_at <= ?1",
+                 WHERE state = 'failed' AND (user_id IS NOT NULL OR device_id IS NOT NULL)
+                   AND failed_at <= ?1",
             )
             .map_err(storage)?;
         let rows = statement
@@ -615,7 +656,7 @@ pub(crate) fn purge_failed(tx: &Transaction<'_>, failed_before: i64) -> Result<u
     };
     for id in &ids {
         tx.execute(
-            "UPDATE erasure_requests SET user_id = NULL,
+            "UPDATE erasure_requests SET user_id = NULL, device_id = NULL,
                 detail = COALESCE(detail, '') || ' (the user id was forgotten; ask again)'
              WHERE id = ?1",
             [id],

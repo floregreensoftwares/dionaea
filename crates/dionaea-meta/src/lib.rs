@@ -26,8 +26,8 @@ mod sqlite;
 mod tests;
 
 pub use erasure::{
-    ErasureRequest, ErasureState, ErasureSummary, HashKey, HashKeys, IdKind, MAX_KEY_LEN,
-    MIN_KEY_LEN, TombstoneBatch, Tombstones,
+    ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, IdKind,
+    MAX_KEY_LEN, MIN_KEY_LEN, TombstoneBatch, Tombstones,
 };
 pub use sqlite::SqliteMeta;
 
@@ -246,6 +246,17 @@ pub trait MetaStore: Send + Sync {
         &self,
         site_id: u32,
         user_id: &str,
+        requested_by: &str,
+    ) -> Result<ErasureRequest, MetaError>;
+
+    /// The same for one device: what was stored under that anonymous id is
+    /// erased whoever it was linked to, and the device is blocked from then
+    /// on. For a person who gives their device id, or whose device never
+    /// identified itself and so cannot be found through a user.
+    fn request_device_erasure(
+        &self,
+        site_id: u32,
+        anon_id: &str,
         requested_by: &str,
     ) -> Result<ErasureRequest, MetaError>;
 

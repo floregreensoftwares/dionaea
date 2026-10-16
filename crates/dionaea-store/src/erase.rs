@@ -99,12 +99,12 @@ fn checked(id: &str) -> Result<&str, Error> {
 fn conditions(
     table: &IdentifierTable,
     site_id: u32,
-    user_id: &str,
+    user_id: Option<&str>,
     anon_ids: &[String],
 ) -> Result<Vec<String>, Error> {
-    let user = match table.user_column {
-        Some(column) => Some(format!("{column} = '{}'", checked(user_id)?)),
-        None => None,
+    let user = match (table.user_column, user_id) {
+        (Some(column), Some(user_id)) => Some(format!("{column} = '{}'", checked(user_id)?)),
+        _ => None,
     };
     let mut out = Vec::new();
     if let Some(user) = &user {
@@ -156,7 +156,7 @@ impl Store {
     pub fn count_user_rows(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
         marked: bool,
     ) -> Result<Vec<TableCount>, Error> {
@@ -193,7 +193,7 @@ impl Store {
     pub fn delete_user_rows(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
     ) -> Result<(), Error> {
         for table in IDENTIFIER_TABLES {
@@ -215,7 +215,7 @@ impl Store {
     pub fn rewrites_needed(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
     ) -> Result<Vec<Rewrite>, Error> {
         let mut needed = Vec::new();
@@ -338,7 +338,8 @@ mod tests {
         let anons: Vec<String> = (0..1200).map(|n| format!("a{n}")).collect();
         let [events, alias, traits] = [0, 1, 2].map(|i| &IDENTIFIER_TABLES[i]);
 
-        let conditions_of = |table, anons: &[String]| conditions(table, 7, "u1", anons).unwrap();
+        let conditions_of =
+            |table, anons: &[String]| conditions(table, 7, Some("u1"), anons).unwrap();
         assert_eq!(conditions_of(events, &[]), Vec::<String>::new());
         let chunks = conditions_of(events, &anons);
         assert_eq!(chunks.len(), 3, "500 ids per statement");
@@ -366,6 +367,26 @@ mod tests {
     }
 
     #[test]
+    fn a_device_without_a_user_selects_only_by_the_device() {
+        let anons = vec!["a1".to_owned(), "a2".to_owned()];
+        let [events, alias, traits] = [0, 1, 2].map(|i| &IDENTIFIER_TABLES[i]);
+        assert_eq!(
+            conditions(events, 7, None, &anons).unwrap(),
+            vec!["site_id = 7 AND anon_id IN ('a1', 'a2')"]
+        );
+        assert_eq!(
+            conditions(alias, 7, None, &anons).unwrap(),
+            vec!["site_id = 7 AND anon_id IN ('a1', 'a2')"],
+            "every link of the device, whoever it was to"
+        );
+        assert!(
+            conditions(traits, 7, None, &anons).unwrap().is_empty(),
+            "traits belong to a user and no user is named"
+        );
+        assert!(conditions(events, 7, None, &[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn an_identifier_that_is_not_plain_is_refused_not_escaped() {
         let table = &IDENTIFIER_TABLES[1];
         for bad in [
@@ -378,13 +399,16 @@ mod tests {
             "a\nb",
             &"x".repeat(65),
         ] {
-            assert!(conditions(table, 1, bad, &[]).is_err(), "user {bad:?}");
             assert!(
-                conditions(table, 1, "u", &[bad.to_owned()]).is_err(),
+                conditions(table, 1, Some(bad), &[]).is_err(),
+                "user {bad:?}"
+            );
+            assert!(
+                conditions(table, 1, Some("u"), &[bad.to_owned()]).is_err(),
                 "device {bad:?}"
             );
         }
         // A table with no user column does not look at the user id.
-        assert!(conditions(&IDENTIFIER_TABLES[0], 1, "x y", &["a".to_owned()]).is_ok());
+        assert!(conditions(&IDENTIFIER_TABLES[0], 1, Some("x y"), &["a".to_owned()]).is_ok());
     }
 }

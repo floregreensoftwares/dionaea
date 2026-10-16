@@ -135,6 +135,8 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         -- a server that does not have every key the tombstones were made with
         -- must not run.
         ALTER TABLE erasure_tombstones ADD COLUMN key_check TEXT NOT NULL DEFAULT '';
+        -- The keys in use, so that checking them does not scan every tombstone.
+        CREATE TABLE erasure_keys (key_check TEXT PRIMARY KEY);
     ",
     },
     Migration {
@@ -144,6 +146,19 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         -- When a request failed, so the identifiers it still holds in the clear
         -- can be forgotten after a while.
         ALTER TABLE erasure_requests ADD COLUMN failed_at INTEGER;
+    ",
+    },
+    Migration {
+        version: 7,
+        name: "erasure_device",
+        sql: "
+        -- A request may name one device instead of a user: for a person who
+        -- gives the device id, or whose device never identified itself. The
+        -- device id is kept in the clear only until the request completes.
+        ALTER TABLE erasure_requests ADD COLUMN device_id TEXT;
+        -- What the request is for, which the device id no longer says once the
+        -- request is complete.
+        ALTER TABLE erasure_requests ADD COLUMN is_device INTEGER NOT NULL DEFAULT 0;
     ",
     },
 ];

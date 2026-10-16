@@ -83,19 +83,21 @@ impl JobStats {
 /// use their own.
 pub(crate) trait Eraser: Send + Sync {
     fn linked_anon_ids(&self, site_id: u32, user_id: &str) -> Result<Vec<String>, Error>;
+    /// The `user_id` is `None` for a request that names a device only.
     fn count(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
         marked: bool,
     ) -> Result<Vec<TableCount>, Error>;
-    fn delete(&self, site_id: u32, user_id: &str, anon_ids: &[String]) -> Result<(), Error>;
+    fn delete(&self, site_id: u32, user_id: Option<&str>, anon_ids: &[String])
+    -> Result<(), Error>;
     /// The tables and partitions that still hold marked rows of the user.
     fn rewrites_needed(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
     ) -> Result<Vec<Rewrite>, Error>;
     /// Removes the marked rows of those tables and partitions from disk.
@@ -110,21 +112,26 @@ impl Eraser for Store {
     fn count(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
         marked: bool,
     ) -> Result<Vec<TableCount>, Error> {
         Store::count_user_rows(self, site_id, user_id, anon_ids, marked)
     }
 
-    fn delete(&self, site_id: u32, user_id: &str, anon_ids: &[String]) -> Result<(), Error> {
+    fn delete(
+        &self,
+        site_id: u32,
+        user_id: Option<&str>,
+        anon_ids: &[String],
+    ) -> Result<(), Error> {
         Store::delete_user_rows(self, site_id, user_id, anon_ids)
     }
 
     fn rewrites_needed(
         &self,
         site_id: u32,
-        user_id: &str,
+        user_id: Option<&str>,
         anon_ids: &[String],
     ) -> Result<Vec<Rewrite>, Error> {
         Store::rewrites_needed(self, site_id, user_id, anon_ids)
@@ -367,10 +374,13 @@ impl Job {
                 return false;
             }
         };
-        let Some(user) = request.user_id.clone() else {
-            self.fail(request.id, "the request has no user id");
+        // A request names a user (and through them the devices ever linked
+        // to them) or one device.
+        let user = request.user_id.clone();
+        if request.names_nobody() {
+            self.fail(request.id, "the request names neither a user nor a device");
             return true;
-        };
+        }
 
         // The devices of an earlier attempt that tombstoned them and deleted
         // the links before it stopped are still known to the metadata store.
@@ -381,13 +391,16 @@ impl Job {
                 return true;
             }
         };
-        match self.eraser.linked_anon_ids(request.site_id, &user) {
-            Ok(found) => anons.extend(found),
-            Err(error) => {
-                self.trouble(&request, &error, timing);
-                return true;
+        if let Some(user) = &user {
+            match self.eraser.linked_anon_ids(request.site_id, user) {
+                Ok(found) => anons.extend(found),
+                Err(error) => {
+                    self.trouble(&request, &error, timing);
+                    return true;
+                }
             }
         }
+        anons.extend(request.device_id.clone());
         anons.sort();
         anons.dedup();
         if let Err(error) = self.meta.add_erasure_anons(request.id, &anons) {
@@ -401,9 +414,10 @@ impl Job {
 
         let before = match self
             .eraser
-            .count(request.site_id, &user, &anons, false)
+            .count(request.site_id, user.as_deref(), &anons, false)
             .and_then(|before| {
-                self.eraser.delete(request.site_id, &user, &anons)?;
+                self.eraser
+                    .delete(request.site_id, user.as_deref(), &anons)?;
                 Ok(before)
             }) {
             Ok(before) => before,
@@ -462,11 +476,12 @@ impl Job {
         // Anything a slow node inserted after the first delete goes now.
         let mut ready = Vec::with_capacity(taken.len());
         for (request, anons) in taken {
-            let Some(user) = request.user_id.clone() else {
-                self.fail(request.id, "the request has no user id");
+            let user = request.user_id.clone();
+            if request.names_nobody() {
+                self.fail(request.id, "the request names neither a user nor a device");
                 continue;
-            };
-            match self.eraser.delete(request.site_id, &user, &anons) {
+            }
+            match self.eraser.delete(request.site_id, user.as_deref(), &anons) {
                 Ok(()) => ready.push((request, user, anons)),
                 Err(error) => self.trouble(&request, &error, timing),
             }
@@ -479,7 +494,10 @@ impl Job {
         let mut rewrites = Vec::new();
         let mut counted = Vec::with_capacity(ready.len());
         for (request, user, anons) in ready {
-            match self.eraser.rewrites_needed(request.site_id, &user, &anons) {
+            match self
+                .eraser
+                .rewrites_needed(request.site_id, user.as_deref(), &anons)
+            {
                 Ok(needed) => {
                     rewrites.extend(needed);
                     counted.push((request, user, anons));
@@ -499,7 +517,10 @@ impl Job {
 
         let mut completed = 0;
         for (request, user, anons) in ready {
-            let counts = match self.eraser.count(request.site_id, &user, &anons, true) {
+            let counts = match self
+                .eraser
+                .count(request.site_id, user.as_deref(), &anons, true)
+            {
                 Ok(counts) => counts,
                 Err(error) => {
                     self.trouble(&request, &error, timing);
@@ -597,9 +618,9 @@ mod tests {
             self.transient.lock().unwrap().take().map_or(Ok(()), Err)
         }
 
-        fn matches(row: &Row, site: u32, user: &str, anons: &[String]) -> bool {
+        fn matches(row: &Row, site: u32, user: Option<&str>, anons: &[String]) -> bool {
             row.site == site
-                && (row.user == Some(user)
+                && (user.is_some_and(|user| row.user == Some(user))
                     || row.anon.is_some_and(|anon| anons.iter().any(|a| a == anon)))
         }
 
@@ -631,7 +652,7 @@ mod tests {
         fn count(
             &self,
             site: u32,
-            user: &str,
+            user: Option<&str>,
             anons: &[String],
             marked: bool,
         ) -> Result<Vec<TableCount>, Error> {
@@ -650,7 +671,7 @@ mod tests {
                 .collect())
         }
 
-        fn delete(&self, site: u32, user: &str, anons: &[String]) -> Result<(), Error> {
+        fn delete(&self, site: u32, user: Option<&str>, anons: &[String]) -> Result<(), Error> {
             self.failure()?;
             self.deletes.fetch_add(1, Ordering::SeqCst);
             for row in self.rows.lock().unwrap().iter_mut() {
@@ -664,7 +685,7 @@ mod tests {
         fn rewrites_needed(
             &self,
             site: u32,
-            user: &str,
+            user: Option<&str>,
             anons: &[String],
         ) -> Result<Vec<Rewrite>, Error> {
             self.failure()?;
@@ -942,7 +963,7 @@ mod tests {
         // The first attempt tombstoned and deleted, then died before moving on.
         let devices = ["a1".to_owned(), "a2".to_owned()];
         w.meta.add_erasure_anons(request.id, &devices).unwrap();
-        w.fake.delete(1, "u1", &devices).unwrap();
+        w.fake.delete(1, Some("u1"), &devices).unwrap();
         w.fake.rows.lock().unwrap().retain(|r| !r.marked);
         w.fake.insert(row("events", None, Some("a2")));
         assert!(hide(&w));
@@ -1131,7 +1152,7 @@ mod tests {
                 second.set(Some(
                     w.meta.request_erasure(w.site, "u2", "ops").unwrap().id,
                 ));
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(1_000));
             }
             true
         });
@@ -1243,5 +1264,27 @@ mod tests {
             tombstones_of(&w.meta).user_erased(w.site, "u1"),
             "still blocked"
         );
+    }
+
+    #[test]
+    fn a_device_request_erases_that_device_alone_and_leaves_every_trait() {
+        let w = world(two_users());
+        let request = w.meta.request_device_erasure(w.site, "a2", "ops").unwrap();
+        round(&w.job, &w);
+        let hidden = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!(hidden.state, ErasureState::Hidden);
+        assert!(
+            hidden.detail.as_deref().unwrap().contains("events 1"),
+            "{hidden:?}"
+        );
+        w.now.store(5_000, Ordering::SeqCst);
+        round(&w.job, &w);
+        let done = w.meta.erasure_request(request.id).unwrap();
+        assert_eq!(done.state, ErasureState::Complete);
+        assert_eq!(done.device_id, None);
+        // Its event and its link go; the other events, links and both
+        // users' traits stay.
+        assert_eq!(w.fake.total(), 6);
+        assert!(tombstones_of(&w.meta).anon_erased(w.site, "a2"));
     }
 }
