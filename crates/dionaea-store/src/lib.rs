@@ -118,16 +118,18 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
-    /// Whether trying the same call again cannot succeed: the data is refused
-    /// (a 4xx other than a timeout or a rate limit) or the row is invalid. A
-    /// transport failure or a server error may pass on a later try. A batcher
-    /// retries the second kind and sets the first kind aside, or the spool
-    /// would never drain.
+    /// Whether trying the same call again cannot succeed: the server refused
+    /// the data itself (400, 413 or 422) or the row is invalid. Everything else
+    /// may pass on a later try, including 401, 403 and 404: a wrong password, a
+    /// missing grant or a missing table are fixed by an operator, and a batcher
+    /// that set those batches aside would silently discard the spool. A batcher
+    /// retries the second kind and sets the first kind aside, or a rejected
+    /// batch would block the spool forever.
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::InvalidRow(_) | Self::InvalidName(_) | Self::TooManyRows | Self::Tls(_) => true,
             Self::Server { status, .. } => {
-                (400..500).contains(status) && !matches!(status, 408 | 429)
+                matches!(status, 400 | 413 | 422)
             }
             Self::Io(_) => false,
         }
@@ -584,10 +586,10 @@ mod tests {
             status,
             message: String::new(),
         };
-        for status in [400, 401, 403, 404, 413, 422] {
+        for status in [400, 413, 422] {
             assert!(server(status).is_permanent(), "{status}");
         }
-        for status in [408, 429, 500, 502, 503, 504] {
+        for status in [401, 403, 404, 408, 409, 429, 500, 502, 503, 504] {
             assert!(!server(status).is_permanent(), "{status}");
         }
         assert!(!Error::Io("reset".to_owned()).is_permanent());
