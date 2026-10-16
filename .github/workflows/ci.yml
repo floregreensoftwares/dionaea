@@ -113,6 +113,29 @@ jobs:
       - name: Verify the compose stack
         run: sh scripts/verify-compose.sh
 
+  # The store against a real ClickHouse: migrations, inserts and the
+  # deduplication of a retried insert.
+  store:
+    name: store
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> .cargo-target"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/trigger' }}
+      - name: Start ClickHouse
+        run: docker compose up -d --wait
+      - name: Run the tests that need it
+        run: cargo test -p dionaea-store --test clickhouse --locked -- --ignored
+      - name: Stop ClickHouse
+        if: always()
+        run: docker compose down -v
+
   # The base revision and this one, benchmarked one after the other on the
   # same runner. It reports changes and never fails on a slowdown: shared
   # runners are too noisy for a threshold. It fails only if a benchmark breaks.
@@ -164,7 +187,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [messages, rust, hooks, compose, bench]
+    needs: [messages, rust, hooks, compose, store, bench]
     runs-on: ubuntu-latest
     steps:
       - name: Check the results

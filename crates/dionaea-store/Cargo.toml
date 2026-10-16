@@ -1,0 +1,25 @@
+[package]
+name = "dionaea-store"
+description = "ClickHouse storage for Dionaea: migrations and batch inserts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1.0.154"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "encode"
+harness = false
