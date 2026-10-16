@@ -55,6 +55,8 @@ pub enum Reason {
     Duplicate,
     /// The sender is an automated client.
     Bot,
+    /// The device belongs to a user whose data is erased.
+    Erased,
 }
 
 impl Reason {
@@ -65,6 +67,7 @@ impl Reason {
             Self::TimestampOutOfRange => "timestamp_out_of_range",
             Self::Duplicate => "duplicate_event",
             Self::Bot => "bot",
+            Self::Erased => "erased",
         }
     }
 }
@@ -174,6 +177,13 @@ pub fn process_with(
         count_drop(UNPARSED_EVENT, Reason::Guard(rejected.reason));
     }
     for event in batch.events {
+        if admission
+            .tombstones
+            .anon_erased(admission.site_id, &event.anon_id)
+        {
+            count_drop(&counted_name(admission, &event.name), Reason::Erased);
+            continue;
+        }
         let ts = i128::from(event.ts) + offset;
         let low = i128::from(received_ms) - i128::from(limits.max_past_ms);
         let high = i128::from(received_ms) + i128::from(limits.max_future_ms);

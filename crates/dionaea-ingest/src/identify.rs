@@ -43,6 +43,8 @@ pub struct Identified {
     pub drops: Vec<DropCount>,
     /// The sender is an automated client: nothing is to be stored.
     pub bot: bool,
+    /// The user or the device was erased: nothing is to be stored.
+    pub erased: bool,
 }
 
 /// Decodes `body` and checks its traits. A body that is not a valid identify
@@ -61,11 +63,27 @@ pub fn process_identify(
         stripped: 0,
         drops: Vec::new(),
         bot: enrichment.bot,
+        erased: false,
     };
     if enrichment.bot {
         result.drops.push(DropCount {
             event_name: IDENTIFY_EVENT.to_owned(),
             reason: Reason::Bot,
+            count: 1,
+        });
+        return Ok(result);
+    }
+    if admission
+        .tombstones
+        .user_erased(admission.site_id, &result.user_id)
+        || admission
+            .tombstones
+            .anon_erased(admission.site_id, &result.anon_id)
+    {
+        result.erased = true;
+        result.drops.push(DropCount {
+            event_name: IDENTIFY_EVENT.to_owned(),
+            reason: Reason::Erased,
             count: 1,
         });
         return Ok(result);

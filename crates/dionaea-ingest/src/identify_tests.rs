@@ -167,3 +167,94 @@ fn a_malformed_request_is_refused_whole() {
         );
     }
 }
+
+// Erased users and devices.
+
+fn with_erased(schemas: &[&str]) -> Admission {
+    use std::sync::Arc;
+
+    let meta = SqliteMeta::open_in_memory().expect("meta");
+    let organization = meta.create_organization("o").expect("organization");
+    let site = meta.create_site(organization.id, "s").expect("site");
+    for schema in schemas {
+        meta.publish_schema(site.id, schema).expect("schema");
+    }
+    let request = meta
+        .request_erasure(site.id, "u_gone", "test")
+        .expect("request");
+    meta.add_erasure_anons(request.id, &["anon_gone".to_owned()])
+        .expect("anons");
+    let admission = admission(schemas);
+    Admission {
+        tombstones: Arc::new(meta.snapshot().expect("snapshot").tombstones),
+        ..admission
+    }
+}
+
+fn identify_for(admission: &Admission, anon: &str, user: &str) -> Identified {
+    let body = serde_json::to_vec(&json!({
+        "sent_at": 1, "sdk": "t/1", "anon_id": anon, "user_id": user,
+        "traits": {"plan": "pro"}
+    }))
+    .expect("json");
+    process_identify(admission, &body, &Enrichment::default()).expect("valid")
+}
+
+#[test]
+fn an_identify_for_an_erased_user_or_device_stores_nothing() {
+    let admission = with_erased(&[V1]);
+    for (anon, user) in [("anon_gone", "u_fine"), ("a_new_device", "u_gone")] {
+        let result = identify_for(&admission, anon, user);
+        assert!(result.erased && !result.bot, "{anon} {user}");
+        assert_eq!(result.traits, None);
+        assert_eq!(
+            result.drops,
+            vec![DropCount {
+                event_name: IDENTIFY_EVENT.to_owned(),
+                reason: Reason::Erased,
+                count: 1,
+            }]
+        );
+    }
+    let fine = identify_for(&admission, "a_new_device", "u_fine");
+    assert!(!fine.erased && fine.traits.is_some());
+}
+
+#[test]
+fn events_of_an_erased_device_are_dropped_and_counted_the_rest_kept() {
+    let admission = with_erased(&[
+        "[events.checkout.fields.items]\nkind = \"count\"\nmax = 100\nrequired = true\n",
+    ]);
+    let event = |n: u32, anon: &str| {
+        json!({
+            "event_id": format!("01890000-0000-7000-8000-{n:012}"),
+            "ts": 1_760_000_000_000_u64 - 1000,
+            "name": "checkout",
+            "anon_id": anon,
+            "props": {"items": 1},
+        })
+    };
+    let body = serde_json::to_vec(&json!({
+        "sent_at": 1_760_000_000_000_u64, "sdk": "t/1",
+        "events": [event(1, "anon_gone"), event(2, "other"), event(3, "anon_gone")],
+    }))
+    .expect("json");
+    let processed = process(
+        &admission,
+        &body,
+        1_760_000_000_000,
+        &crate::Limits::default(),
+    )
+    .expect("valid");
+    assert_eq!(processed.accepted.len(), 1);
+    assert_eq!(processed.accepted[0].anon_id, "other");
+    assert_eq!(
+        processed.drops,
+        vec![DropCount {
+            event_name: "checkout".to_owned(),
+            reason: Reason::Erased,
+            count: 2,
+        }]
+    );
+    assert_eq!(Reason::Erased.as_str(), "erased");
+}

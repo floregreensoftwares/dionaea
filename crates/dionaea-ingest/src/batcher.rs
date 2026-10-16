@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use dionaea_meta::Tombstones;
 use dionaea_spool::{Record, Spool};
 use dionaea_store::{Error, Store};
 
@@ -107,9 +108,13 @@ impl Default for BatcherConfig {
     }
 }
 
+/// Where the batcher reads the erased users and devices from at each batch.
+pub type TombstoneSource = Arc<dyn Fn() -> Arc<Tombstones> + Send + Sync>;
+
 /// Counters for metrics and for tests.
 #[derive(Debug, Default)]
 pub struct BatcherStats {
+    erased_rows: AtomicU64,
     batches: AtomicU64,
     event_rows: AtomicU64,
     drop_rows: AtomicU64,
@@ -133,6 +138,12 @@ impl BatcherStats {
 
     pub fn drop_rows(&self) -> u64 {
         self.drop_rows.load(Ordering::Relaxed)
+    }
+
+    /// Rows left out because their user or device was erased after they
+    /// were made durable.
+    pub fn erased_rows(&self) -> u64 {
+        self.erased_rows.load(Ordering::Relaxed)
     }
 
     /// Identity link and trait rows the store confirmed.
@@ -193,6 +204,23 @@ impl Batcher {
         destination: Arc<dyn Destination>,
         config: BatcherConfig,
     ) -> std::io::Result<Self> {
+        let none: TombstoneSource = Arc::new(|| Arc::new(Tombstones::default()));
+        Self::start_with(spool, destination, config, none)
+    }
+
+    /// [`start`](Self::start) with a source of erased users and devices,
+    /// consulted before every insert: rows that were durable in the spool
+    /// before their user was erased are left out instead of coming back.
+    ///
+    /// # Errors
+    ///
+    /// When the operating system cannot start a thread.
+    pub fn start_with(
+        spool: Spool,
+        destination: Arc<dyn Destination>,
+        config: BatcherConfig,
+        erased: TombstoneSource,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(BatcherStats::default());
         let config = Arc::new(RwLock::new(config));
@@ -202,7 +230,14 @@ impl Batcher {
             thread::Builder::new()
                 .name("dionaea-batcher".to_owned())
                 .spawn(move || {
-                    run(&spool, destination.as_ref(), &config, &stop, &stats);
+                    run(
+                        &spool,
+                        destination.as_ref(),
+                        &config,
+                        erased.as_ref(),
+                        &stop,
+                        &stats,
+                    );
                     // Records read but not confirmed are read again by the next
                     // batcher on this spool, not skipped.
                     spool.rewind();
@@ -271,6 +306,7 @@ fn run(
     spool: &Spool,
     destination: &dyn Destination,
     shared: &RwLock<BatcherConfig>,
+    erased: &(dyn Fn() -> Arc<Tombstones> + Send + Sync),
     stop: &AtomicBool,
     stats: &BatcherStats,
 ) {
@@ -301,7 +337,16 @@ fn run(
             pause(config.min_interval.saturating_sub(at.elapsed()), stop);
         }
         let through = last.next;
-        match deliver(&records, destination, config, stop, stats, &mut backoff) {
+        let erased = erased();
+        match deliver(
+            &records,
+            destination,
+            config,
+            &erased,
+            stop,
+            stats,
+            &mut backoff,
+        ) {
             Delivered::Done => {
                 if let Err(error) = spool.commit(through) {
                     stats.set_error(Some(error.to_string()));
@@ -367,6 +412,7 @@ fn deliver(
     records: &[Record],
     destination: &dyn Destination,
     config: &BatcherConfig,
+    erased: &Tombstones,
     stop: &AtomicBool,
     stats: &BatcherStats,
     backoff: &mut Duration,
@@ -378,9 +424,16 @@ fn deliver(
         }
     }
     for part in [Part::Events, Part::Aliases, Part::Traits, Part::Drops] {
-        if let Delivered::Stopped =
-            deliver_part(records, part, destination, config, stop, stats, backoff)
-        {
+        if let Delivered::Stopped = deliver_part(
+            records,
+            part,
+            destination,
+            config,
+            erased,
+            stop,
+            stats,
+            backoff,
+        ) {
             return Delivered::Stopped;
         }
     }
@@ -485,11 +538,47 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Removes from `lines` the rows of erased users and devices. A line that
+/// cannot be read is kept: the store decides about it.
+fn without_erased(lines: String, part: Part, erased: &Tombstones) -> (String, u64) {
+    if erased.is_empty() || matches!(part, Part::Drops) {
+        return (lines, 0);
+    }
+    let mut kept = String::with_capacity(lines.len());
+    let mut removed = 0;
+    for line in lines.split_inclusive('\n') {
+        let value: Option<serde_json::Value> = serde_json::from_str(line).ok();
+        let field = |name: &str| value.as_ref().and_then(|v| v.get(name)?.as_str());
+        let site = value
+            .as_ref()
+            .and_then(|v| v.get("site_id")?.as_u64())
+            .and_then(|site| u32::try_from(site).ok());
+        let hit = site.is_some_and(|site| {
+            let anon = field("anon_id").is_some_and(|id| erased.anon_erased(site, id));
+            let user = field("user_id").is_some_and(|id| erased.user_erased(site, id));
+            match part {
+                Part::Events => anon,
+                Part::Aliases => anon || user,
+                Part::Traits => user,
+                Part::Drops => false,
+            }
+        });
+        if hit {
+            removed += 1;
+        } else {
+            kept.push_str(line);
+        }
+    }
+    (kept, removed)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn deliver_part(
     records: &[Record],
     part: Part,
     destination: &dyn Destination,
     config: &BatcherConfig,
+    erased: &Tombstones,
     stop: &AtomicBool,
     stats: &BatcherStats,
     backoff: &mut Duration,
@@ -504,6 +593,8 @@ fn deliver_part(
             Part::Traits => lines.traits,
         })
         .collect();
+    let (lines, removed) = without_erased(lines, part, erased);
+    stats.erased_rows.fetch_add(removed, Ordering::Relaxed);
     if lines.is_empty() {
         return Delivered::Done;
     }
@@ -562,7 +653,7 @@ fn deliver_part(
                 for record in records {
                     let one = std::slice::from_ref(record);
                     if let Delivered::Stopped =
-                        deliver_part(one, part, destination, config, stop, stats, backoff)
+                        deliver_part(one, part, destination, config, erased, stop, stats, backoff)
                     {
                         return Delivered::Stopped;
                     }

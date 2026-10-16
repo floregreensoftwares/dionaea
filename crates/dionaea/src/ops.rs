@@ -125,7 +125,7 @@ fn render(ops: &Ops) -> String {
         &mut out,
         "dionaea_identifies_total",
         "counter",
-        "Identify requests: linked, or ignored because the sender is an automated client.",
+        "Identify requests: linked, or ignored because the sender is an automated client or the user was erased.",
     );
     let _ = writeln!(
         out,
@@ -136,6 +136,11 @@ fn render(ops: &Ops) -> String {
         out,
         "dionaea_identifies_total{{result=\"bot\"}} {}",
         read(&counters.identify_bots)
+    );
+    let _ = writeln!(
+        out,
+        "dionaea_identifies_total{{result=\"erased\"}} {}",
+        read(&counters.identify_erased)
     );
     metric(
         &mut out,
@@ -304,6 +309,12 @@ fn render(ops: &Ops) -> String {
                 "counter",
                 "Events left out because another node or batch already stored them.",
                 stats.duplicates(),
+            ),
+            (
+                "dionaea_batcher_erased_rows_total",
+                "counter",
+                "Rows left out because their user or device was erased after they were durable.",
+                stats.erased_rows(),
             ),
             (
                 "dionaea_batcher_failing",

@@ -1059,3 +1059,188 @@ fn rejected_traits_never_repeat_the_link_stored_with_them() {
     drop(spool);
     assert_eq!(pending(&dir), 0, "the poison does not block the spool");
 }
+
+// Erased users and devices.
+
+/// Tombstones for user `u_erased` of site 7 and its devices `gone1` and
+/// `gone2`, made the way the server makes them.
+fn erased_set() -> Arc<dionaea_meta::Tombstones> {
+    use dionaea_meta::MetaStore;
+    let meta = dionaea_meta::SqliteMeta::open_in_memory().expect("meta");
+    let organization = meta.create_organization("o").expect("organization");
+    // Sites 1 to 7, so that the erased user belongs to site 7.
+    for n in 1..=7 {
+        meta.create_site(organization.id, &format!("s{n}"))
+            .expect("site");
+    }
+    let request = meta
+        .request_erasure(7, "u_erased", "test")
+        .expect("request");
+    meta.add_erasure_anons(request.id, &["gone1".to_owned(), "gone2".to_owned()])
+        .expect("anons");
+    Arc::new(meta.snapshot().expect("snapshot").tombstones)
+}
+
+fn source(tombstones: Arc<dionaea_meta::Tombstones>) -> TombstoneSource {
+    Arc::new(move || Arc::clone(&tombstones))
+}
+
+fn anon_event(n: u32, anon: &str) -> Accepted {
+    Accepted {
+        anon_id: anon.to_owned(),
+        ..accepted(n, 1)
+    }
+}
+
+#[test]
+fn rows_made_durable_before_the_erasure_are_left_out_when_the_batch_is_inserted() {
+    let dir = spool_dir("erased-batch");
+    let spool = open(&dir);
+    enqueue(
+        &spool,
+        &request(
+            vec![
+                anon_event(1, "gone1"),
+                anon_event(2, "kept"),
+                anon_event(3, "gone2"),
+                anon_event(4, "kept"),
+            ],
+            0,
+        ),
+        7,
+        NOW,
+    )
+    .unwrap();
+    // The same devices, identified; and the erased user on a device not yet
+    // known as theirs; and someone else.
+    let alias = |anon: &str, user: &str| AliasRow {
+        site_id: 7,
+        anon_id: anon.to_owned(),
+        user_id: user.to_owned(),
+        linked_ms: NOW,
+    };
+    sink::enqueue_identity(&spool, &alias("gone1", "u_other"), None, &[]).unwrap();
+    sink::enqueue_identity(
+        &spool,
+        &alias("fresh", "u_erased"),
+        Some(&traits_of("u_erased", "pro")),
+        &[],
+    )
+    .unwrap();
+    sink::enqueue_identity(
+        &spool,
+        &alias("fine", "u_fine"),
+        Some(&traits_of("u_fine", "free")),
+        &[],
+    )
+    .unwrap();
+
+    let fake = Arc::new(Fake::default());
+    let batcher = Batcher::start_with(
+        spool.clone(),
+        Arc::clone(&fake) as Arc<dyn Destination>,
+        fast(),
+        source(erased_set()),
+    )
+    .expect("thread");
+    wait_for("the rows", || {
+        batcher.stats().event_rows() == 2 && batcher.stats().identity_rows() == 2
+    });
+    batcher.stop();
+
+    let events = fake.events();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|line| line.contains("\"anon_id\":\"kept\""))
+    );
+    let aliases = fake.stored_aliases.lock().unwrap().clone();
+    assert_eq!(aliases.len(), 1, "{aliases:?}");
+    assert!(aliases[0].contains("u_fine"));
+    let traits = fake.stored_traits.lock().unwrap().clone();
+    assert_eq!(traits.len(), 1, "{traits:?}");
+    assert!(traits[0].contains("free") && !traits.iter().any(|t| t.contains("u_erased")));
+    drop(spool);
+    assert_eq!(pending(&dir), 0, "everything was committed, erased or not");
+}
+
+#[test]
+fn the_erased_count_is_kept_and_a_batch_of_only_erased_rows_drains() {
+    let dir = spool_dir("erased-only");
+    let spool = open(&dir);
+    enqueue(
+        &spool,
+        &request(vec![anon_event(1, "gone1"), anon_event(2, "gone2")], 0),
+        7,
+        NOW,
+    )
+    .unwrap();
+    let fake = Arc::new(Fake::default());
+    let batcher = Batcher::start_with(
+        spool.clone(),
+        Arc::clone(&fake) as Arc<dyn Destination>,
+        fast(),
+        source(erased_set()),
+    )
+    .expect("thread");
+    wait_for("the erased rows", || batcher.stats().erased_rows() == 2);
+    // A row that is kept, after them: once it is stored the erased batch has
+    // been committed too.
+    enqueue(&spool, &request(vec![anon_event(3, "kept")], 0), 7, NOW).unwrap();
+    wait_for("the kept row", || batcher.stats().event_rows() == 1);
+    assert_eq!(batcher.stats().erased_rows(), 2);
+    batcher.stop();
+    assert_eq!(fake.events().len(), 1);
+    drop(spool);
+    assert_eq!(pending(&dir), 0, "the erased rows were committed, not kept");
+}
+
+#[test]
+fn another_site_with_the_same_names_is_not_filtered() {
+    let dir = spool_dir("erased-site");
+    let spool = open(&dir);
+    let mut other_site = anon_event(1, "gone1");
+    other_site.site_id = 3;
+    enqueue(&spool, &request(vec![other_site], 0), 3, NOW).unwrap();
+    let fake = Arc::new(Fake::default());
+    let batcher = Batcher::start_with(
+        spool.clone(),
+        Arc::clone(&fake) as Arc<dyn Destination>,
+        fast(),
+        source(erased_set()),
+    )
+    .expect("thread");
+    wait_for("the row", || batcher.stats().event_rows() == 1);
+    assert_eq!(batcher.stats().erased_rows(), 0);
+    batcher.stop();
+}
+
+#[test]
+fn a_tombstone_that_arrives_later_applies_to_the_next_batch() {
+    use std::sync::RwLock;
+    let dir = spool_dir("erased-late");
+    let spool = open(&dir);
+    let current: Arc<RwLock<Arc<dionaea_meta::Tombstones>>> = Arc::default();
+    let reader = Arc::clone(&current);
+    let late: TombstoneSource = Arc::new(move || Arc::clone(&reader.read().unwrap()));
+    let fake = Arc::new(Fake::default());
+    let batcher = Batcher::start_with(
+        spool.clone(),
+        Arc::clone(&fake) as Arc<dyn Destination>,
+        fast(),
+        late,
+    )
+    .expect("thread");
+
+    enqueue(&spool, &request(vec![anon_event(1, "gone1")], 0), 7, NOW).unwrap();
+    wait_for("the first row", || batcher.stats().event_rows() == 1);
+
+    *current.write().unwrap() = erased_set();
+    enqueue(&spool, &request(vec![anon_event(2, "gone1")], 0), 7, NOW).unwrap();
+    wait_for("the second to be left out", || {
+        batcher.stats().erased_rows() == 1
+    });
+    batcher.stop();
+    assert_eq!(fake.events().len(), 1, "only what came before");
+}
