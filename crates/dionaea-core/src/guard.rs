@@ -175,7 +175,8 @@ fn guard_fields(
 /// Characters `text` replaces with a space: Unicode controls (Cc), the format
 /// characters (Cf) that can reorder or hide text, the line and paragraph
 /// separators, every Unicode space except the ASCII one (Zs), and the blank
-/// fillers that render as nothing (U+115F, U+1160, U+2800, U+3164, U+FFA0).
+/// fillers that render as nothing (U+115F, U+1160, U+2800, U+3164, U+FFA0), and
+/// the invisible combining marks U+034F, U+17B4, U+17B5 and U+180B to U+180D.
 /// The standard library has no category lookup, so the sets are listed by
 /// hand from the Unicode character database.
 fn is_unsafe_char(c: char) -> bool {
@@ -192,7 +193,9 @@ fn is_unsafe_char(c: char) -> bool {
                 | 0x070F
                 | 0x0890..=0x0891
                 | 0x08E2
-                | 0x180E
+                | 0x180B..=0x180E
+                | 0x034F
+                | 0x17B4..=0x17B5
                 | 0x2000..=0x200F
                 | 0x2028..=0x202E
                 | 0x2060..=0x2064
@@ -224,6 +227,13 @@ pub(crate) fn is_id(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
 
+/// A variation selector changes how the character before it is drawn and is
+/// legitimate after an emoji, so `text` keeps it; a value made only of them
+/// shows nothing and counts as empty.
+fn is_variation_selector(c: char) -> bool {
+    matches!(u32::from(c), 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+}
+
 fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
     match kind {
         FieldKind::Id => {
@@ -239,7 +249,8 @@ fn sanitize(kind: &FieldKind, value: &Value) -> Option<FieldValue> {
                 .take(*max)
                 .collect();
             let capped = capped.trim_end();
-            (!capped.is_empty()).then(|| FieldValue::Text(capped.to_owned()))
+            let blank = capped.is_empty() || capped.chars().all(is_variation_selector);
+            (!blank).then(|| FieldValue::Text(capped.to_owned()))
         }
         FieldKind::Unit => {
             let number = value.as_f64().filter(|n| n.is_finite())?;
@@ -388,6 +399,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn text_replaces_invisible_combining_marks_but_keeps_variation_selectors() {
+        let kind = FieldKind::text(50).unwrap();
+        let cases = [
+            ("a\u{034F}b", "a b"),
+            ("a\u{17B4}\u{17B5}b", "a  b"),
+            ("a\u{180B}\u{180C}\u{180D}b", "a   b"),
+            ("\u{2764}\u{FE0F}", "\u{2764}\u{FE0F}"),
+            ("a\u{FE0E}b", "a\u{FE0E}b"),
+            ("x\u{E0100}", "x\u{E0100}"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                guard_one(kind.clone(), json!(input)),
+                text(expected),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_made_only_of_variation_selectors_is_invalid() {
+        let kind = FieldKind::text(50).unwrap();
+        for input in ["\u{FE0F}", "\u{FE00}\u{FE0F}", "\u{E0100}", " \u{FE0F} "] {
+            assert_eq!(guard_one(kind.clone(), json!(input)), None, "{input:?}");
+        }
+    }
     #[test]
     fn text_made_only_of_invisible_characters_is_invalid() {
         let kind = FieldKind::text(50).unwrap();
@@ -809,7 +847,7 @@ mod unsafe_char_tests {
             0x2064, 0x2066, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB, 0xE0001, 0xE0020, 0xE007F,
             // invisible fillers and Unicode spaces (Zs)
             0x00A0, 0x115F, 0x1160, 0x1680, 0x2000, 0x200A, 0x202F, 0x205F, 0x2800, 0x3000, 0x3164,
-            0xFFA0,
+            0x034F, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0xFFA0,
         ] {
             assert!(flagged(code), "U+{code:04X}");
         }
@@ -821,7 +859,8 @@ mod unsafe_char_tests {
             0x00AC, 0x00AE, 0x05FF, 0x0606, 0x1FFF, 0x2010, 0x2027, 0x2030, 0x205E, 0x2070, 0xFEFE,
             0xFF00, 0xFFF8, 0xFFFC, 0xE0000, 0xE0002, 0xE001F, 0xE0080, 0x0041, 0x00E9, 0x65E5,
             0x00A1, 0x115E, 0x1161, 0x167F, 0x1681, 0x27FF, 0x2801, 0x2FFF, 0x3001, 0x3163, 0x3165,
-            0xFF9F, 0xFFA1, 0x0020,
+            0xFF9F, 0xFFA1, 0x0020, 0x034E, 0x0350, 0x17B3, 0x17B6, 0x180A, 0xFE00, 0xFE0F,
+            0xE0100,
         ] {
             assert!(!flagged(code), "U+{code:04X}");
         }

@@ -9,6 +9,7 @@ services:
       CLICKHOUSE_USER: dionaea
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-dionaea-dev}
       CLICKHOUSE_DB: dionaea
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     ulimits:

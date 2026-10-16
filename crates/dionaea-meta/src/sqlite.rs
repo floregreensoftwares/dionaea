@@ -508,7 +508,7 @@ impl MetaStore for SqliteMeta {
             let mut statement = tx
                 .prepare(
                     "SELECT key, site_id, label, created_at, revoked_at
-                     FROM write_keys WHERE site_id = ?1 ORDER BY created_at, key",
+                     FROM write_keys WHERE site_id = ?1 ORDER BY created_at, rowid",
                 )
                 .map_err(storage)?;
             let mut rows = statement.query([site_id]).map_err(storage)?;

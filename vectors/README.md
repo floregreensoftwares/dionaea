@@ -76,3 +76,10 @@ produces each of them, and each request error.
 
 Scrubbing of error messages and route templating belong to app health and get
 their own vectors with it.
+
+## Known limit of the text rules
+
+Variation selectors are kept (U+FE0F is legitimate after an emoji), so "a" and
+"a" followed by U+FE0F are stored as different values although they can look
+alike. The rules remove the characters that render as nothing on their own; they
+do not make every pair of look-alike strings equal.
