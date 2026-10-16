@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use erase::{IDENTIFIER_TABLES, IdentifierTable, TableCount};
+pub use erase::{IDENTIFIER_TABLES, IdentifierTable, Rewrite, TableCount};
 pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key};
 
 /// Most rows one insert call accepts.

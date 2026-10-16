@@ -30,7 +30,7 @@ use std::thread;
 use std::time::Duration;
 
 use dionaea_meta::{ErasureRequest, ErasureState, ErasureSummary, MetaError, MetaStore};
-use dionaea_store::{Error, Store, TableCount};
+use dionaea_store::{Error, Rewrite, Store, TableCount};
 use tracing::{info, warn};
 
 /// How long a worker holds a request while it hides it.
@@ -89,7 +89,15 @@ pub(crate) trait Eraser: Send + Sync {
         marked: bool,
     ) -> Result<Vec<TableCount>, Error>;
     fn delete(&self, site_id: u32, user_id: &str, anon_ids: &[String]) -> Result<(), Error>;
-    fn remove_deleted(&self) -> Result<(), Error>;
+    /// The tables and partitions that still hold marked rows of the user.
+    fn rewrites_needed(
+        &self,
+        site_id: u32,
+        user_id: &str,
+        anon_ids: &[String],
+    ) -> Result<Vec<Rewrite>, Error>;
+    /// Removes the marked rows of those tables and partitions from disk.
+    fn apply_rewrites(&self, rewrites: &[Rewrite]) -> Result<(), Error>;
 }
 
 impl Eraser for Store {
@@ -111,8 +119,17 @@ impl Eraser for Store {
         Store::delete_user_rows(self, site_id, user_id, anon_ids)
     }
 
-    fn remove_deleted(&self) -> Result<(), Error> {
-        Store::remove_deleted_rows(self)
+    fn rewrites_needed(
+        &self,
+        site_id: u32,
+        user_id: &str,
+        anon_ids: &[String],
+    ) -> Result<Vec<Rewrite>, Error> {
+        Store::rewrites_needed(self, site_id, user_id, anon_ids)
+    }
+
+    fn apply_rewrites(&self, rewrites: &[Rewrite]) -> Result<(), Error> {
+        Store::apply_rewrites(self, rewrites)
     }
 }
 
@@ -430,7 +447,23 @@ impl Job {
         if ready.is_empty() {
             return 0;
         }
-        if let Err(error) = self.eraser.remove_deleted() {
+        // Only the partitions that hold these users' rows, however many
+        // requests share the rewrite.
+        let mut rewrites = Vec::new();
+        let mut counted = Vec::with_capacity(ready.len());
+        for (request, user, anons) in ready {
+            match self.eraser.rewrites_needed(request.site_id, &user, &anons) {
+                Ok(needed) => {
+                    rewrites.extend(needed);
+                    counted.push((request, user, anons));
+                }
+                Err(error) => self.trouble(&request, &error, timing),
+            }
+        }
+        let ready = counted;
+        if !rewrites.is_empty()
+            && let Err(error) = self.eraser.apply_rewrites(&rewrites)
+        {
             for (request, ..) in &ready {
                 self.trouble(request, &error, timing);
             }
@@ -501,6 +534,8 @@ mod tests {
         site: u32,
         user: Option<&'static str>,
         anon: Option<&'static str>,
+        /// The month of an event; 0 for the tables that are not partitioned.
+        month: u32,
         marked: bool,
     }
 
@@ -516,6 +551,8 @@ mod tests {
         broken_rewrite: Mutex<bool>,
         /// The next rewrite, and only it, fails.
         fail_rewrite: Mutex<Option<Error>>,
+        /// Every rewrite asked for, in order.
+        applied: Mutex<Vec<Rewrite>>,
     }
 
     impl Fake {
@@ -597,14 +634,41 @@ mod tests {
             Ok(())
         }
 
-        fn remove_deleted(&self) -> Result<(), Error> {
+        fn rewrites_needed(
+            &self,
+            site: u32,
+            user: &str,
+            anons: &[String],
+        ) -> Result<Vec<Rewrite>, Error> {
+            self.failure()?;
+            let rows = self.rows.lock().unwrap();
+            let mut needed = std::collections::BTreeSet::new();
+            for row in rows
+                .iter()
+                .filter(|r| r.marked && Self::matches(r, site, user, anons))
+            {
+                needed.insert(Rewrite {
+                    table: TABLES.iter().find(|t| **t == row.table).unwrap(),
+                    partition: (row.table == "events").then_some(row.month),
+                });
+            }
+            Ok(needed.into_iter().collect())
+        }
+
+        fn apply_rewrites(&self, rewrites: &[Rewrite]) -> Result<(), Error> {
             self.failure()?;
             if let Some(error) = self.fail_rewrite.lock().unwrap().take() {
                 return Err(error);
             }
             self.rewrites.fetch_add(1, Ordering::SeqCst);
+            self.applied.lock().unwrap().extend_from_slice(rewrites);
             if !*self.broken_rewrite.lock().unwrap() {
-                self.rows.lock().unwrap().retain(|r| !r.marked);
+                self.rows.lock().unwrap().retain(|r| {
+                    !(r.marked
+                        && rewrites.iter().any(|w| {
+                            w.table == r.table && w.partition.is_none_or(|p| p == r.month)
+                        }))
+                });
             }
             Ok(())
         }
@@ -616,16 +680,22 @@ mod tests {
             site: 1,
             user,
             anon,
+            month: 0,
             marked: false,
         }
+    }
+
+    fn in_month(mut row: Row, month: u32) -> Row {
+        row.month = month;
+        row
     }
 
     /// u1 with devices a1 and a2, u2 with a3, and the rows they leave.
     fn two_users() -> Arc<Fake> {
         Fake::with(&[
-            row("events", None, Some("a1")),
-            row("events", None, Some("a2")),
-            row("events", None, Some("a3")),
+            in_month(row("events", None, Some("a1")), 202_510),
+            in_month(row("events", None, Some("a2")), 202_510),
+            in_month(row("events", None, Some("a3")), 202_510),
             row("identity_alias", Some("u1"), Some("a1")),
             row("identity_alias", Some("u1"), Some("a2")),
             row("identity_alias", Some("u2"), Some("a3")),
@@ -1050,5 +1120,64 @@ mod tests {
             "and nothing was started after the lease was lost"
         );
         assert_eq!(w.stats.hidden.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn only_the_partitions_holding_the_erased_rows_are_rewritten_once_for_all_requests() {
+        let w = world(Fake::with(&[
+            in_month(row("events", None, Some("a1")), 202_509),
+            in_month(row("events", None, Some("a1")), 202_511),
+            in_month(row("events", None, Some("a2")), 202_511),
+            in_month(row("events", None, Some("a3")), 202_510),
+            row("identity_alias", Some("u1"), Some("a1")),
+            row("identity_alias", Some("u2"), Some("a2")),
+            row("identity_alias", Some("u3"), Some("a3")),
+        ]));
+        for user in ["u1", "u2"] {
+            w.meta.request_erasure(w.site, user, "ops").unwrap();
+        }
+        round(&w.job, &w);
+        w.now.store(5_000, Ordering::SeqCst);
+        round(&w.job, &w);
+
+        assert_eq!(
+            w.fake.rewrites.load(Ordering::SeqCst),
+            1,
+            "one call for both"
+        );
+        let mut applied = w.fake.applied.lock().unwrap().clone();
+        applied.sort();
+        applied.dedup();
+        assert_eq!(
+            applied,
+            vec![
+                Rewrite {
+                    table: "events",
+                    partition: Some(202_509)
+                },
+                Rewrite {
+                    table: "events",
+                    partition: Some(202_511)
+                },
+                Rewrite {
+                    table: "identity_alias",
+                    partition: None
+                },
+            ],
+            "October holds only someone who is not being erased"
+        );
+        assert_eq!(w.fake.total(), 2, "u3's event and link");
+    }
+
+    #[test]
+    fn nothing_is_rewritten_when_no_marked_row_is_left() {
+        let w = world(two_users());
+        w.meta.request_erasure(w.site, "nobody", "ops").unwrap();
+        round(&w.job, &w);
+        w.now.store(5_000, Ordering::SeqCst);
+        round(&w.job, &w);
+        assert_eq!(w.fake.rewrites.load(Ordering::SeqCst), 0);
+        assert!(w.fake.applied.lock().unwrap().is_empty());
+        assert_eq!(w.stats.completed.load(Ordering::Relaxed), 1);
     }
 }

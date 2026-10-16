@@ -986,7 +986,10 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
         "{on_disk:?}"
     );
 
-    store.remove_deleted_rows().expect("apply the mask");
+    let needed = store
+        .rewrites_needed(7, "u1", &anons)
+        .expect("what to rewrite");
+    store.apply_rewrites(&needed).expect("apply the mask");
     assert_eq!(
         rows(&store.count_user_rows(7, "u1", &anons, true).expect("gone")),
         vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
@@ -1017,13 +1020,18 @@ fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
     store
         .delete_user_rows(7, "ghost", &[])
         .expect("nothing to delete");
-    store.remove_deleted_rows().expect("nothing to rewrite");
+    let nothing = store
+        .rewrites_needed(7, "ghost", &[])
+        .expect("what to rewrite");
+    assert!(nothing.is_empty(), "{nothing:?}");
+    store.apply_rewrites(&nothing).expect("nothing to rewrite");
     assert_eq!(count(store, "events"), 5);
 
     let anons = store.linked_anon_ids(7, "u2").expect("linked");
     for _ in 0..2 {
         store.delete_user_rows(7, "u2", &anons).expect("delete");
-        store.remove_deleted_rows().expect("apply");
+        let needed = store.rewrites_needed(7, "u2", &anons).expect("needed");
+        store.apply_rewrites(&needed).expect("apply");
     }
     assert_eq!(
         rows(&store.count_user_rows(7, "u2", &anons, true).expect("gone")),
@@ -1046,4 +1054,91 @@ fn an_identifier_that_could_alter_the_statement_never_reaches_clickhouse() {
         );
     }
     assert_eq!(count(store, "events"), 5, "nothing was deleted");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
+    use dionaea_store::Rewrite;
+
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    // September, October and November 2025.
+    let (sep, oct, nov) = (1_757_000_000_000, 1_760_000_000_000, 1_763_000_000_000);
+    let mut events = Vec::new();
+    for (n, anon, ts) in [
+        (1, "a1", sep),
+        (2, "a1", nov),
+        (3, "a2", oct),
+        (4, "a2", nov),
+    ] {
+        let mut row = event(n);
+        row.anon_id = anon.to_owned();
+        row.ts_ms = ts;
+        row.received_ms = now_ms();
+        events.push(row);
+    }
+    store.insert_events(&events, "partitions").expect("events");
+    store
+        .insert_alias_lines(
+            &Store::encode_aliases(&[alias("a1", "u1", now_ms()), alias("a2", "u2", now_ms())])
+                .expect("encode"),
+            "partitions-links",
+        )
+        .expect("links");
+
+    let anons = vec!["a1".to_owned()];
+    store.delete_user_rows(7, "u1", &anons).expect("delete");
+    let needed = store.rewrites_needed(7, "u1", &anons).expect("needed");
+    // Whether the rows are still in the parts depends on the version, but
+    // never more than the months of the erased device, and never the month
+    // that only the other person has.
+    let events_partitions: Vec<Option<u32>> = needed
+        .iter()
+        .filter(|r| r.table == "events")
+        .map(|r| r.partition)
+        .collect();
+    assert!(
+        events_partitions
+            .iter()
+            .all(|p| matches!(p, Some(202_509 | 202_511))),
+        "{needed:?}"
+    );
+    assert!(
+        needed
+            .iter()
+            .all(|r| r.table != "events" || r.partition.is_some())
+    );
+    // The links table is not partitioned: the whole table, or nothing.
+    assert!(
+        needed
+            .iter()
+            .filter(|r| r.table == "identity_alias")
+            .all(|r| *r
+                == Rewrite {
+                    table: "identity_alias",
+                    partition: None
+                })
+    );
+
+    store.apply_rewrites(&needed).expect("rewrite");
+    store
+        .apply_rewrites(&needed)
+        .expect("the same again is harmless");
+    assert_eq!(
+        rows(&store.count_user_rows(7, "u1", &anons, true).expect("gone")),
+        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
+    );
+    assert_eq!(count(store, "events"), 2, "the other person's two events");
+    assert_eq!(count(store, "identity_alias"), 1);
+
+    assert!(
+        store
+            .apply_rewrites(&[Rewrite {
+                table: "_migrations",
+                partition: None
+            }])
+            .is_err(),
+        "only identifier tables"
+    );
 }
