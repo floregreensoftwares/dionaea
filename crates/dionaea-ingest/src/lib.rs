@@ -15,7 +15,7 @@ mod limit;
 mod pipeline;
 mod sink;
 
-pub use batcher::{Batcher, BatcherConfig, BatcherStats, Destination};
+pub use batcher::{Batcher, BatcherConfig, BatcherStats, Destination, TombstoneSource};
 pub use cache::{Admission, Cache, Refusal};
 pub use dedup::Deduper;
 pub use drops::DropAggregator;

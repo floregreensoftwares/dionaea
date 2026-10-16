@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use dionaea_core::Schema;
-use dionaea_meta::{MetaError, MetaStore, StoredSetting};
+use dionaea_meta::{MetaError, MetaStore, StoredSetting, Tombstones};
 
 /// Why a write key was not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,8 @@ impl Refusal {
 pub struct Admission {
     pub site_id: u32,
     pub schemas: Arc<[(u32, Schema)]>,
+    /// Users and devices whose data is being or has been erased.
+    pub tombstones: Arc<Tombstones>,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,7 @@ struct Table {
     keys: HashMap<String, KeyEntry>,
     schemas: HashMap<u32, Arc<[(u32, Schema)]>>,
     settings: BTreeMap<String, StoredSetting>,
+    tombstones: Arc<Tombstones>,
 }
 
 /// Keys and schemas, shared by every request.
@@ -74,6 +77,11 @@ impl Cache {
         self.current().settings.clone()
     }
 
+    /// The erased users and devices, as of the generation the cache holds.
+    pub fn tombstones(&self) -> Arc<Tombstones> {
+        Arc::clone(&self.current().tombstones)
+    }
+
     /// The generation of the data the cache holds.
     pub fn generation(&self) -> u64 {
         self.current().generation
@@ -94,6 +102,7 @@ impl Cache {
             keys: HashMap::with_capacity(snapshot.keys.len()),
             schemas: HashMap::with_capacity(snapshot.schemas.len()),
             settings: snapshot.settings,
+            tombstones: Arc::new(snapshot.tombstones),
         };
         for key in snapshot.keys {
             table.keys.insert(
@@ -152,6 +161,7 @@ impl Cache {
         Ok(Admission {
             site_id: entry.site_id,
             schemas,
+            tombstones: Arc::clone(&table.tombstones),
         })
     }
 }

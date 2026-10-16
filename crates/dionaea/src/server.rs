@@ -333,7 +333,13 @@ impl Node {
                                 info!(applied = applied.len(), "clickhouse is ready");
                                 let destination: Arc<dyn Destination> = Arc::new(store);
                                 let config = batcher_config(&live.tuning());
-                                match Batcher::start(spool, destination, config) {
+                                // Read at every batch, so an erasure takes hold
+                                // as soon as this node has reloaded the metadata.
+                                let erased = {
+                                    let collect = Arc::clone(&live.collect);
+                                    Arc::new(move || collect.cache.tombstones())
+                                };
+                                match Batcher::start_with(spool, destination, config, erased) {
                                     Ok(started) => {
                                         *status
                                             .batcher

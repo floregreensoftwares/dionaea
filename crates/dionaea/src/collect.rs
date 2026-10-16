@@ -128,6 +128,8 @@ pub(crate) struct Counters {
     /// because the sender is an automated client.
     pub(crate) identified: AtomicU64,
     pub(crate) identify_bots: AtomicU64,
+    /// Identify requests for an erased user or device, ignored.
+    pub(crate) identify_erased: AtomicU64,
     /// Traits removed by the guard from identify requests.
     pub(crate) traits_stripped: AtomicU64,
     /// Events dropped, by reason. The reasons are a fixed small set, so this
@@ -600,24 +602,26 @@ async fn handle(
                 &format!("{{\"accepted\":{accepted},\"dropped\":{dropped}}}"),
             )
         }
-        Ok(Outcome::Linked { linked, stripped }) => {
+        Ok(Outcome::Linked { stripped }) => {
             counters.accepted.fetch_add(1, Ordering::Relaxed);
-            let seen = if linked {
-                &counters.identified
-            } else {
-                &counters.identify_bots
-            };
-            seen.fetch_add(1, Ordering::Relaxed);
+            counters.identified.fetch_add(1, Ordering::Relaxed);
             counters
                 .traits_stripped
                 .fetch_add(stripped, Ordering::Relaxed);
             json(
                 StatusCode::ACCEPTED,
-                &format!(
-                    "{{\"accepted\":{},\"stripped\":{stripped}}}",
-                    u8::from(linked)
-                ),
+                &format!("{{\"accepted\":1,\"stripped\":{stripped}}}"),
             )
+        }
+        Ok(Outcome::Ignored { erased }) => {
+            counters.accepted.fetch_add(1, Ordering::Relaxed);
+            let seen = if erased {
+                &counters.identify_erased
+            } else {
+                &counters.identify_bots
+            };
+            seen.fetch_add(1, Ordering::Relaxed);
+            json(StatusCode::ACCEPTED, "{\"accepted\":0,\"stripped\":0}")
         }
         Ok(Outcome::Refused(reason)) => {
             counters.bad_request.fetch_add(1, Ordering::Relaxed);
@@ -639,11 +643,15 @@ enum Outcome {
         accepted: usize,
         dropped: u64,
     },
-    /// An identify request: whether the link was stored (not for a bot) and
-    /// how many traits the guard removed.
+    /// An identify request that was stored, and how many traits the guard
+    /// removed.
     Linked {
-        linked: bool,
         stripped: u64,
+    },
+    /// An identify request from an automated client or for an erased user or
+    /// device: acknowledged, counted, not stored.
+    Ignored {
+        erased: bool,
     },
     Refused(&'static str),
     Unavailable,
@@ -674,17 +682,15 @@ fn store_identify(
         Ok(identified) => identified,
         Err(error) => return Outcome::Refused(error.as_str()),
     };
-    if identified.bot {
+    if identified.bot || identified.erased {
         // Nothing to store: only the count, merged with the other drop counts.
         collect.drops.add(admission.site_id, &identified.drops, now);
-        return Outcome::Linked {
-            linked: false,
-            stripped: 0,
+        return Outcome::Ignored {
+            erased: identified.erased,
         };
     }
     match enqueue_identified(&collect.spool, &identified, now) {
         Ok(()) => Outcome::Linked {
-            linked: true,
             stripped: identified.stripped,
         },
         Err(error) => spool_failure(&error),
@@ -1437,5 +1443,60 @@ mod tests {
         assert_eq!(headers[RETRY_AFTER], "5");
         assert_eq!(answer["error"], "unavailable");
         assert!(w.collect.counters.unavailable.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// Asks for the erasure of `user` (with the device `anon`) on the world's
+    /// site and lets the cache see it, as a node does after a refresh.
+    fn erase(world: &World, user: &str, anon: &str) {
+        let site = world.meta.sites().unwrap()[0].id;
+        let request = world.meta.request_erasure(site, user, "test").unwrap();
+        world
+            .meta
+            .add_erasure_anons(request.id, &[anon.to_owned()])
+            .unwrap();
+        assert!(world.collect.cache.refresh(&world.meta).unwrap());
+    }
+
+    #[tokio::test]
+    async fn events_of_an_erased_device_are_acknowledged_counted_and_not_stored() {
+        let w = world(&[], Settings::default(), None);
+        erase(&w, "u_gone", "anon1");
+        let events = [
+            event(1, "checkout", json!({"items": 1})),
+            event(2, "checkout", json!({"items": 2})),
+        ];
+        let (status, _, answer) = send(&w, post(Some(&w.key), body(&events))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(answer, json!({"accepted": 0, "dropped": 2}));
+        assert_eq!(spooled(&w), 0);
+        assert_eq!(w.collect.counters.drops_by_reason(), vec![("erased", 2)]);
+    }
+
+    #[tokio::test]
+    async fn an_identify_for_an_erased_user_or_device_is_ignored() {
+        let w = world(&[], Settings::default(), None);
+        erase(&w, "u_gone", "anon_gone");
+        for (anon, user) in [("anon_gone", "u_fine"), ("anon_new", "u_gone")] {
+            let body = serde_json::to_vec(&json!({
+                "sent_at": NOW, "sdk": "t/1", "anon_id": anon, "user_id": user,
+                "traits": {"plan": "pro"}
+            }))
+            .unwrap();
+            let (status, _, answer) = send(&w, identify_post(Some(&w.key), body)).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(answer, json!({"accepted": 0, "stripped": 0}));
+        }
+        assert_eq!(spooled(&w), 0);
+        let c = &w.collect.counters;
+        assert_eq!(c.identify_erased.load(Ordering::Relaxed), 2);
+        assert_eq!(c.identified.load(Ordering::Relaxed), 0);
+        assert_eq!(c.identify_bots.load(Ordering::Relaxed), 0);
+
+        // Someone else is not affected.
+        let (status, _, answer) = send(&w, identify_post(Some(&w.key), identify_body(None))).await;
+        assert_eq!(
+            (status, answer["accepted"].as_u64()),
+            (StatusCode::ACCEPTED, Some(1))
+        );
     }
 }

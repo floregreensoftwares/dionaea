@@ -20,10 +20,10 @@ dionaea-meta = { version = "0.0.0", path = "../dionaea-meta" }
 dionaea-spool = { version = "0.0.0", path = "../dionaea-spool" }
 dionaea-store = { version = "0.0.0", path = "../dionaea-store" }
 maxminddb = "0.32.0"
+serde_json = "1.0.154"
 woothee = "0.13.0"
 
 [dev-dependencies]
-serde_json = "1.0.154"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

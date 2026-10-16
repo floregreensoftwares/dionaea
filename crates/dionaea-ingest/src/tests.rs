@@ -441,6 +441,7 @@ fn an_event_only_an_older_version_accepts_is_admitted_by_it() {
             (2, dionaea_core::parse_schema(strict).expect("strict")),
             (1, dionaea_core::parse_schema(V1).expect("v1")),
         ]),
+        tombstones: Default::default(),
     };
     let processed = run(
         &mixed,
