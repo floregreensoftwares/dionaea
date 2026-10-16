@@ -110,7 +110,12 @@ impl Server {
     }
 
     fn request_to(address: &str, head: &str, body: &str) -> (u16, String) {
-        let mut stream = TcpStream::connect(address).expect("connect");
+        // A server that refuses the connection (at its limit) may close it
+        // before the request is written or reset it while it is read; that is
+        // answered with status 0 rather than a panic, so a caller can retry.
+        let Ok(mut stream) = TcpStream::connect(address) else {
+            return (0, String::new());
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
@@ -118,14 +123,16 @@ impl Server {
             "{head}\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        stream.write_all(request.as_bytes()).expect("send");
+        if stream.write_all(request.as_bytes()).is_err() {
+            return (0, String::new());
+        }
         let mut response = String::new();
-        stream.read_to_string(&mut response).expect("read");
+        let _ = stream.read_to_string(&mut response);
         let status = response
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
-            .expect("a status line");
+            .unwrap_or(0);
         (status, response)
     }
 }
