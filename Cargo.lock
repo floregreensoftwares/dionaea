@@ -443,6 +443,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dionaea-ingest"
+version = "0.0.0"
+dependencies = [
+ "criterion",
+ "dionaea-core",
+ "dionaea-meta",
+ "serde_json",
+]
+
+[[package]]
 name = "dionaea-meta"
 version = "0.0.0"
 dependencies = [
