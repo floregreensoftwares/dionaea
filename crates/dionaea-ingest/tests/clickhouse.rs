@@ -179,7 +179,7 @@ fn a_request_becomes_rows_and_drop_counts() {
     );
 
     let store: Arc<dyn Destination> = Arc::new(scratch.store());
-    let batcher = Batcher::start(spool.clone(), store, fast());
+    let batcher = Batcher::start(spool.clone(), store, fast()).expect("thread");
     wait_for("the rows", || {
         scratch.number("SELECT count() FROM events") == 3
     });
@@ -231,7 +231,7 @@ fn an_outage_loses_nothing_and_the_spool_drains_when_clickhouse_returns() {
 
     // Nothing listens on port 1: ClickHouse is "down".
     let down: Arc<dyn Destination> = Arc::new(make(&scratch.database, Some(1)));
-    let batcher = Batcher::start(spool.clone(), down, fast());
+    let batcher = Batcher::start(spool.clone(), down, fast()).expect("thread");
     for n in 0..20 {
         collect(
             &cache,
@@ -250,7 +250,7 @@ fn an_outage_loses_nothing_and_the_spool_drains_when_clickhouse_returns() {
 
     // ClickHouse is back: a new batcher drains the same spool.
     let up: Arc<dyn Destination> = Arc::new(scratch.store());
-    let batcher = Batcher::start(spool.clone(), up, fast());
+    let batcher = Batcher::start(spool.clone(), up, fast()).expect("thread");
     wait_for("every row", || {
         scratch.number("SELECT count() FROM events") == 40
     });

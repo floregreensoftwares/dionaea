@@ -104,7 +104,8 @@ impl BatcherStats {
         self.retries.load(Ordering::Relaxed)
     }
 
-    /// Records given up on: unreadable, or rejected by the store for good.
+    /// Records, or the event or drop lines of a record, given up on:
+    /// unreadable, or rejected by the store for good.
     pub fn skipped_records(&self) -> u64 {
         self.skipped_records.load(Ordering::Relaxed)
     }
@@ -135,7 +136,15 @@ pub struct Batcher {
 
 impl Batcher {
     /// Starts the thread. It runs until [`stop`](Self::stop) or until dropped.
-    pub fn start(spool: Spool, destination: Arc<dyn Destination>, config: BatcherConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// When the operating system cannot start a thread.
+    pub fn start(
+        spool: Spool,
+        destination: Arc<dyn Destination>,
+        config: BatcherConfig,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(BatcherStats::default());
         let thread = {
@@ -147,14 +156,13 @@ impl Batcher {
                     // Records read but not confirmed are read again by the next
                     // batcher on this spool, not skipped.
                     spool.rewind();
-                })
-                .ok()
+                })?
         };
-        Self {
+        Ok(Self {
             stop,
             stats,
-            thread,
-        }
+            thread: Some(thread),
+        })
     }
 
     pub fn stats(&self) -> &BatcherStats {
@@ -247,30 +255,25 @@ enum Delivered {
     Stopped,
 }
 
-fn token(records: &[Record]) -> String {
-    let (first, last) = (&records[0].id, &records[records.len() - 1].next);
-    format!(
-        "{}.{}-{}.{}",
-        first.segment, first.offset, last.segment, last.offset
-    )
+/// The two kinds of line a record carries. Each is inserted, retried and, if
+/// rejected, isolated on its own, so a problem with one never repeats the
+/// other.
+#[derive(Clone, Copy)]
+enum Part {
+    Events,
+    Drops,
 }
 
-/// Joins the lines of `records`, skipping those that cannot be read.
-fn join(records: &[Record], stats: &BatcherStats) -> (String, String) {
-    let (mut events, mut drops) = (String::new(), String::new());
-    for record in records {
-        match sink::decode(&record.payload) {
-            Some(lines) => {
-                events.push_str(lines.events);
-                drops.push_str(lines.drops);
-            }
-            None => {
-                stats.skipped_records.fetch_add(1, Ordering::Relaxed);
-                stats.set_error(Some("a spool record could not be read".to_owned()));
-            }
-        }
-    }
-    (events, drops)
+fn token(records: &[Record], part: Part) -> String {
+    let (first, last) = (&records[0].id, &records[records.len() - 1].next);
+    let suffix = match part {
+        Part::Events => 'e',
+        Part::Drops => 'd',
+    };
+    format!(
+        "{}.{}-{}.{}-{suffix}",
+        first.segment, first.offset, last.segment, last.offset
+    )
 }
 
 fn count_lines(text: &str) -> u64 {
@@ -287,21 +290,56 @@ fn deliver(
     stats: &BatcherStats,
     backoff: &mut Duration,
 ) -> Delivered {
-    let (events, drops) = join(records, stats);
-    let token = token(records);
+    for record in records {
+        if sink::decode(&record.payload).is_none() {
+            stats.skipped_records.fetch_add(1, Ordering::Relaxed);
+            stats.set_error(Some("a spool record could not be read".to_owned()));
+        }
+    }
+    for part in [Part::Events, Part::Drops] {
+        if let Delivered::Stopped =
+            deliver_part(records, part, destination, config, stop, stats, backoff)
+        {
+            return Delivered::Stopped;
+        }
+    }
+    Delivered::Done
+}
+
+fn deliver_part(
+    records: &[Record],
+    part: Part,
+    destination: &dyn Destination,
+    config: &BatcherConfig,
+    stop: &AtomicBool,
+    stats: &BatcherStats,
+    backoff: &mut Duration,
+) -> Delivered {
+    let lines: String = records
+        .iter()
+        .filter_map(|record| sink::decode(&record.payload))
+        .map(|lines| match part {
+            Part::Events => lines.events,
+            Part::Drops => lines.drops,
+        })
+        .collect();
+    if lines.is_empty() {
+        return Delivered::Done;
+    }
+    let token = token(records, part);
     loop {
-        let result = destination
-            .insert_event_lines(&events, &format!("{token}-e"))
-            .and_then(|()| destination.insert_drop_lines(&drops, &format!("{token}-d")));
+        let result = match part {
+            Part::Events => destination.insert_event_lines(&lines, &token),
+            Part::Drops => destination.insert_drop_lines(&lines, &token),
+        };
         match result {
             Ok(()) => {
                 stats.batches.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .event_rows
-                    .fetch_add(count_lines(&events), Ordering::Relaxed);
-                stats
-                    .drop_rows
-                    .fetch_add(count_lines(&drops), Ordering::Relaxed);
+                let rows = match part {
+                    Part::Events => &stats.event_rows,
+                    Part::Drops => &stats.drop_rows,
+                };
+                rows.fetch_add(count_lines(&lines), Ordering::Relaxed);
                 stats.set_error(None);
                 *backoff = config.backoff_min;
                 return Delivered::Done;
@@ -310,14 +348,10 @@ fn deliver(
                 stats.set_error(Some(error.to_string()));
                 if records.len() > 1 {
                     for record in records {
-                        if let Delivered::Stopped = deliver(
-                            std::slice::from_ref(record),
-                            destination,
-                            config,
-                            stop,
-                            stats,
-                            backoff,
-                        ) {
+                        let one = std::slice::from_ref(record);
+                        if let Delivered::Stopped =
+                            deliver_part(one, part, destination, config, stop, stats, backoff)
+                        {
                             return Delivered::Stopped;
                         }
                     }

@@ -160,6 +160,7 @@ fn start(spool: &Spool, fake: &Arc<Fake>) -> Batcher {
         Arc::clone(fake) as Arc<dyn Destination>,
         fast(),
     )
+    .expect("thread")
 }
 
 /// Whether the spool still holds records, read from a fresh handle.
@@ -308,7 +309,8 @@ fn what_is_enqueued_reaches_the_destination_and_the_spool_drains() {
     let fake = Arc::new(Fake::default());
     let batcher = start(&spool, &fake);
     wait_for("the rows", || batcher.stats().event_rows() == 10);
-    assert_eq!(batcher.stats().drop_rows(), 5);
+    wait_for("the drop counts", || batcher.stats().drop_rows() == 5);
+
     assert_eq!(batcher.stats().last_error(), None);
     batcher.stop();
     assert_eq!(fake.events().len(), 10);
@@ -429,7 +431,8 @@ fn stopping_interrupts_a_long_wait_after_a_failure() {
         spool.clone(),
         Arc::clone(&down) as Arc<dyn Destination>,
         config,
-    );
+    )
+    .expect("thread");
     wait_for("the first failure", || batcher.stats().retries() >= 1);
     let started = Instant::now();
     batcher.stop();
@@ -479,4 +482,32 @@ fn a_second_batcher_on_the_same_spool_reads_what_the_first_never_confirmed() {
     let second = start(&spool, &healthy);
     wait_for("the rows", || healthy.events().len() == 2);
     second.stop();
+}
+
+#[test]
+fn a_rejected_drop_line_never_repeats_the_events_stored_with_it() {
+    let dir = spool_dir("drops-poison");
+    let spool = open(&dir);
+    // Two requests whose events are fine; the second one's drop lines are
+    // rejected for good. They are joined in one batch.
+    enqueue(&spool, &request(vec![accepted(1, 1)], 1), 7, NOW).unwrap();
+    let mut second = request(vec![accepted(2, 1)], 1);
+    second.drops[0].event_name = POISON.to_owned();
+    enqueue(&spool, &second, 7, NOW).unwrap();
+    let fake = Arc::new(Fake::default());
+    let batcher = start(&spool, &fake);
+    wait_for("the events and the isolated drops", || {
+        fake.events().len() == 2 && batcher.stats().skipped_records() == 1
+    });
+    // Give a wrong implementation the time to insert the events again.
+    std::thread::sleep(Duration::from_millis(200));
+    batcher.stop();
+    assert_eq!(fake.events().len(), 2, "each event was stored once");
+    assert_eq!(
+        fake.stored_drops.lock().unwrap().len(),
+        1,
+        "the good drop line was stored"
+    );
+    drop(spool);
+    assert_eq!(pending(&dir), 0);
 }
