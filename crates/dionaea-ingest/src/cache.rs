@@ -106,8 +106,19 @@ impl Cache {
             versions.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
             table.schemas.insert(site.site_id, versions.into());
         }
-        *self.table.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(table);
-        Ok(true)
+        Ok(self.install(table))
+    }
+
+    /// Replaces the held data unless it is already newer: two refreshes that
+    /// overlap must not let the older snapshot win, or a revoked key would
+    /// come back until the next change.
+    fn install(&self, table: Table) -> bool {
+        let mut held = self.table.write().unwrap_or_else(PoisonError::into_inner);
+        if held.loaded && held.generation > table.generation {
+            return false;
+        }
+        *held = Arc::new(table);
+        true
     }
 
     /// Resolves a write key and checks the request's `Origin` header.
@@ -134,5 +145,44 @@ impl Cache {
             site_id: entry.site_id,
             schemas,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(generation: u64, key: &str) -> Table {
+        let mut table = Table {
+            loaded: true,
+            generation,
+            ..Table::default()
+        };
+        table.keys.insert(
+            key.to_owned(),
+            KeyEntry {
+                site_id: 1,
+                origins: Vec::new(),
+            },
+        );
+        table
+    }
+
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_one() {
+        let cache = Cache::new();
+        assert!(cache.install(table(6, "new")));
+        assert!(
+            !cache.install(table(5, "old")),
+            "an overlapping refresh lost the race"
+        );
+        assert_eq!(cache.generation(), 6);
+        assert!(cache.admit("new", None).is_ok());
+        assert_eq!(cache.admit("old", None).unwrap_err(), Refusal::UnknownKey);
+        assert!(cache.install(table(7, "newer")));
+        assert!(
+            cache.install(table(7, "same")),
+            "the same generation is idempotent"
+        );
     }
 }

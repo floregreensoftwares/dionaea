@@ -20,6 +20,11 @@ struct Bucket {
 
 /// Allows `rate_per_sec` requests per second on average per key, with bursts
 /// of up to `burst`.
+///
+/// Bounded memory has a price: under a flood of distinct keys an arbitrary
+/// bucket can be evicted, which resets that key to a full burst. Apply it to
+/// keys that already passed admission, or to client addresses behind a
+/// network-level limit, never to unchecked strings from the request.
 #[derive(Debug)]
 pub struct RateLimiter<K> {
     rate_per_ms: f64,
