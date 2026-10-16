@@ -86,6 +86,10 @@ impl Node {
         }
         let store = Store::new(store_config).map_err(|e| format!("clickhouse settings: {e}"))?;
 
+        // The user agent dataset compiles its patterns on first use; do it now
+        // so the first request does not pay for it.
+        let _ = dionaea_ingest::parse_user_agent("Mozilla/5.0 (X11; Linux x86_64) warm-up");
+
         let mut collect = Collect::new(
             cache,
             spool.clone(),
