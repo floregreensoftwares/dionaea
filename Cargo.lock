@@ -517,6 +517,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dionaea-spool"
+version = "0.0.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
 name = "dionaea-store"
 version = "0.0.0"
 dependencies = [
