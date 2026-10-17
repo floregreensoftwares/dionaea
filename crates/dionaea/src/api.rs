@@ -289,8 +289,10 @@ pub(crate) struct Api {
     schemas: Mutex<SchemaCache>,
     in_flight: AtomicUsize,
     artifacts: Arc<dyn ArtifactStore>,
-    /// Symbol uploads being received.
-    uploads: AtomicUsize,
+    /// Symbol uploads being received (taken before the body is read).
+    uploads: Arc<AtomicUsize>,
+    /// One upload at a time is checked against the quota and recorded.
+    upload_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for Api {
@@ -480,7 +482,8 @@ impl Api {
     ) -> Self {
         Self {
             artifacts,
-            uploads: AtomicUsize::new(0),
+            uploads: Arc::new(AtomicUsize::new(0)),
+            upload_lock: Mutex::new(()),
             meta,
             auth,
             store,

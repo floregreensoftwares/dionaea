@@ -11,6 +11,8 @@ use crate::sqlite::{SqliteMeta, id_of, storage};
 /// Longest release and file name, in characters.
 pub const MAX_RELEASE_CHARS: usize = 64;
 pub const MAX_SYMBOL_NAME_CHARS: usize = 256;
+/// Most files one listing returns.
+pub const MAX_LISTED: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SymbolKind {
@@ -85,7 +87,8 @@ pub trait SymbolIndex: Send + Sync {
         name: &str,
     ) -> Result<Option<SymbolFile>, MetaError>;
 
-    /// The files of a site, of one release when given, in name order.
+    /// The files of a site, of one release when given, in name order; at most
+    /// [`MAX_LISTED`].
     fn symbol_files(
         &self,
         site_id: u32,
@@ -239,7 +242,7 @@ impl SymbolIndex for SqliteMeta {
                 .prepare(&format!(
                     "SELECT {COLUMNS} FROM symbol_files
                      WHERE site_id = ?1 AND (?2 IS NULL OR release = ?2)
-                     ORDER BY release, kind, name"
+                     ORDER BY release, kind, name LIMIT {MAX_LISTED}"
                 ))
                 .map_err(storage)?;
             let rows = statement

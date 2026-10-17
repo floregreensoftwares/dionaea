@@ -103,6 +103,9 @@ enum SymbolsCommand {
         /// Store files under their path below this directory instead of their file name
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Send the token over plain HTTP to a server that is not this machine
+        #[arg(long)]
+        allow_http: bool,
         files: Vec<PathBuf>,
     },
 }
@@ -437,6 +440,7 @@ fn symbols(command: SymbolsCommand) -> ExitCode {
         release,
         kind,
         root,
+        allow_http,
         files,
     } = command;
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
@@ -456,6 +460,7 @@ fn symbols(command: SymbolsCommand) -> ExitCode {
         kind,
         root.as_deref(),
         &files,
+        allow_http,
         &mut out,
         &mut err,
     ))

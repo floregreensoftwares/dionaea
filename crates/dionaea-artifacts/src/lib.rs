@@ -136,12 +136,16 @@ impl LocalArtifacts {
             .join(path_part(id.name)))
     }
 
-    fn temp_name(&self) -> String {
-        format!(
+    /// A name no other writer uses, even another server on the same directory
+    /// (process ids repeat between containers): 64 random bits and a count.
+    fn temp_name(&self) -> io::Result<String> {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        Ok(format!(
             ".tmp-{}-{}",
-            std::process::id(),
+            hex(&random),
             self.counter.fetch_add(1, Ordering::Relaxed)
-        )
+        ))
     }
 }
 
@@ -152,7 +156,7 @@ impl ArtifactStore for LocalArtifacts {
             io::Error::new(io::ErrorKind::InvalidInput, "an artifact has a directory")
         })?;
         fs::create_dir_all(dir)?;
-        let temp = dir.join(self.temp_name());
+        let temp = dir.join(self.temp_name()?);
         let written = (|| -> io::Result<()> {
             let mut file = File::create(&temp)?;
             file.write_all(bytes)?;

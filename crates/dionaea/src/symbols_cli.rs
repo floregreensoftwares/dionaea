@@ -31,6 +31,23 @@ fn encode(text: &str) -> String {
     out
 }
 
+/// Whether sending a token to `url` is safe: HTTPS, or a name that only this
+/// machine reaches. Anything else would put the token on the network in the clear.
+pub(crate) fn safe_to_send(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(inner) => inner.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 /// The name a file is stored under: its path below `root` with `/`
 /// separators, or just its file name when there is no root.
 pub(crate) fn name_of(file: &Path, root: Option<&Path>) -> Result<String, String> {
@@ -71,9 +88,17 @@ pub(crate) fn upload(
     kind: SymbolKind,
     root: Option<&Path>,
     files: &[PathBuf],
+    allow_http: bool,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> u8 {
+    if !allow_http && !safe_to_send(url) {
+        let _ = writeln!(
+            err,
+            "error: refusing to send the token over plain HTTP to {url}; use https://, or pass --allow-http"
+        );
+        return UNUSABLE;
+    }
     if files.is_empty() {
         let _ = writeln!(err, "error: name at least one file");
         return UNUSABLE;
@@ -166,6 +191,28 @@ mod tests {
             name_of(Path::new("build/static/main.map"), None).unwrap(),
             "main.map"
         );
+    }
+
+    #[test]
+    fn a_token_is_only_sent_over_https_or_to_this_machine() {
+        for good in [
+            "https://d.example.com",
+            "http://localhost:8090",
+            "http://127.0.0.1:8090/x",
+            "http://[::1]:8090",
+        ] {
+            assert!(safe_to_send(good), "{good}");
+        }
+        for bad in [
+            "http://d.example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "ftp://x",
+            "d.example.com",
+            "http://user@d.example.com",
+        ] {
+            assert!(!safe_to_send(bad), "{bad}");
+        }
     }
 
     #[test]

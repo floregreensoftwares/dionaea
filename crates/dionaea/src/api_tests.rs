@@ -1500,6 +1500,7 @@ fn the_body_limit_is_decided_after_the_caller_is_known() {
         r.content_type = Some("application/octet-stream".to_owned());
         w.api
             .body_limit(&r, ordinary)
+            .map(|(limit, _slot)| limit)
             .map_err(|refusal| refusal.status)
     };
     let symbols = format!("sites/{}/symbols", w.shop);
@@ -1533,18 +1534,43 @@ fn the_body_limit_is_decided_after_the_caller_is_known() {
     let mut foreign = request("POST", &symbols, &admin, None);
     foreign.origin = Some("https://evil.example".to_owned());
     assert_eq!(
-        w.api.body_limit(&foreign, ordinary).map_err(|r| r.status),
+        w.api
+            .body_limit(&foreign, ordinary)
+            .map(|(l, _)| l)
+            .map_err(|r| r.status),
         Err(403)
     );
 }
 
 #[test]
-fn uploads_in_progress_are_bounded() {
-    let counter = AtomicUsize::new(0);
+fn uploads_are_bounded_before_their_bodies_are_read() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let symbols = format!("sites/{}/symbols", w.shop);
+    let head = request("POST", &symbols, &admin, None);
+
     let held: Vec<_> = (0..symbols::MAX_UPLOADS_IN_FLIGHT)
-        .map(|_| InFlight::acquire(&counter, symbols::MAX_UPLOADS_IN_FLIGHT).expect("room"))
+        .map(|_| {
+            w.api
+                .body_limit(&head, 1000)
+                .expect("room")
+                .1
+                .expect("a slot")
+        })
         .collect();
-    assert!(InFlight::acquire(&counter, symbols::MAX_UPLOADS_IN_FLIGHT).is_none());
+    let refused = w.api.body_limit(&head, 1000).unwrap_err();
+    assert_eq!(refused.status, 429);
+    assert!(refused.retry_after.is_some());
+    // Reads and other requests are not held up by uploads.
+    assert!(
+        w.api
+            .body_limit(&request("GET", &symbols, &admin, None), 1000)
+            .is_ok()
+    );
+
     drop(held);
-    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    assert!(
+        w.api.body_limit(&head, 1000).is_ok(),
+        "the places came back"
+    );
 }

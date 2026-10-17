@@ -69,7 +69,7 @@ async fn handle(
         client,
     };
     // For an upload of symbols the caller is checked before the body is read.
-    let limit = {
+    let (limit, _upload_slot) = {
         let (api, head) = (Arc::clone(&state.api), api_request.clone());
         match tokio::task::spawn_blocking(move || api.body_limit(&head, MAX_BODY_BYTES)).await {
             Ok(Ok(limit)) => limit,

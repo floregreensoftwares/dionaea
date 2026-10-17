@@ -600,6 +600,7 @@ dependencies = [
 name = "dionaea-artifacts"
 version = "0.0.0"
 dependencies = [
+ "getrandom 0.4.3",
  "sha2",
 ]
 

@@ -40,8 +40,8 @@ pub use erasure::{
 };
 pub use sqlite::SqliteMeta;
 pub use symbols::{
-    MAX_RELEASE_CHARS, MAX_SYMBOL_NAME_CHARS, SymbolFile, SymbolIndex, SymbolKind, is_release,
-    is_symbol_name,
+    MAX_LISTED, MAX_RELEASE_CHARS, MAX_SYMBOL_NAME_CHARS, SymbolFile, SymbolIndex, SymbolKind,
+    is_release, is_symbol_name,
 };
 
 /// Most origins one write key may allow.

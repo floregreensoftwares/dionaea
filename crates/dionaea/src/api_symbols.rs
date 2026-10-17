@@ -19,6 +19,25 @@ const MAX_SITE_SYMBOL_BYTES: u64 = 1 << 30;
 /// Uploads being received at once on a node.
 pub(crate) const MAX_UPLOADS_IN_FLIGHT: usize = 4;
 
+/// A place among the uploads being received; given back when dropped.
+#[derive(Debug)]
+pub(crate) struct UploadSlot(Arc<AtomicUsize>);
+
+impl UploadSlot {
+    fn take(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        let before = counter.fetch_add(1, Ordering::AcqRel);
+        let slot = Self(Arc::clone(counter));
+        // Dropping the slot gives the place back.
+        (before < max).then_some(slot)
+    }
+}
+
+impl Drop for UploadSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewUploadTokenBody {
@@ -104,13 +123,16 @@ fn check_content(kind: SymbolKind, bytes: &[u8]) -> Result<(), ApiError> {
 }
 
 impl Api {
-    /// How large a body this request may have. For an upload of symbols the
-    /// caller is checked first; for anything else the ordinary limit applies.
+    /// How large a body this request may have, and for an upload the place
+    /// among the uploads being received, which the caller keeps until the
+    /// request is answered. For an upload of symbols the caller is checked
+    /// first and refused before anything is buffered; for anything else the
+    /// ordinary limit applies.
     pub(crate) fn body_limit(
         &self,
         req: &ApiRequest,
         ordinary: usize,
-    ) -> Result<usize, ApiResponse> {
+    ) -> Result<(usize, Option<UploadSlot>), ApiResponse> {
         let is_upload = req.method == "POST"
             && req
                 .path
@@ -118,7 +140,7 @@ impl Api {
                 .and_then(|rest| rest.strip_suffix("/symbols"))
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
         if !is_upload {
-            return Ok(ordinary);
+            return Ok((ordinary, None));
         }
         let check = || -> Result<(), ApiError> {
             if !same_origin(req) {
@@ -136,9 +158,17 @@ impl Api {
             self.site_access(&principal, id_of(site)?, Permission::Upload)?;
             Ok(())
         };
-        check()
-            .map(|()| MAX_SYMBOL_BYTES)
-            .map_err(ApiError::into_response)
+        check().map_err(ApiError::into_response)?;
+        let slot = UploadSlot::take(&self.uploads, MAX_UPLOADS_IN_FLIGHT).ok_or_else(|| {
+            let mut busy = ApiError::new(
+                429,
+                "busy",
+                "too many uploads are in progress; retry shortly",
+            );
+            busy.retry_after = Some(2);
+            busy.into_response()
+        })?;
+        Ok((MAX_SYMBOL_BYTES, Some(slot)))
     }
 
     pub(super) fn symbols(&self, req: &ApiRequest, principal: &Principal, site: u32) -> ApiResult {
@@ -186,15 +216,11 @@ impl Api {
         }
         check_content(kind, &req.body)?;
 
-        let _slot = InFlight::acquire(&self.uploads, MAX_UPLOADS_IN_FLIGHT).ok_or_else(|| {
-            let mut busy = ApiError::new(
-                429,
-                "busy",
-                "too many uploads are in progress; retry shortly",
-            );
-            busy.retry_after = Some(2);
-            busy
-        })?;
+        // The quota check, the write and the index update are one step.
+        let _one_at_a_time = self
+            .upload_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let replaced = self.meta.symbol_file(site.id, &release, kind, &name)?;
         let total = self.meta.symbol_bytes(site.id)?;
         let after = total - replaced.as_ref().map_or(0, |f| f.size) + req.body.len() as u64;
@@ -252,13 +278,15 @@ impl Api {
         };
         match (kind, name) {
             (None, None) => {
-                let removed = self.meta.remove_release_symbols(site.id, &release)?;
-                if removed.is_empty() {
+                if self.meta.symbol_files(site.id, Some(&release))?.is_empty() {
                     return Err(ApiError::not_found());
                 }
+                // The bytes first: if that fails nothing has changed, and a
+                // retry finds the index still there.
                 self.artifacts
                     .delete_release(site.id, &release)
                     .map_err(storage_failed)?;
+                self.meta.remove_release_symbols(site.id, &release)?;
             }
             (Some(kind), Some(name)) => {
                 let kind = SymbolKind::parse(&kind)
