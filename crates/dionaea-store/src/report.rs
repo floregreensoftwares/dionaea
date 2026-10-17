@@ -481,6 +481,20 @@ fn escape_param(value: &str) -> String {
 }
 
 impl Store {
+    /// Whether ClickHouse knows the time zone.
+    pub fn time_zone_known(&self, time_zone: &str) -> Result<bool, Error> {
+        let limits = Limits {
+            max_execution_secs: 10,
+            max_rows: 10,
+        };
+        let rows = self.select(&time_zone_known(time_zone), &limits)?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.get("n"))
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0))
+    }
+
     /// Runs a read statement and returns its rows as JSON objects. A read
     /// that takes longer than `limits.max_execution_secs`, or would return
     /// more than `limits.max_rows`, fails (see [`Error::server_code`])

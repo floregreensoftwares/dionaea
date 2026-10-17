@@ -19,3 +19,10 @@ dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
 dionaea-store = { version = "0.0.0", path = "../dionaea-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "plan"
+harness = false

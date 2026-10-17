@@ -717,8 +717,5 @@ fn an_unknown_time_zone_is_an_error_not_a_panic() {
     seed(&scratch);
     let query = week(series(Measure::Events, None, Granularity::Day, None));
     let answer = scratch.ask_with(&query, &Limits::default(), "Mars/Olympus_Mons", SITE);
-    assert!(
-        matches!(answer, Err(QueryError::Unavailable(_))),
-        "{answer:?}"
-    );
+    assert_eq!(answer, Err(QueryError::InvalidTimeZone));
 }

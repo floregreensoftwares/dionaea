@@ -30,9 +30,18 @@ pub(crate) struct Config {
     /// Where `/healthz`, `/readyz` and `/metrics` are served, apart from the
     /// public listener so they need not be reachable from the internet.
     pub(crate) ops_listen: SocketAddr,
+    /// Where the API for members and scripts (`/api/v1/`) is served.
+    pub(crate) api_listen: SocketAddr,
+    /// Whether the session cookie carries `Secure`. Turn it off only when the
+    /// API is reached over plain HTTP in local development.
+    pub(crate) secure_cookies: bool,
     pub(crate) clickhouse_url: String,
     pub(crate) clickhouse_user: String,
     pub(crate) clickhouse_password: Secret,
+    /// The ClickHouse user that reports are read with; it should only be able
+    /// to read. Without it the user above reads too.
+    pub(crate) clickhouse_query_user: Option<String>,
+    pub(crate) clickhouse_query_password: Secret,
     pub(crate) clickhouse_database: String,
     /// A PEM file with the certificates to trust for an `https://` ClickHouse;
     /// without it the public roots are trusted.
@@ -89,9 +98,13 @@ impl std::error::Error for ConfigError {}
 const FILE_KEYS: &[&str] = &[
     "listen",
     "ops_listen",
+    "api_listen",
+    "secure_cookies",
     "clickhouse_url",
     "clickhouse_user",
     "clickhouse_password",
+    "clickhouse_query_user",
+    "clickhouse_query_password",
     "clickhouse_database",
     "clickhouse_ca_file",
     "clickhouse_server_name",
@@ -111,9 +124,13 @@ const FILE_KEYS: &[&str] = &[
 struct FileConfig {
     listen: Option<String>,
     ops_listen: Option<String>,
+    api_listen: Option<String>,
+    secure_cookies: Option<bool>,
     clickhouse_url: Option<String>,
     clickhouse_user: Option<String>,
     clickhouse_password: Option<String>,
+    clickhouse_query_user: Option<String>,
+    clickhouse_query_password: Option<String>,
     clickhouse_database: Option<String>,
     clickhouse_ca_file: Option<PathBuf>,
     clickhouse_server_name: Option<String>,
@@ -216,6 +233,25 @@ impl Config {
             file.ops_listen,
             "127.0.0.1:9100",
         )?;
+        let api_listen = address(
+            "API_LISTEN",
+            "api_listen",
+            file.api_listen,
+            "127.0.0.1:8090",
+        )?;
+        let secure_cookies = match source.var("SECURE_COOKIES") {
+            Some(value) => match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(ConfigError::Invalid {
+                        key: "secure_cookies",
+                        reason: "expected `true` or `false`".to_owned(),
+                    });
+                }
+            },
+            None => file.secure_cookies.unwrap_or(true),
+        };
 
         let clickhouse_url = source.text(
             "CLICKHOUSE_URL",
@@ -229,6 +265,15 @@ impl Config {
         let clickhouse_user = source.text("CLICKHOUSE_USER", file.clickhouse_user, "default");
         let clickhouse_password =
             Secret(source.text("CLICKHOUSE_PASSWORD", file.clickhouse_password, ""));
+        let clickhouse_query_user = source
+            .var("CLICKHOUSE_QUERY_USER")
+            .or(file.clickhouse_query_user)
+            .filter(|user| !user.is_empty());
+        let clickhouse_query_password = Secret(source.text(
+            "CLICKHOUSE_QUERY_PASSWORD",
+            file.clickhouse_query_password,
+            "",
+        ));
         let clickhouse_database =
             source.text("CLICKHOUSE_DATABASE", file.clickhouse_database, "dionaea");
         let clickhouse_ca_file = source.path("CLICKHOUSE_CA_FILE", file.clickhouse_ca_file);
@@ -300,9 +345,13 @@ impl Config {
         Ok(Self {
             listen,
             ops_listen,
+            api_listen,
+            secure_cookies,
             clickhouse_url,
             clickhouse_user,
             clickhouse_password,
+            clickhouse_query_user,
+            clickhouse_query_password,
             clickhouse_database,
             clickhouse_ca_file,
             clickhouse_server_name,
@@ -376,11 +425,32 @@ impl Config {
         &self,
         timeout: Option<std::time::Duration>,
     ) -> Result<Store, String> {
+        self.clickhouse_handle(&self.clickhouse_user, &self.clickhouse_password.0, timeout)
+    }
+
+    /// A handle to ClickHouse for reading reports: the query user when one is
+    /// configured.
+    pub(crate) fn clickhouse_query_store(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Store, String> {
+        match &self.clickhouse_query_user {
+            Some(user) => self.clickhouse_handle(user, &self.clickhouse_query_password.0, timeout),
+            None => self.clickhouse_store(timeout),
+        }
+    }
+
+    fn clickhouse_handle(
+        &self,
+        user: &str,
+        password: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Store, String> {
         let endpoint = clickhouse_endpoint(&self.clickhouse_url)?;
         let mut config =
             dionaea_store::Config::new(&endpoint.host, endpoint.port, &self.clickhouse_database);
-        config.user.clone_from(&self.clickhouse_user);
-        config.password.clone_from(&self.clickhouse_password.0);
+        user.clone_into(&mut config.user);
+        password.clone_into(&mut config.password);
         if endpoint.tls {
             config.tls = Some(TlsConfig {
                 ca_file: self.clickhouse_ca_file.clone(),

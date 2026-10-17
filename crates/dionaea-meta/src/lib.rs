@@ -425,6 +425,10 @@ pub trait MetaStore: Send + Sync {
     /// Lets go of a lease `holder` has, so another node may take it at once.
     fn release_lease(&self, name: &str, holder: &str) -> Result<(), MetaError>;
 
+    /// The active schema versions of one site, oldest first, and the
+    /// generation they were read at.
+    fn site_schemas(&self, site_id: u32) -> Result<(u64, Vec<Schema>), MetaError>;
+
     /// The live keys and active schema versions of every site.
     fn snapshot(&self) -> Result<Snapshot, MetaError>;
 }

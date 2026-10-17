@@ -6,6 +6,8 @@
 //! all of that memory: callers on an async runtime run it on a blocking
 //! thread.
 
+use std::sync::{Arc, OnceLock};
+
 use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
 use argon2::{Algorithm, Argon2, Params, Version};
 
@@ -38,12 +40,29 @@ pub fn check_policy(password: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
+fn hash_with(argon2: &Argon2<'_>, password: &str) -> Result<String, AuthError> {
+    let mut salt = [0u8; SALT_BYTES];
+    getrandom::fill(&mut salt).map_err(|e| AuthError::Random(e.to_string()))?;
+    let hash = argon2
+        .hash_password_with_salt(password.as_bytes(), &salt)
+        .map_err(|e| AuthError::Hash(e.to_string()))?;
+    Ok(hash.to_string())
+}
+
+fn make_decoy(argon2: &Argon2<'_>) -> Result<String, AuthError> {
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random).map_err(|e| AuthError::Random(e.to_string()))?;
+    hash_with(argon2, &format!("{random:?}"))
+}
+
 pub struct Hasher {
     argon2: Argon2<'static>,
     /// A hash of a random password nobody knows, verified against when the
     /// account does not exist so that a missing account takes as long as a
-    /// wrong password.
-    decoy: String,
+    /// wrong password. Made on a thread of its own when the hasher is, so
+    /// starting a server does not wait for it; a login that needs it first
+    /// waits for the thread.
+    decoy: Arc<OnceLock<String>>,
 }
 
 impl std::fmt::Debug for Hasher {
@@ -69,25 +88,24 @@ impl Hasher {
         let params = Params::new(memory_kib, passes, lanes, None)
             .map_err(|e| AuthError::Hash(e.to_string()))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut hasher = Self {
+        let hasher = Self {
             argon2,
-            decoy: String::new(),
+            decoy: Arc::new(OnceLock::new()),
         };
-        let mut random = [0u8; 32];
-        getrandom::fill(&mut random).map_err(|e| AuthError::Random(e.to_string()))?;
-        hasher.decoy = hasher.hash(&format!("{random:?}"))?;
+        // Fails now, not on a login, if there is no randomness.
+        getrandom::fill(&mut [0u8; 1]).map_err(|e| AuthError::Random(e.to_string()))?;
+        let (argon2, decoy) = (hasher.argon2.clone(), Arc::clone(&hasher.decoy));
+        let _ = std::thread::Builder::new()
+            .name("dionaea-decoy".to_owned())
+            .spawn(move || {
+                let _ = decoy.get_or_init(|| make_decoy(&argon2).unwrap_or_default());
+            });
         Ok(hasher)
     }
 
     /// The argon2id hash of a password, as a PHC string with a fresh salt.
     pub fn hash(&self, password: &str) -> Result<String, AuthError> {
-        let mut salt = [0u8; SALT_BYTES];
-        getrandom::fill(&mut salt).map_err(|e| AuthError::Random(e.to_string()))?;
-        let hash = self
-            .argon2
-            .hash_password_with_salt(password.as_bytes(), &salt)
-            .map_err(|e| AuthError::Hash(e.to_string()))?;
-        Ok(hash.to_string())
+        hash_with(&self.argon2, password)
     }
 
     /// Whether the password matches the hash. A malformed hash does not match.
@@ -100,7 +118,10 @@ impl Hasher {
     /// Spends the time of a verification on nothing, for an account that does
     /// not exist.
     pub fn verify_decoy(&self, password: &str) {
-        let _ = self.verify(password, &self.decoy);
+        let decoy = self
+            .decoy
+            .get_or_init(|| make_decoy(&self.argon2).unwrap_or_default());
+        let _ = self.verify(password, decoy);
     }
 }
 

@@ -347,7 +347,7 @@ fn address_bucket(ip: IpAddr) -> IpAddr {
 /// the client is the `hops`-th entry from the right; anything to its left was
 /// written by the client and is ignored. A header that is missing, too short
 /// or not an address falls back to the peer.
-fn client_address(headers: &HeaderMap, peer: IpAddr, hops: u8, header: &str) -> IpAddr {
+pub(crate) fn client_address(headers: &HeaderMap, peer: IpAddr, hops: u8, header: &str) -> IpAddr {
     if hops == 0 {
         return peer;
     }

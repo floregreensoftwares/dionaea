@@ -965,6 +965,30 @@ impl MetaStore for SqliteMeta {
         self.write(|tx, _| erasure_sql::release_lease(tx, name, holder))
     }
 
+    fn site_schemas(&self, site_id: u32) -> Result<(u64, Vec<Schema>), MetaError> {
+        self.read(|tx| {
+            let generation = generation_of(tx)?;
+            let mut statement = tx
+                .prepare(
+                    "SELECT version, source FROM schema_versions
+                     WHERE site_id = ?1 AND retired_at IS NULL ORDER BY version",
+                )
+                .map_err(storage)?;
+            let rows = statement
+                .query_map([site_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?;
+            let schemas = rows
+                .map(|row| {
+                    let (version, source) = row.map_err(storage)?;
+                    parse_stored(&source, site_id, id_of(version)?)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((generation, schemas))
+        })
+    }
+
     fn snapshot(&self) -> Result<Snapshot, MetaError> {
         self.read(|tx| {
             let generation = generation_of(tx)?;

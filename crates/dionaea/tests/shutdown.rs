@@ -15,6 +15,7 @@ fn sigterm_stops_the_server_after_an_orderly_shutdown() {
         .arg("serve")
         .env("DIONAEA_LISTEN", "127.0.0.1:0")
         .env("DIONAEA_OPS_LISTEN", "127.0.0.1:0")
+        .env("DIONAEA_API_LISTEN", "127.0.0.1:0")
         .env("DIONAEA_METADATA_PATH", dir.join("meta.db"))
         .env("DIONAEA_SPOOL_DIR", dir.join("spool"))
         .env("DIONAEA_LOG_FORMAT", "json")

@@ -14,9 +14,11 @@ workspace = true
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6.7", features = ["derive"] }
+dionaea-auth = { version = "0.0.0", path = "../dionaea-auth" }
 dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
 dionaea-ingest = { version = "0.0.0", path = "../dionaea-ingest" }
 dionaea-meta = { version = "0.0.0", path = "../dionaea-meta" }
+dionaea-query = { version = "0.0.0", path = "../dionaea-query" }
 dionaea-spool = { version = "0.0.0", path = "../dionaea-spool" }
 dionaea-store = { version = "0.0.0", path = "../dionaea-store" }
 http-body-util = "0.1.5"

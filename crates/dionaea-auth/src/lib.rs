@@ -234,6 +234,38 @@ impl Auth {
         Ok(self.accounts.set_password_hash(member_id, &hash)?)
     }
 
+    /// Replaces a member's password after checking the current one, and ends
+    /// their sessions. A wrong current password counts as a failed login.
+    pub fn change_password(
+        &self,
+        member: &Member,
+        current: &str,
+        new: &str,
+        client: &str,
+    ) -> Result<(), AuthError> {
+        check_policy(new)?;
+        let now = (self.clock)();
+        let key = format!("email:{}", member.email);
+        if let Some(retry_after_secs) = self.limiter.blocked_for(&key, now) {
+            return Err(AuthError::TooManyAttempts { retry_after_secs });
+        }
+        let stored = self.accounts.member_for_login(&member.email)?;
+        let right = current.chars().count() <= MAX_PASSWORD_CHARS
+            && stored
+                .as_ref()
+                .is_some_and(|(_, hash)| self.hasher.verify(current, hash));
+        if !right {
+            self.limiter.record_failure(&key, now);
+            if !client.is_empty() {
+                self.limiter
+                    .record_failure(&format!("client:{client}"), now);
+            }
+            return Err(AuthError::InvalidCredentials);
+        }
+        self.limiter.clear(&key);
+        self.set_password(member.id, new)
+    }
+
     /// Logs a member in. `client` names where the attempt comes from (an
     /// address) and is limited like the e-mail address is; pass an empty
     /// string when unknown.

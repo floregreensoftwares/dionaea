@@ -572,9 +572,11 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "clap",
+ "dionaea-auth",
  "dionaea-core",
  "dionaea-ingest",
  "dionaea-meta",
+ "dionaea-query",
  "dionaea-spool",
  "dionaea-store",
  "futures-util",
@@ -597,6 +599,7 @@ name = "dionaea-auth"
 version = "0.0.0"
 dependencies = [
  "argon2",
+ "criterion",
  "dionaea-meta",
  "getrandom 0.4.3",
  "sha2",
@@ -641,6 +644,7 @@ dependencies = [
 name = "dionaea-query"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "dionaea-core",
  "dionaea-store",
  "serde",
