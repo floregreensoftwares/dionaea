@@ -12,4 +12,4 @@ pub mod scrub;
 
 pub use frames::{Frame, normalize as normalize_frames};
 pub use route::template_route;
-pub use scrub::{scrub_message, strip_query};
+pub use scrub::{scrub_message, strip_query, strip_userinfo};

@@ -17,6 +17,15 @@ pub(crate) fn screen(screen: &str) -> String {
     }
 }
 
+fn host_only(host: &str) -> String {
+    let after = host.rsplit('@').next().unwrap_or("").trim();
+    if after.is_empty() {
+        "unknown".to_owned()
+    } else {
+        after.to_owned()
+    }
+}
+
 /// A message the guard may have cut at its maximum length ends in a word that
 /// may be the front of an address, a token or a number the masks would no
 /// longer recognise; that last word is dropped.
@@ -47,8 +56,11 @@ pub(crate) fn sanitize(event: &str, strings: &mut Vec<(String, String)>) {
         }
         "http_request" | "web_vital" => {
             for (name, value) in strings.iter_mut() {
-                if name == "route" {
-                    *value = template_route(value);
+                match name.as_str() {
+                    "route" => *value = template_route(value),
+                    // A host that carries `user:password@` keeps only the host.
+                    "host" => *value = host_only(value),
+                    _ => {}
                 }
             }
         }
@@ -123,6 +135,20 @@ mod tests {
         assert_eq!(screen("Home"), "Home");
         assert_eq!(screen("Home?x=1"), "Home");
         assert_eq!(screen("/"), "/");
+    }
+
+    #[test]
+    fn a_host_loses_user_info() {
+        for (sent, kept) in [
+            ("user:secret@api.example.com:8443", "api.example.com:8443"),
+            ("api.example.com", "api.example.com"),
+            ("a@b@host", "host"),
+            ("user@", "unknown"),
+        ] {
+            let mut call = fields(&[("host", sent)]);
+            sanitize("http_request", &mut call);
+            assert_eq!(call, fields(&[("host", kept)]), "{sent}");
+        }
     }
 
     #[test]

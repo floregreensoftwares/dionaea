@@ -42,6 +42,22 @@ pub fn strip_query(location: &str) -> String {
     }
 }
 
+/// Removes the user name and password from the authority of a URL
+/// (`https://user:pw@host/x` becomes `https://host/x`). Text that is not a URL
+/// with an authority is returned unchanged.
+pub fn strip_userinfo(location: &str) -> String {
+    let Some(at) = location.find("://") else {
+        return location.to_owned();
+    };
+    let start = at + 3;
+    let rest = &location[start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(user_end) => format!("{}{}", &location[..start], &rest[user_end + 1..]),
+        None => location.to_owned(),
+    }
+}
+
 fn is_hex(c: char) -> bool {
     c.is_ascii_hexdigit()
 }
@@ -427,6 +443,21 @@ mod tests {
             "https://cdn/app.js"
         );
         assert_eq!(strip_query("app.js"), "app.js");
+    }
+
+    #[test]
+    fn user_info_leaves_a_url_authority_only() {
+        assert_eq!(
+            strip_userinfo("https://user:pw@cdn.example.com/a.js"),
+            "https://cdn.example.com/a.js"
+        );
+        assert_eq!(
+            strip_userinfo("https://cdn.example.com/a@b.js"),
+            "https://cdn.example.com/a@b.js"
+        );
+        assert_eq!(strip_userinfo("https://a@b@host/x"), "https://host/x");
+        assert_eq!(strip_userinfo("app/cart.js"), "app/cart.js");
+        assert_eq!(strip_userinfo("https://host?u=a@b"), "https://host?u=a@b");
     }
 
     #[test]

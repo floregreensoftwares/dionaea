@@ -13,7 +13,7 @@
 //! maximum, and at most [`MAX_FRAMES`] frames are kept. [`encode`] writes what
 //! [`parse`] reads.
 
-use crate::scrub::strip_query;
+use crate::scrub::{strip_query, strip_userinfo};
 
 /// Most frames kept; deeper frames add nothing to grouping.
 pub const MAX_FRAMES: usize = 64;
@@ -65,7 +65,10 @@ fn parse_frame(text: &str) -> Option<Frame> {
         _ => return None,
     };
     Some(Frame {
-        module: cut(&strip_query(&decode(module)?), MAX_MODULE_CHARS),
+        module: cut(
+            &strip_query(&strip_userinfo(&decode(module)?)),
+            MAX_MODULE_CHARS,
+        ),
         function: cut(&decode(function)?, MAX_FUNCTION_CHARS),
         line: number(line)?,
         column: number(column)?,

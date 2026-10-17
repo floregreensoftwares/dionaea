@@ -234,7 +234,7 @@ A stack is code locations only, written in one text: frames joined by `;`, each
 library or the platform. The first frame is the top of the stack. A `%`, `|` or
 `;` inside a name is written `%25`, `%7C` or `%3B`. The server keeps at most 64
 well-formed frames, cuts a module to 256 characters and a function to 128, and
-removes the query string and fragment of a module; a frame that does not parse
+removes the user name and password, the query string and the fragment of a module; a frame that does not parse
 (one cut in half by the length limit, for example) is dropped.
 
 ### What the server does to the text
@@ -248,6 +248,7 @@ removes the query string and fragment of a module; a frame that does not parse
 - **The `screen` of every event** loses a query string or fragment, and a
   screen that is a path (starts with `/`) has identifier-like segments turned
   into `:id`; a screen name such as `Home` is kept.
+- **A host** keeps only what follows the last `@`, so `user:password@host` is stored as `host`.
 - **Routes** lose the scheme, host, query string, fragment and matrix
   parameters, and a segment that looks like an identifier becomes `:id`. A
   segment already written `:name`, `{name}` or `[name]` is kept.
