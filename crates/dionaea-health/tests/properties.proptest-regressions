@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc fce43ba42fe0f2ee5a2c1e33c4ea996d574c631964b795a40b30d180443c2cff # shrinks to text = "& ;"
 cc 3e759a826de1f156dc6635290f59f6ccc662c3594ac743a3cedbb0f7747b8959 # shrinks to text = ['f', 'a', ':', '/', '/', '?']
+cc 210a613bc318d976155fc7a8eba19fb1709797619971d9a5eee11085c6948a27 # shrinks to text = "0\u{a0};"

@@ -17,7 +17,12 @@ pub use dionaea_core::MAX_ROUTE_CHARS;
 pub fn template_route(route: &str) -> String {
     let path = path_of(route);
     let mut out = String::from("/");
-    for (count, segment) in path.split('/').filter(|s| !s.is_empty()).enumerate() {
+    for (count, segment) in path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
         if count == MAX_SEGMENTS {
             break;
         }
@@ -144,6 +149,14 @@ mod tests {
         assert_eq!(template_route("https://api.example.com"), "/");
         assert_eq!(template_route("/a/b;jsessionid=1/c?x=1"), "/a/b");
         assert_eq!(template_route("/a?b=1"), "/a");
+    }
+
+    #[test]
+    fn whitespace_around_a_segment_does_not_hide_an_identifier() {
+        // Found by the property test: a non-breaking space after the number
+        // kept it from being recognised, and the template changed on a second pass.
+        assert_eq!(template_route("0\u{a0};"), "/:id");
+        assert_eq!(template_route("/orders/ 123 /items"), "/orders/:id/items");
     }
 
     #[test]
