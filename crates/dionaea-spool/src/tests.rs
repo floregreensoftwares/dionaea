@@ -387,12 +387,17 @@ fn the_marker_round_trips_and_rejects_damage() {
 fn outcome_within(spool: &Spool, payload: &'static [u8]) -> Result<Position, SpoolError> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let spool = spool.clone();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let _ = sender.send(spool.append(payload));
     });
-    receiver
+    let outcome = receiver
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the append returned instead of hanging")
+        .expect("the append returned instead of hanging");
+    // The thread still holds its clone of the spool, and with it the lock on
+    // the directory, until it ends; a test that reopens the directory next
+    // must not race with that.
+    worker.join().expect("the appending thread ends");
+    outcome
 }
 
 #[test]
