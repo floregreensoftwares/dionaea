@@ -16,11 +16,17 @@ workspace = true
 
 [dependencies]
 dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
+# Reading source maps (JSON). The same crates the rest of the workspace uses.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# The fingerprint of an error is a SHA-256 of its type and frames (the crate
+# the metadata store and the artifact store already use). Invariant: the hash
+# input is fixed by `fingerprint::VERSION`, so every node agrees.
+sha2 = "0.11.1"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1.12.0"
-serde_json = "1.0.154"
 
 [[bench]]
 name = "scrub"
