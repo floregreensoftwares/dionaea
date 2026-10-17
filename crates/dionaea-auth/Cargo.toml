@@ -1,0 +1,29 @@
+[package]
+name = "dionaea-auth"
+description = "Members, passwords, sessions, roles and read tokens for Dionaea"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Password hashing: argon2id from RustCrypto, pure Rust, no unsafe of its own
+# that this crate relies on. Cost: 19 MiB and tens of milliseconds per
+# verification at the default parameters. Invariant: passwords are only ever
+# stored as the PHC string it produces, with a fresh 16-byte salt.
+argon2 = "0.6.0"
+dionaea-meta = { version = "0.0.0", path = "../dionaea-meta" }
+# Salts and the 256 random bits of session and read-token secrets.
+getrandom = "0.4.3"
+# Session and read-token secrets are stored as their SHA-256 (the same crate
+# the metadata store uses for tombstones). Invariant: the secrets are random
+# and long, so no salt or work factor is needed.
+sha2 = "0.11.1"

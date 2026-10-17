@@ -179,4 +179,47 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 9,
+        name: "accounts",
+        sql: "
+        -- The zone a site's days are cut in for reports.
+        ALTER TABLE sites ADD COLUMN time_zone TEXT NOT NULL DEFAULT 'UTC';
+        -- Passwords are stored as argon2id hashes, sessions and read tokens as
+        -- the SHA-256 of a secret that is shown once and never kept.
+        CREATE TABLE members (
+            id            INTEGER PRIMARY KEY,
+            email         TEXT NOT NULL UNIQUE,
+            name          TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            disabled_at   INTEGER
+        );
+        CREATE TABLE memberships (
+            member_id INTEGER NOT NULL REFERENCES members(id),
+            org_id    INTEGER NOT NULL REFERENCES organizations(id),
+            role      TEXT NOT NULL CHECK (role IN ('viewer', 'admin', 'owner')),
+            PRIMARY KEY (member_id, org_id)
+        );
+        CREATE INDEX memberships_by_org ON memberships (org_id);
+        CREATE TABLE auth_sessions (
+            token_hash TEXT PRIMARY KEY,
+            member_id  INTEGER NOT NULL REFERENCES members(id),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX auth_sessions_by_member ON auth_sessions (member_id);
+        CREATE INDEX auth_sessions_by_expiry ON auth_sessions (expires_at);
+        CREATE TABLE read_tokens (
+            id         INTEGER PRIMARY KEY,
+            site_id    INTEGER NOT NULL REFERENCES sites(id),
+            label      TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_by INTEGER REFERENCES members(id),
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE INDEX read_tokens_by_site ON read_tokens (site_id);
+    ",
+    },
 ];

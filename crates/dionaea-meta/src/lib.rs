@@ -18,6 +18,9 @@ use std::fmt;
 
 use dionaea_core::{Change, Diagnostic, Schema};
 
+mod accounts;
+#[cfg(test)]
+mod accounts_tests;
 mod erasure;
 mod erasure_sql;
 mod migrations;
@@ -26,6 +29,10 @@ mod sqlite;
 #[cfg(test)]
 mod tests;
 
+pub use accounts::{
+    AccountStore, Login, MAX_EMAIL_LEN, MAX_NAME_LEN, MAX_TIME_ZONE_LEN, Member, Membership,
+    OrganizationMember, ReadTokenInfo, Role,
+};
 pub use erasure::{
     ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, IdKind,
     MAX_KEY_LEN, MIN_KEY_LEN, TombstoneBatch, Tombstones,
@@ -51,6 +58,8 @@ pub struct Site {
     pub id: u32,
     pub organization_id: u32,
     pub name: String,
+    /// The zone the site's days are cut in for reports; `UTC` until set.
+    pub time_zone: String,
 }
 
 /// A write key as listed for administration.
@@ -226,6 +235,13 @@ pub trait MetaStore: Send + Sync {
     fn create_site(&self, organization_id: u32, name: &str) -> Result<Site, MetaError>;
 
     fn sites(&self) -> Result<Vec<Site>, MetaError>;
+
+    fn site(&self, site_id: u32) -> Result<Site, MetaError>;
+
+    /// Sets the zone a site's days are cut in. Only the shape of the name is
+    /// checked here (letters, digits and `_/+-`); whether the zone exists is
+    /// for the store that cuts the days.
+    fn set_site_time_zone(&self, site_id: u32, time_zone: &str) -> Result<(), MetaError>;
 
     /// Issues a write key for a site. `origins` are the web origins allowed
     /// to use it (`https://example.com`, no path); empty for a native app.
