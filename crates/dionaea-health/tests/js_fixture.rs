@@ -80,3 +80,37 @@ fn the_bundle_is_one_line_and_the_map_is_small() {
     assert!(map.approx_bytes() < 16 * 1024, "{}", map.approx_bytes());
     assert!(map.lookup(2, 1).is_none());
 }
+
+#[test]
+fn a_frame_with_no_named_function_is_anonymous_and_not_the_minified_name() {
+    use dionaea_health::frames::Frame;
+    use dionaea_health::sourcemap::symbolicate;
+
+    let map = map();
+    let frame = |column, function: &str| Frame {
+        module: "app.min.js".to_owned(),
+        function: function.to_owned(),
+        line: 1,
+        column,
+        in_app: true,
+    };
+    // The top level of index.js: the stack called it something Node-specific.
+    let top = symbolicate(&map, &frame(368, "Object.<anonymous>")).expect("mapped");
+    assert_eq!(
+        (top.module.as_str(), top.function.as_str()),
+        ("src/index.js", "<anonymous>")
+    );
+    // And the same position under another minified name gives the same frame.
+    let other = symbolicate(&map, &frame(368, "q")).expect("mapped");
+    assert_eq!(top, other);
+    let named = symbolicate(&map, &frame(56, "u")).expect("mapped");
+    assert_eq!(
+        (
+            named.module.as_str(),
+            named.function.as_str(),
+            named.line,
+            named.column
+        ),
+        ("src/util.js", "parseQuantity", 4, 11)
+    );
+}

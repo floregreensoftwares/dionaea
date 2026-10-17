@@ -84,7 +84,7 @@ struct LineStart {
 pub struct Original<'a> {
     /// Which entry of the map's sources, for [`SourceMap::function_name`].
     pub source_index: usize,
-    pub source: String,
+    pub source: &'a str,
     pub line: u32,
     pub column: u32,
     pub name: Option<&'a str>,
@@ -144,7 +144,8 @@ struct Segment {
 }
 
 /// Decodes one line of `mappings` starting at `state`; calls `each` for every
-/// segment and returns `None` if the text is malformed. `state` is updated to
+/// segment until it returns false, and returns where it stopped (the end of the
+/// line when it never did), or `None` if the text is malformed. `state` is updated to
 /// where the line ends (its source, line, column and name).
 fn decode_line(
     bytes: &[u8],
@@ -188,10 +189,8 @@ fn decode_line(
             break;
         }
     }
-    // Skip to the end of the line even if `each` stopped early.
-    while at < bytes.len() && bytes[at] != b';' {
-        at += 1;
-    }
+    // When `each` stopped early the rest of the line is not read: a lookup
+    // costs up to its position, not the length of the line.
     Some(at)
 }
 
@@ -290,7 +289,7 @@ impl SourceMap {
         let source_index = usize::try_from(source).ok()?;
         Some(Original {
             source_index,
-            source: self.sources.get(source_index)?.clone(),
+            source: self.sources.get(source_index)?.as_str(),
             line: u32::try_from(orig_line).ok()?.checked_add(1)?,
             column: u32::try_from(orig_column).ok()?.checked_add(1)?,
             name: name
@@ -298,6 +297,13 @@ impl SourceMap {
                 .and_then(|n| self.names.get(n))
                 .map(String::as_str),
         })
+    }
+
+    /// Whether the map carries the text of the source `original` is in.
+    pub fn has_source_text(&self, original: &Original<'_>) -> bool {
+        self.contents
+            .get(original.source_index)
+            .is_some_and(Option::is_some)
     }
 
     /// The name of the function around an original position, read from the
@@ -351,14 +357,23 @@ pub fn normalize_source(source: &str) -> String {
 
 /// The frame a minified JavaScript frame stands for, or `None` when the map
 /// has nothing at that position. The function is the one read from the
-/// original source, else the name in the map, else the one the stack had.
+/// original source; `<anonymous>` when the map has the source and no named
+/// function is around; else the one the stack had.
 pub fn symbolicate(map: &SourceMap, frame: &Frame) -> Option<Frame> {
     let original = map.lookup(frame.line, frame.column)?;
-    let module = normalize_source(&original.source);
-    let function = map
-        .function_name(&original)
-        .or_else(|| original.name.map(str::to_owned))
-        .unwrap_or_else(|| frame.function.clone());
+    let module = normalize_source(original.source);
+    // The name stored in the map at a position is the identifier written
+    // there (a callee at a call site), not the function the frame is in, so it
+    // is not used. Where the map carries the source text and no named function is around
+    // (the top level, an anonymous callback), the function is `<anonymous>`
+    // and not the minified name of the stack, which changes with every build.
+    let function = map.function_name(&original).unwrap_or_else(|| {
+        if map.has_source_text(&original) {
+            "<anonymous>".to_owned()
+        } else {
+            frame.function.clone()
+        }
+    });
     Some(Frame {
         in_app: frame.in_app && !module.contains("node_modules/"),
         module,
@@ -454,12 +469,12 @@ mod tests {
         let map = SourceMap::parse(&map(&m), 1 << 20).expect("parse");
         let first = map.lookup(1, 1).expect("a mapping");
         assert_eq!(
-            (first.source.as_str(), first.line, first.column, first.name),
+            (first.source, first.line, first.column, first.name),
             ("src/a.js", 1, 1, None)
         );
         let named = map.lookup(1, 11).expect("a mapping");
         assert_eq!(
-            (named.source.as_str(), named.line, named.column, named.name),
+            (named.source, named.line, named.column, named.name),
             ("src/a.js", 5, 3, Some("alpha"))
         );
         // Between segments the earlier one applies.
@@ -467,12 +482,7 @@ mod tests {
         assert_eq!(map.lookup(1, 500).expect("a mapping").line, 5);
         let second = map.lookup(2, 6).expect("a mapping");
         assert_eq!(
-            (
-                second.source.as_str(),
-                second.line,
-                second.column,
-                second.name
-            ),
+            (second.source, second.line, second.column, second.name),
             ("src/b.js", 11, 4, Some("beta"))
         );
     }

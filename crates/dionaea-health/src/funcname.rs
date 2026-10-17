@@ -18,6 +18,10 @@
 const MAX_SCAN: usize = 64 * 1024;
 /// Most characters of a function head read.
 const MAX_HEAD: usize = 400;
+/// Most function heads read for one position: each costs up to `MAX_HEAD`
+/// characters, so this bounds the work of a lookup however many unclosed
+/// braces the text has.
+const MAX_HEADS: usize = 64;
 
 const NOT_FUNCTIONS: &[&str] = &[
     "if", "for", "while", "switch", "catch", "with", "else", "do", "try", "finally",
@@ -142,6 +146,7 @@ pub fn enclosing_function(source: &str, line: u32, column: u32) -> Option<String
     let low = (low..=at).find(|i| source.is_char_boundary(*i))?;
     let window = &source[low..at];
     let mut depth = 0usize;
+    let mut heads = 0usize;
     for (i, c) in window.char_indices().rev() {
         match c {
             '}' => depth += 1,
@@ -149,6 +154,10 @@ pub fn enclosing_function(source: &str, line: u32, column: u32) -> Option<String
                 if depth > 0 {
                     depth -= 1;
                     continue;
+                }
+                heads += 1;
+                if heads > MAX_HEADS {
+                    return None;
                 }
                 let head_start = window[..i]
                     .char_indices()
@@ -225,6 +234,18 @@ mod tests {
         // Further back than the scan reaches: nothing, and no panic.
         assert_eq!(enclosing_function(&long, 1, 300_000), None);
         assert_eq!(enclosing_function(&long, 1, 100).as_deref(), Some("big"));
+    }
+
+    #[test]
+    fn a_text_of_unclosed_braces_costs_a_bounded_amount() {
+        let text = format!("function f() {{ {} x", "{ ".repeat(30_000));
+        let started = std::time::Instant::now();
+        assert_eq!(enclosing_function(&text, 1, 60_000), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
