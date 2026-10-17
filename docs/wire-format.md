@@ -230,7 +230,7 @@ properties are stripped as undeclared.
 
 A stack is code locations only, written in one text: frames joined by `;`, each
 `module|function|line|column|flag`. `module` is a file or class, `line` and
-`column` may be empty, and `flag` is `1` for the app's own code and `0` for a
+`column` start at 1, as in a stack trace (0 or empty when unknown), and `flag` is `1` for the app's own code and `0` for a
 library or the platform. The first frame is the top of the stack. A `%`, `|` or
 `;` inside a name is written `%25`, `%7C` or `%3B`. The server keeps at most 64
 well-formed frames, cuts a module to 256 characters and a function to 128, and
