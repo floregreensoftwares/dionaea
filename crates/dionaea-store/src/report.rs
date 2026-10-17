@@ -20,6 +20,9 @@ use crate::{Error, Store, http};
 
 /// Most values one filter may list.
 pub const MAX_FILTER_VALUES: usize = 100;
+/// The most one read may return, in bytes of JSON. With the row limit it
+/// bounds memory; an answer past it fails with [`Error::AnswerTooLarge`].
+pub const MAX_ANSWER_BYTES: usize = 16 << 20;
 /// Longest time zone name, in bytes.
 pub const MAX_TIME_ZONE_LEN: usize = 64;
 
@@ -515,7 +518,23 @@ impl Store {
                 http::url_encode(&escape_param(value))
             );
         }
-        let text = self.post(&path, statement.sql.as_bytes(), false)?;
+        let response = self
+            .client
+            .post_limited(&path, statement.sql.as_bytes(), MAX_ANSWER_BYTES)
+            .map_err(|e| {
+                if e.to_string() == http::TOO_LARGE {
+                    Error::AnswerTooLarge
+                } else {
+                    Error::from(e)
+                }
+            })?;
+        if response.status != 200 {
+            return Err(Error::Server {
+                status: response.status,
+                message: crate::summarize(&response.body, false),
+            });
+        }
+        let text = String::from_utf8_lossy(&response.body).into_owned();
         text.lines()
             .filter(|line| !line.is_empty())
             .map(|line| {

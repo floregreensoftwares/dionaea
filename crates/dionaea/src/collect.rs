@@ -327,7 +327,7 @@ pub(crate) fn system_clock() -> u64 {
 /// What an address is limited as: an IPv6 client by its /64, since one host
 /// controls a whole prefix and could otherwise rotate through it; an IPv4
 /// address mapped into IPv6 as the IPv4 address.
-fn address_bucket(ip: IpAddr) -> IpAddr {
+pub(crate) fn address_bucket(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
             || {

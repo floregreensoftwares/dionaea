@@ -103,13 +103,24 @@ pub enum Answer {
 }
 
 fn read_error(error: &Error) -> QueryError {
+    if matches!(error, Error::AnswerTooLarge) {
+        return QueryError::TooManyRows;
+    }
     match error.server_code() {
         Some(TIMEOUT_EXCEEDED) => QueryError::TooSlow,
         Some(TOO_MANY_ROWS | TOO_MANY_ROWS_OR_BYTES) => QueryError::TooManyRows,
         Some(BAD_ARGUMENTS) if error.to_string().contains("time zone") => {
             QueryError::InvalidTimeZone
         }
-        _ => QueryError::Unavailable(error.to_string()),
+        // The store's own text can hold the statement, with the values a
+        // caller filtered by; only its status and code are kept.
+        _ => QueryError::Unavailable(match error {
+            Error::Server { status, .. } => match error.server_code() {
+                Some(code) => format!("ClickHouse answered {status} (code {code})"),
+                None => format!("ClickHouse answered {status}"),
+            },
+            other => other.to_string(),
+        }),
     }
 }
 
@@ -331,10 +342,14 @@ mod tests {
             read_error(&server("Code: 36. DB::Exception: Cannot load time zone X")),
             QueryError::InvalidTimeZone
         );
-        assert!(matches!(
-            read_error(&server("Code: 36. DB::Exception: something else")),
-            QueryError::Unavailable(_)
+        let hidden = read_error(&server(
+            "Code: 47. DB::Exception: In scope SELECT 'secret-value'",
         ));
+        assert_eq!(
+            hidden,
+            QueryError::Unavailable("ClickHouse answered 500 (code 47)".to_owned())
+        );
+        assert_eq!(read_error(&Error::AnswerTooLarge), QueryError::TooManyRows);
         assert!(matches!(
             read_error(&Error::Io("down".to_owned())),
             QueryError::Unavailable(_)

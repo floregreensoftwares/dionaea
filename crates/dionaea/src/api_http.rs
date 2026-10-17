@@ -48,13 +48,12 @@ async fn handle(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let client = crate::collect::client_address(
+    let client = client_key(
         request.headers(),
         peer.ip(),
         state.trusted_proxy_hops,
         &state.client_address_header,
-    )
-    .to_string();
+    );
     let (parts, body) = request.into_parts();
     let request = Request::from_parts(parts, Body::empty());
     let mut api_request = ApiRequest {
@@ -82,6 +81,18 @@ async fn handle(
             plain(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         }
     }
+}
+
+/// What the login limiter counts a client as: the address, except that an
+/// IPv6 client is its /64, which one host controls whole.
+fn client_key(
+    headers: &axum::http::HeaderMap,
+    peer: std::net::IpAddr,
+    hops: u8,
+    header: &str,
+) -> String {
+    crate::collect::address_bucket(crate::collect::client_address(headers, peer, hops, header))
+        .to_string()
 }
 
 fn plain(status: StatusCode, code: &str) -> Response<Body> {
@@ -126,4 +137,28 @@ fn write(response: ApiResponse) -> Response<Body> {
         out.headers_mut().insert(RETRY_AFTER, seconds);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn an_ipv6_client_is_counted_by_its_prefix() {
+        let headers = HeaderMap::new();
+        let a: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: std::net::IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other: std::net::IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(
+            client_key(&headers, a, 0, "x-forwarded-for"),
+            client_key(&headers, b, 0, "x-forwarded-for")
+        );
+        assert_ne!(
+            client_key(&headers, a, 0, "x-forwarded-for"),
+            client_key(&headers, other, 0, "x-forwarded-for")
+        );
+        let v4: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(client_key(&headers, v4, 0, "x-forwarded-for"), "192.0.2.7");
+    }
 }

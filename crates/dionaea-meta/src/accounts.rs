@@ -100,6 +100,17 @@ pub trait AccountStore: Send + Sync {
         password_hash: &str,
     ) -> Result<Member, MetaError>;
 
+    /// Adds a member and gives them a role in an organization in one step,
+    /// so a failure leaves no member without an organization.
+    fn create_member_with_role(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+        organization_id: u32,
+        role: Role,
+    ) -> Result<Member, MetaError>;
+
     fn member(&self, id: u32) -> Result<Member, MetaError>;
 
     /// The member with this address and their password hash, for logging in.
@@ -240,6 +251,39 @@ fn to_member(raw: (i64, String, String, i64, Option<i64>)) -> Result<Member, Met
     })
 }
 
+fn insert_member(
+    tx: &Transaction<'_>,
+    at: i64,
+    email: String,
+    name: String,
+    password_hash: &str,
+) -> Result<Member, MetaError> {
+    let taken: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM members WHERE email = ?1)",
+            [&email],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if taken {
+        return Err(MetaError::Conflict(
+            "a member with that address exists".to_owned(),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO members (email, name, password_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![email, name, password_hash, at],
+    )
+    .map_err(storage)?;
+    Ok(Member {
+        id: id_of(tx.last_insert_rowid())?,
+        email,
+        name,
+        created_at: at,
+        disabled: false,
+    })
+}
+
 fn memberships_of(tx: &Transaction<'_>, member_id: u32) -> Result<Vec<Membership>, MetaError> {
     let mut statement = tx
         .prepare("SELECT org_id, role FROM memberships WHERE member_id = ?1 ORDER BY org_id")
@@ -289,31 +333,38 @@ impl AccountStore for SqliteMeta {
         let email = clean_email(email)?;
         let name = clean_name(name)?;
         check_password_hash(password_hash)?;
+        self.write(|tx, at| insert_member(tx, at, email, name, password_hash))
+    }
+
+    fn create_member_with_role(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+        organization_id: u32,
+        role: Role,
+    ) -> Result<Member, MetaError> {
+        let email = clean_email(email)?;
+        let name = clean_name(name)?;
+        check_password_hash(password_hash)?;
         self.write(|tx, at| {
-            let taken: bool = tx
+            let organization: bool = tx
                 .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM members WHERE email = ?1)",
-                    [&email],
+                    "SELECT EXISTS (SELECT 1 FROM organizations WHERE id = ?1)",
+                    [organization_id],
                     |row| row.get(0),
                 )
                 .map_err(storage)?;
-            if taken {
-                return Err(MetaError::Conflict(
-                    "a member with that address exists".to_owned(),
-                ));
+            if !organization {
+                return Err(MetaError::NotFound("organization"));
             }
+            let member = insert_member(tx, at, email, name, password_hash)?;
             tx.execute(
-                "INSERT INTO members (email, name, password_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![email, name, password_hash, at],
+                "INSERT INTO memberships (member_id, org_id, role) VALUES (?1, ?2, ?3)",
+                params![member.id, organization_id, role.as_str()],
             )
             .map_err(storage)?;
-            Ok(Member {
-                id: id_of(tx.last_insert_rowid())?,
-                email,
-                name,
-                created_at: at,
-                disabled: false,
-            })
+            Ok(member)
         })
     }
 

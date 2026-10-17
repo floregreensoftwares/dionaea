@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use dionaea_auth::{Auth, AuthError, Denied, Permission, Principal, Scope, cookie_from_header};
 use dionaea_core::Schema;
 use dionaea_meta::{
-    AccountStore, ErasureRequest, ErasureState, ErasureSubject, MetaError, MetaStore,
-    RetentionFamily, Role, Site, SqliteMeta, WriteKeyInfo,
+    AccountStore, ErasureRequest, ErasureState, ErasureSubject, MAX_RETENTION_DAYS,
+    MIN_RETENTION_DAYS, MetaError, MetaStore, RetentionFamily, Role, Site, SqliteMeta,
+    WriteKeyInfo,
 };
 use dionaea_query::{Limits, Query, QueryError, is_time_zone_shape};
 use dionaea_store::Store;
@@ -40,7 +41,7 @@ use tracing::{error, info};
 /// a burst of reports cannot queue up work for ClickHouse without bound.
 const MAX_QUERIES_IN_FLIGHT: usize = 8;
 /// Most erasure requests one listing returns (the newest).
-const MAX_LISTED_ERASURES: usize = 500;
+const MAX_LISTED_ERASURES: u32 = 500;
 
 pub(crate) struct ApiRequest {
     pub(crate) method: String,
@@ -192,6 +193,15 @@ impl From<AuthError> for ApiError {
             AuthError::TooManyAttempts { retry_after_secs } => {
                 let mut api = Self::new(429, "too_many_attempts", "too many failed attempts");
                 api.retry_after = Some(retry_after_secs);
+                api
+            }
+            AuthError::Busy => {
+                let mut api = Self::new(
+                    429,
+                    "busy",
+                    "too many passwords are being checked; retry shortly",
+                );
+                api.retry_after = Some(1);
                 api
             }
             AuthError::WeakPassword(why) => {
@@ -533,6 +543,9 @@ impl Api {
                 self.revoke_token(p, id_of(site)?, id_of(token)?)
             }
             ("GET", ["sites", site, "retention"]) => self.retention(p, id_of(site)?),
+            ("GET", ["sites", site, "retention", "preview"]) => {
+                self.retention_preview(req, p, id_of(site)?)
+            }
             ("PUT", ["sites", site, "retention"]) => self.set_retention(req, p, id_of(site)?),
             ("DELETE", ["sites", site, "retention"]) => self.unset_retention(p, id_of(site)?),
             ("GET", ["sites", site, "erasures"]) => self.erasures(req, p, id_of(site)?),
@@ -764,10 +777,9 @@ impl Api {
         let body: NewMemberBody = Self::json(req)?;
         let role = Role::parse(&body.role)
             .ok_or_else(|| ApiError::bad("the role is viewer, admin or owner"))?;
-        let member = self
-            .auth
-            .create_member(&body.email, &body.name, &body.password)?;
-        self.meta.set_role(member.id, org, Some(role))?;
+        let member =
+            self.auth
+                .create_member_in(&body.email, &body.name, &body.password, org, role)?;
         Self::audit(principal, "add_member", None);
         let mut value = member_json(&member);
         if let Some(map) = value.as_object_mut() {
@@ -960,6 +972,44 @@ impl Api {
         })))
     }
 
+    /// What the next retention run would remove from this site at `days` (or at
+    /// the days it keeps now), counted and not deleted: use it before lowering
+    /// the number, because a run cannot be undone.
+    fn retention_preview(&self, req: &ApiRequest, principal: &Principal, site: u32) -> ApiResult {
+        let site = self.site_access(principal, site, Permission::Manage)?;
+        let days = match value_of(req.query.as_deref(), "days") {
+            Some(text) => text
+                .parse::<u32>()
+                .ok()
+                .filter(|d| (MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(d))
+                .ok_or_else(|| {
+                    ApiError::bad(format!(
+                        "days is a number from {MIN_RETENTION_DAYS} to {MAX_RETENTION_DAYS}"
+                    ))
+                })?,
+            None => self
+                .meta
+                .retentions()?
+                .into_iter()
+                .find(|r| r.site_id == site.id && r.family == RetentionFamily::Analytics)
+                .map_or_else(|| (self.default_retention_days)(), |r| r.days),
+        };
+        let cutoff = crate::collect::system_clock().saturating_sub(u64::from(days) * 86_400_000);
+        let counted = self.store.count_expired(site.id, cutoff).map_err(|error| {
+            error!(%error, "cannot count what retention would remove");
+            ApiError::new(503, "unavailable", "the analytics store is unavailable")
+        })?;
+        let tables: Vec<Value> = counted
+            .iter()
+            .map(|e| json!({ "table": e.table, "rows": e.rows }))
+            .collect();
+        Ok(ApiResponse::ok(json!({
+            "days": days,
+            "cutoff_ms": cutoff,
+            "tables": tables,
+        })))
+    }
+
     fn set_retention(&self, req: &ApiRequest, principal: &Principal, site: u32) -> ApiResult {
         let site = self.site_access(principal, site, Permission::Manage)?;
         let body: RetentionBody = Self::json(req)?;
@@ -985,16 +1035,12 @@ impl Api {
             })?),
             None => None,
         };
-        let mut requests: Vec<Value> = self
+        let requests: Vec<Value> = self
             .meta
-            .erasure_requests(state)?
+            .site_erasure_requests(site.id, state, MAX_LISTED_ERASURES)?
             .iter()
-            .filter(|r| r.site_id == site.id)
             .map(erasure_json)
             .collect();
-        if requests.len() > MAX_LISTED_ERASURES {
-            requests.drain(..requests.len() - MAX_LISTED_ERASURES);
-        }
         Ok(ApiResponse::ok(json!({ "requests": requests })))
     }
 

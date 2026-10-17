@@ -869,6 +869,15 @@ impl MetaStore for SqliteMeta {
         self.read(|tx| erasure_sql::list(tx, state))
     }
 
+    fn site_erasure_requests(
+        &self,
+        site_id: u32,
+        state: Option<ErasureState>,
+        limit: u32,
+    ) -> Result<Vec<ErasureRequest>, MetaError> {
+        self.read(|tx| erasure_sql::list_for_site(tx, site_id, state, limit))
+    }
+
     fn claim_erasure(
         &self,
         state: ErasureState,

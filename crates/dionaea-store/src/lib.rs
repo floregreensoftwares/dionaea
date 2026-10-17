@@ -104,6 +104,8 @@ pub enum Error {
     Tls(String),
     /// Too many rows for one insert.
     TooManyRows,
+    /// A read would return more data than a read may.
+    AnswerTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -117,6 +119,7 @@ impl fmt::Display for Error {
             Self::InvalidRow(message) => write!(f, "a row cannot be stored: {message}"),
             Self::InvalidName(message) => write!(f, "invalid name: {message}"),
             Self::TooManyRows => write!(f, "more than {MAX_ROWS_PER_INSERT} rows in one insert"),
+            Self::AnswerTooLarge => f.write_str("the answer is larger than a read may return"),
         }
     }
 }
@@ -145,7 +148,11 @@ impl Error {
     /// batch would block the spool forever.
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::InvalidRow(_) | Self::InvalidName(_) | Self::TooManyRows | Self::Tls(_) => true,
+            Self::InvalidRow(_)
+            | Self::InvalidName(_)
+            | Self::TooManyRows
+            | Self::AnswerTooLarge
+            | Self::Tls(_) => true,
             Self::Server { status, .. } => {
                 matches!(status, 400 | 413 | 422)
             }

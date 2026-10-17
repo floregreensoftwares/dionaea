@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::*;
+use crate::ErasureState;
 
 const PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGhhc2hoYXNoaGFzaA";
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -337,4 +338,37 @@ fn a_site_has_a_time_zone() {
         Err(MetaError::NotFound("site"))
     ));
     assert!(matches!(store.site(99), Err(MetaError::NotFound("site"))));
+}
+
+#[test]
+fn erasure_requests_of_one_site_are_listed_newest_first_within_a_limit() {
+    let store = SqliteMeta::open_in_memory()
+        .expect("an in-memory database")
+        .with_hash_key(HashKey::from_secret("0123456789abcdef0123456789abcdef").expect("key"));
+    let org = store.create_organization("Acme").expect("org");
+    let shop = store.create_site(org.id, "shop").expect("site");
+    let blog = store.create_site(org.id, "blog").expect("site");
+    for n in 0..5 {
+        store
+            .request_erasure(shop.id, &format!("user-{n}"), "test")
+            .expect("request");
+    }
+    store
+        .request_erasure(blog.id, "user-x", "test")
+        .expect("request");
+
+    let all = store
+        .site_erasure_requests(shop.id, None, 10)
+        .expect("list");
+    assert_eq!(all.len(), 5);
+    assert!(all.iter().all(|r| r.site_id == shop.id));
+    let newest = store.site_erasure_requests(shop.id, None, 2).expect("list");
+    assert_eq!(newest.len(), 2);
+    assert_eq!(newest[1].id, all[4].id, "the newest are kept, oldest first");
+    assert!(
+        store
+            .site_erasure_requests(shop.id, Some(ErasureState::Complete), 10)
+            .expect("list")
+            .is_empty()
+    );
 }

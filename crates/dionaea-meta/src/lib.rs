@@ -320,6 +320,15 @@ pub trait MetaStore: Send + Sync {
         state: Option<ErasureState>,
     ) -> Result<Vec<ErasureRequest>, MetaError>;
 
+    /// The newest `limit` requests of one site, oldest first; only those in
+    /// `state` when given.
+    fn site_erasure_requests(
+        &self,
+        site_id: u32,
+        state: Option<ErasureState>,
+        limit: u32,
+    ) -> Result<Vec<ErasureRequest>, MetaError>;
+
     /// Takes the oldest request in `state` that no worker holds and that
     /// reached that state at `due_before` (seconds since the epoch) or
     /// earlier, for `lease_secs`; a worker that dies lets go of it by the

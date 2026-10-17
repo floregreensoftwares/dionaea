@@ -39,9 +39,10 @@ hash (19 MiB, two passes), a session or token as the SHA-256 of a random
 - `404` — the thing does not exist, **or** the caller has no standing in the
   organization that owns it. Both answer the same, so ids cannot be probed.
 - `403` — the caller can see it but lacks the role.
-- `429` — too many failed logins from an address or for an account (ten in
-  fifteen minutes), or too many reports being read at once; `Retry-After` says
-  when to try again.
+- `429` — too many failed logins from an address (an IPv6 client counts as its
+  /64) or for an account (ten in fifteen minutes), too many passwords being
+  checked at once (four per node), or too many reports being read at once;
+  `Retry-After` says when to try again.
 
 A state-changing request (`POST`, `PUT`, `DELETE`) that carries an `Origin`
 header must name the server's own `Host`; anything else is `403
@@ -80,12 +81,17 @@ refused.
 | `GET`, `POST /sites/{site}/tokens` | admin | list; issue `{label}`; the answer holds `token`, once |
 | `DELETE /sites/{site}/tokens/{id}` | admin | revoke |
 | `GET`, `PUT`, `DELETE /sites/{site}/retention` | admin | days kept (`{days}`); `DELETE` goes back to the default |
+| `GET /sites/{site}/retention/preview` | admin | rows per table the next run would remove at `?days=` (or the days kept now); deletes nothing |
 | `GET`, `POST /sites/{site}/erasures` | admin | list (`?state=`); request `{user_id}` or `{device_id}` |
 | `GET /sites/{site}/erasures/{id}` | admin | one request and what the job reported |
 | `POST /sites/{site}/erasures/{id}/retry` | admin | put a failed request back |
 | `POST /sites/{site}/query` | viewer or its token | a report |
 
-Erasure listings show the hash of the user or device id and never the id.
+Adding a member answers `409` when the address already has an account, so an
+owner can learn whether an address is registered in another organization. There
+is no invitation by e-mail to hide that behind.
+
+Erasure listings (the newest 500 of the site) show the hash of the user or device id and never the id.
 Every administrative change is logged with who made it.
 
 ## Reports
@@ -141,8 +147,8 @@ is asked:
 | `too_many_filters`, `invalid_filter_values`, `invalid_limit` | more than 8 filters; a filter with no values, more than 100, or one empty or over 256 bytes; a limit outside 1 to 100 |
 | `filter_not_available` | a session report filtered by something sessions do not have |
 
-Reads run with a limit of 30 seconds and 20,000 result rows; a read that
-exceeds either fails (`504 too_slow`, `422 too_many_rows`) rather than
+Reads run with a limit of 30 seconds, 20,000 result rows and 16 MiB of answer;
+a read that exceeds one fails (`504 too_slow`, `422 too_many_rows`) rather than
 returning part of the answer. At most eight reports run at once per node.
 
 Every value, name and time reaches ClickHouse as a query parameter and never as

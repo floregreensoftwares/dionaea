@@ -299,6 +299,6 @@ The password is read from standard input and must have 12 to 256 characters. Rol
 
 `dionaea token issue --site 1` prints a read token once; it can read that site's reports and nothing else, and `dionaea token revoke` ends it. Only a SHA-256 of the token is stored, so a lost token is replaced, not recovered.
 
-Failed logins are counted per address and per client in memory, ten in fifteen minutes. With several servers the count is per server. Sessions last seven days, end when the password changes or the member is disabled, and are not extended by use.
+Failed logins are counted per account and per client (an IPv6 client is its /64) in memory, ten in fifteen minutes, and at most four passwords are hashed at once on a node (each takes 19 MiB), so a burst of logins is refused with 429 instead of exhausting memory. With several servers the count is per server. Sessions last seven days, end when the password changes or the member is disabled, and are not extended by use.
 
-Reports are read with `clickhouse_query_user` when it is set. Each read has a time limit of 30 seconds and a row limit of 20,000, and a node runs at most eight at once; the [API document](api.md) lists the rest.
+Reports are read with `clickhouse_query_user` when it is set. Each read has a time limit of 30 seconds, a row limit of 20,000 and an answer limit of 16 MiB, and a node runs at most eight at once; the [API document](api.md) lists the rest.

@@ -1125,3 +1125,55 @@ fn the_origin_check_compares_scheme_less_authority() {
     assert!(!same_origin(&with(Some("null"), Some("dionaea.test"))));
     assert!(!same_origin(&with(Some("https://dionaea.test"), None)));
 }
+
+#[test]
+fn the_retention_preview_is_for_administrators_and_checks_its_input() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let viewer = login(&w, "viewer@example.com", &[(w.acme, Role::Viewer)]);
+    let path = format!("sites/{}/retention/preview", w.shop);
+    assert_eq!(w.status("GET", &path, &viewer, None), 403);
+    assert_eq!(
+        w.status(
+            "GET",
+            &format!("sites/{}/retention/preview", w.elsewhere),
+            &admin,
+            None
+        ),
+        404
+    );
+    for days in ["0", "99999", "abc", ""] {
+        let r = ApiRequest {
+            query: Some(format!("days={days}")),
+            ..request("GET", &path, &admin, None)
+        };
+        assert_eq!(w.api.respond(&r).status, 400, "{days:?}");
+    }
+    // Past validation it needs the store, which is not there.
+    let r = ApiRequest {
+        query: Some("days=30".to_owned()),
+        ..request("GET", &path, &admin, None)
+    };
+    assert_eq!(w.api.respond(&r).status, 503);
+}
+
+#[test]
+fn a_member_who_cannot_be_given_a_role_is_not_created() {
+    let w = world();
+    let owner = login(&w, "owner@example.com", &[(w.acme, Role::Owner)]);
+    let created = w.call(
+        "POST",
+        &format!("organizations/{}/members", w.acme),
+        &owner,
+        Some(json!({ "email": "new@example.com", "name": "New", "password": PASSWORD, "role": "viewer" })),
+    );
+    assert_eq!(created.status, 201);
+    assert_eq!(
+        w.meta
+            .memberships(created.body["id"].as_u64().unwrap() as u32)
+            .unwrap()
+            .len(),
+        1,
+        "created with its role"
+    );
+}

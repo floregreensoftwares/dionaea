@@ -22,6 +22,7 @@ mod tests;
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dionaea_meta::{AccountStore, Member, MetaError, ReadTokenInfo, Role};
 
@@ -42,6 +43,8 @@ pub enum AuthError {
     },
     /// The new password does not meet the policy; says what is wrong.
     WeakPassword(String),
+    /// Too many passwords are being hashed at once; try again shortly.
+    Busy,
     Hash(String),
     Random(String),
     Meta(MetaError),
@@ -58,6 +61,7 @@ impl fmt::Display for AuthError {
                 )
             }
             Self::WeakPassword(why) => write!(f, "the password needs {why}"),
+            Self::Busy => f.write_str("too many passwords are being checked; try again shortly"),
             Self::Hash(message) => write!(f, "hashing failed: {message}"),
             Self::Random(message) => write!(f, "no randomness: {message}"),
             Self::Meta(error) => write!(f, "{error}"),
@@ -84,6 +88,10 @@ pub struct AuthConfig {
     /// Failed logins per address or client in `login_window_secs`.
     pub max_login_failures: u32,
     pub login_window_secs: i64,
+    /// Passwords hashed or verified at the same time. Each takes 19 MiB, and
+    /// the failures that would slow an attacker are only counted once the hash
+    /// is done, so a burst of logins would otherwise all run at once.
+    pub max_concurrent_hashes: usize,
 }
 
 impl Default for AuthConfig {
@@ -93,6 +101,7 @@ impl Default for AuthConfig {
             secure_cookies: true,
             max_login_failures: 10,
             login_window_secs: 15 * 60,
+            max_concurrent_hashes: 4,
         }
     }
 }
@@ -171,7 +180,17 @@ pub struct NewSession {
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
+/// Holds one of the places for hashing a password; frees it when dropped.
+struct HashSlot<'a>(&'a AtomicUsize);
+
+impl Drop for HashSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct Auth {
+    hashing: AtomicUsize,
     accounts: Arc<dyn AccountStore>,
     hasher: Hasher,
     limiter: LoginLimiter,
@@ -196,6 +215,7 @@ fn wall_clock() -> i64 {
 impl Auth {
     pub fn new(accounts: Arc<dyn AccountStore>, hasher: Hasher, config: AuthConfig) -> Self {
         Self {
+            hashing: AtomicUsize::new(0),
             accounts,
             hasher,
             limiter: LoginLimiter::new(config.max_login_failures, config.login_window_secs),
@@ -215,6 +235,16 @@ impl Auth {
         &self.config
     }
 
+    fn slot(&self) -> Result<HashSlot<'_>, AuthError> {
+        let before = self.hashing.fetch_add(1, Ordering::AcqRel);
+        let slot = HashSlot(&self.hashing);
+        if before >= self.config.max_concurrent_hashes {
+            // Dropping the slot gives the place back.
+            return Err(AuthError::Busy);
+        }
+        Ok(slot)
+    }
+
     /// Adds a member after checking the password against the policy.
     pub fn create_member(
         &self,
@@ -223,13 +253,32 @@ impl Auth {
         password: &str,
     ) -> Result<Member, AuthError> {
         check_policy(password)?;
+        let _slot = self.slot()?;
         let hash = self.hasher.hash(password)?;
         Ok(self.accounts.create_member(email, name, &hash)?)
+    }
+
+    /// Adds a member to an organization with a role, in one step.
+    pub fn create_member_in(
+        &self,
+        email: &str,
+        name: &str,
+        password: &str,
+        organization_id: u32,
+        role: Role,
+    ) -> Result<Member, AuthError> {
+        check_policy(password)?;
+        let _slot = self.slot()?;
+        let hash = self.hasher.hash(password)?;
+        Ok(self
+            .accounts
+            .create_member_with_role(email, name, &hash, organization_id, role)?)
     }
 
     /// Replaces a member's password and ends their sessions.
     pub fn set_password(&self, member_id: u32, password: &str) -> Result<(), AuthError> {
         check_policy(password)?;
+        let _slot = self.slot()?;
         let hash = self.hasher.hash(password)?;
         Ok(self.accounts.set_password_hash(member_id, &hash)?)
     }
@@ -249,6 +298,7 @@ impl Auth {
         if let Some(retry_after_secs) = self.limiter.blocked_for(&key, now) {
             return Err(AuthError::TooManyAttempts { retry_after_secs });
         }
+        let _slot = self.slot()?;
         let stored = self.accounts.member_for_login(&member.email)?;
         let right = current.chars().count() <= MAX_PASSWORD_CHARS
             && stored
@@ -263,7 +313,8 @@ impl Auth {
             return Err(AuthError::InvalidCredentials);
         }
         self.limiter.clear(&key);
-        self.set_password(member.id, new)
+        let hash = self.hasher.hash(new)?;
+        Ok(self.accounts.set_password_hash(member.id, &hash)?)
     }
 
     /// Logs a member in. `client` names where the attempt comes from (an
@@ -288,6 +339,7 @@ impl Auth {
                 return Err(AuthError::TooManyAttempts { retry_after_secs });
             }
         }
+        let _slot = self.slot()?;
         // A password longer than the policy allows is never hashed.
         let within_bounds = password.chars().count() <= MAX_PASSWORD_CHARS;
         let found = self.accounts.member_for_login(email)?;
@@ -312,6 +364,10 @@ impl Auth {
         let expires_at =
             self.accounts
                 .create_session(&secret.hash, member.id, self.config.session_ttl_secs)?;
+        // Expired sessions are removed as new ones are made, so the table stays
+        // the size of the sessions in use. A failure here changes nothing for
+        // this login.
+        let _ = self.accounts.delete_expired_sessions();
         Ok(NewSession {
             secret: secret.value,
             expires_at,

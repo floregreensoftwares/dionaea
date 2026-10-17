@@ -441,3 +441,80 @@ fn the_debug_forms_show_no_secret() {
     let rendered = format!("{:?}", w.auth);
     assert!(!rendered.contains("argon2"));
 }
+
+#[test]
+fn only_a_few_passwords_are_hashed_at_once() {
+    let w = world_with(AuthConfig {
+        max_concurrent_hashes: 2,
+        ..AuthConfig::default()
+    });
+    let first = w.auth.slot().expect("room");
+    let second = w.auth.slot().expect("room");
+    assert!(matches!(w.auth.slot(), Err(AuthError::Busy)));
+    assert!(matches!(
+        w.auth.login("ana@example.com", PASSWORD, ""),
+        Err(AuthError::Busy)
+    ));
+    assert!(matches!(
+        w.auth.create_member("ana@example.com", "Ana", PASSWORD),
+        Err(AuthError::Busy)
+    ));
+    drop(first);
+    // A refused attempt gave its place back and counted as no failure.
+    assert!(w.auth.slot().is_ok());
+    drop(second);
+    assert_eq!(w.auth.hashing.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn expired_sessions_are_removed_as_new_ones_are_made() {
+    let w = world();
+    w.auth
+        .create_member("ana@example.com", "Ana", PASSWORD)
+        .expect("member");
+    let old = w
+        .auth
+        .login("ana@example.com", PASSWORD, "")
+        .expect("login");
+    w.time.store(old.expires_at + 1, Ordering::Relaxed);
+    w.auth
+        .login("ana@example.com", PASSWORD, "")
+        .expect("login");
+    assert!(
+        w.meta
+            .session(&hash(&old.secret))
+            .expect("lookup")
+            .is_none()
+    );
+    assert_eq!(
+        w.meta.delete_expired_sessions().expect("purge"),
+        0,
+        "already removed"
+    );
+}
+
+#[test]
+fn a_member_is_added_to_an_organization_in_one_step() {
+    let w = world();
+    let org = w.meta.create_organization("Acme").expect("org");
+    let ana = w
+        .auth
+        .create_member_in("ana@example.com", "Ana", PASSWORD, org.id, Role::Admin)
+        .expect("member");
+    assert_eq!(
+        w.meta.memberships(ana.id).expect("roles")[0].role,
+        Role::Admin
+    );
+    // A missing organization leaves no member behind.
+    assert!(
+        w.auth
+            .create_member_in("bia@example.com", "Bia", PASSWORD, 99, Role::Viewer)
+            .is_err()
+    );
+    assert!(
+        w.meta
+            .member_for_login("bia@example.com")
+            .expect("lookup")
+            .is_none()
+    );
+}

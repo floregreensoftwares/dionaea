@@ -472,6 +472,19 @@ fn reports_come_out_of_the_api_for_members_and_tokens_and_stay_inside_their_site
         .sum();
     assert_eq!(total, 7.0);
 
+    // What retention would remove is counted, not deleted.
+    let preview = api(
+        &server,
+        "GET",
+        "sites/1/retention/preview?days=1",
+        &owner,
+        None,
+    );
+    assert_eq!(preview.status, 200, "{}", preview.body);
+    assert_eq!(preview.json()["days"], 1);
+    assert_eq!(preview.json()["tables"][0]["table"], "events");
+    assert_eq!(preview.json()["tables"][0]["rows"], 0);
+
     // A viewer reads, and cannot administer.
     let as_viewer = api(
         &server,
