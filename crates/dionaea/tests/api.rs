@@ -86,6 +86,16 @@ impl Scratch {
     }
 }
 
+impl Scratch {
+    /// A handle on the scratch database itself.
+    fn reader(&self) -> Store {
+        let mut config = Config::new("127.0.0.1", 8123, &self.database);
+        config.user = "dionaea".to_owned();
+        config.password = "dionaea-dev".to_owned();
+        Store::new(config).expect("a valid config")
+    }
+}
+
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = self
@@ -592,4 +602,104 @@ fn reports_come_out_of_the_api_for_members_and_tokens_and_stay_inside_their_site
         api(&server, "GET", "me", &Auth::Cookie(cookie.clone()), None).status,
         401
     );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn health_events_reach_the_store_masked_and_templated() {
+    let scratch = Scratch::new();
+    let db = scratch.database.as_str();
+    let dir = dir("health");
+    let step = |args: &[&str]| run(&dir, db, args, None);
+    step(&["site", "create", "shop"]);
+    let schema = dir.join("schema.toml");
+    std::fs::write(&schema, SCHEMA).expect("write the schema");
+    step(&[
+        "schema",
+        "push",
+        "--site",
+        "1",
+        schema.to_str().expect("utf-8"),
+    ]);
+    let key = step(&["key", "issue", "--site", "1"]);
+    let server = Server::start(&dir, db);
+
+    let events = vec![
+        event(
+            1,
+            "app_error",
+            "a1",
+            "s1",
+            &json!({
+                "kind": "unhandled",
+                "type": "TypeError",
+                "message": "no account for ana@example.com card 4111 1111 1111 1111",
+                "frames": "https://cdn.example.com/app.js?v=3|checkout|42|7|1;broken",
+            }),
+        ),
+        event(
+            2,
+            "http_request",
+            "a1",
+            "s1",
+            &json!({
+                "method": "get",
+                "host": "api.example.com",
+                "route": "https://api.example.com/v1/orders/123456?token=abc",
+                "status": 200,
+                "duration": 120,
+            }),
+        ),
+    ];
+    let batch = json!({ "sent_at": now_ms(), "sdk": "test/1.0", "events": events }).to_string();
+    let sent = http(
+        &server.collect,
+        "POST",
+        "/v1/collect",
+        &[
+            ("X-Dionaea-Key", key.as_str()),
+            ("Content-Type", "application/json"),
+        ],
+        &batch,
+    );
+    assert_eq!(sent.status, 202, "{}", sent.body);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stored = loop {
+        let found = scratch.reader().raw_query(
+            "SELECT name, props_str['message'] AS message, props_str['frames'] AS frames, \
+             props_str['route'] AS route FROM events ORDER BY name FORMAT JSONEachRow",
+        );
+        if let Ok(text) = found
+            && text.lines().count() == 2
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the events did not arrive; stored: {:?}; dropped: {:?}",
+            scratch
+                .reader()
+                .raw_query("SELECT name, count() FROM events GROUP BY name"),
+            scratch
+                .reader()
+                .raw_query("SELECT event_name, reason, count FROM drops_daily"),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let rows: Vec<Value> = stored
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json"))
+        .collect();
+    assert_eq!(rows[0]["name"], "app_error");
+    assert_eq!(rows[0]["message"], "no account for [email] card [number]");
+    assert_eq!(
+        rows[0]["frames"],
+        "https://cdn.example.com/app.js|checkout|42|7|1"
+    );
+    assert_eq!(rows[1]["route"], "/v1/orders/:id");
+    let everything = stored.to_lowercase();
+    for leaked in ["ana@example", "4111", "token=abc", "123456"] {
+        assert!(!everything.contains(leaked), "{leaked} was stored");
+    }
 }

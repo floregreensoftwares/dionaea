@@ -1,0 +1,16 @@
+{
+  "description": "The frames field of an app_error: frames joined by ';', each module|function|line|column|flag, '%', '|' and ';' written %25, %7C and %3B inside names, flag 1 for the app's code and 0 otherwise. Normalizing keeps the well-formed frames (at most 64), removes query strings and fragments from modules, cuts names (256 and 128 characters) and writes them again.",
+  "cases": [
+    { "name": "two frames", "input": "app/cart.js|checkout|42|7|1;lib/react.js|render|10|3|0", "output": "app/cart.js|checkout|42|7|1;lib/react.js|render|10|3|0" },
+    { "name": "no line or column", "input": "App|run|||1", "output": "App|run|||1" },
+    { "name": "zero line and column are written empty", "input": "App|run|0|0|1", "output": "App|run|||1" },
+    { "name": "escaped delimiters survive", "input": "a%7Cb%3Bc%25d|f%7Cg|1|2|0", "output": "a%7Cb%3Bc%25d|f%7Cg|1|2|0" },
+    { "name": "query string and fragment leave the module", "input": "https://cdn.example.com/app.js?v=3#x|f|1|2|1", "output": "https://cdn.example.com/app.js|f|1|2|1" },
+    { "name": "a frame cut in half is dropped", "input": "a|f|1|2|1;b|g|3", "output": "a|f|1|2|1" },
+    { "name": "bad number is dropped", "input": "a|f|x|2|1;b|g|3|4|1", "output": "b|g|3|4|1" },
+    { "name": "bad flag is dropped", "input": "a|f|1|2|9;b|g|3|4|0", "output": "b|g|3|4|0" },
+    { "name": "bad escape is dropped", "input": "a%ZZ|f|1|2|1;b|g|3|4|1", "output": "b|g|3|4|1" },
+    { "name": "an extra field is dropped", "input": "a|f|1|2|1|x;b|g|3|4|1", "output": "b|g|3|4|1" },
+    { "name": "empty", "input": "", "output": "" }
+  ]
+}

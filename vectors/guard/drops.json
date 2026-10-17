@@ -6,7 +6,7 @@
     { "name": "an invalid optional field does not drop the event", "event": "order", "props": { "a": "x", "b": 1, "note": 5 }, "expect": { "accepted": { "fields": { "a": "x", "b": 1 }, "undeclared": 0, "invalid": ["note"] } } },
 
     { "name": "unknown event", "event": "nope", "props": {}, "expect": { "dropped": { "reason": "unknown_event" } } },
-    { "name": "a reserved health event is unknown until its shape exists", "event": "app_error", "props": {}, "expect": { "dropped": { "reason": "unknown_event" } } },
+    { "name": "a reserved health event is unknown until its shape exists", "event": "frame_stats", "props": {}, "expect": { "dropped": { "reason": "unknown_event" } } },
     { "name": "event name with a capital", "event": "Order", "props": { "a": "x", "b": 1 }, "expect": { "dropped": { "reason": "invalid_event_name" } } },
     { "name": "empty event name", "event": "", "props": {}, "expect": { "dropped": { "reason": "invalid_event_name" } } },
     { "name": "event name with a trailing space", "event": "order ", "props": {}, "expect": { "dropped": { "reason": "invalid_event_name" } } },

@@ -1,0 +1,30 @@
+{
+  "description": "Error message scrubbing. Rules run in this order, each in one pass: URLs (user info, query, fragment), e-mail addresses, JWT-like tokens, UUIDs, long tokens, long digit runs. Scrubbing the output again changes nothing.",
+  "cases": [
+    { "name": "plain message", "input": "TypeError: undefined is not a function", "output": "TypeError: undefined is not a function" },
+    { "name": "email", "input": "no account for ana.silva+tag@example.co.uk", "output": "no account for [email]" },
+    { "name": "email at the end of a sentence", "input": "sent to a@b.com.", "output": "sent to [email]." },
+    { "name": "not an email: no dot in the domain", "input": "user@localhost failed", "output": "user@localhost failed" },
+    { "name": "url query and fragment", "input": "GET https://api.example.com/v1/x?token=abc&u=1#top failed", "output": "GET https://api.example.com/v1/x?[query] failed" },
+    { "name": "url fragment only", "input": "see https://example.com/docs#install.", "output": "see https://example.com/docs#[fragment]." },
+    { "name": "url user info", "input": "https://user:secret@db.example.com/x", "output": "https://[userinfo]@db.example.com/x" },
+    { "name": "url without query is kept", "input": "load https://cdn.example.com/app.js failed", "output": "load https://cdn.example.com/app.js failed" },
+    { "name": "uuid", "input": "order 0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e not found", "output": "order [uuid] not found" },
+    { "name": "uuid in capitals", "input": "id 0190F7E2-7C3E-7A52-9A0E-5F3C2A1B4D6E", "output": "id [uuid]" },
+    { "name": "jwt", "input": "bad token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl", "output": "bad token [token]" },
+    { "name": "long hex token", "input": "key a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 rejected", "output": "key [token] rejected" },
+    { "name": "long mixed token", "input": "secret zx_test_4eC39HqLyjWDarjtT1zdp7dc", "output": "secret [token]" },
+    { "name": "long word without digits is kept", "input": "ValidationErrorSomethingVeryLongIdentifierNameWithoutDigits", "output": "ValidationErrorSomethingVeryLongIdentifierNameWithoutDigits" },
+    { "name": "words joined by hyphens are kept", "input": "load checkout-payment-form-v2 failed", "output": "load checkout-payment-form-v2 failed" },
+    { "name": "a constant name is kept", "input": "ORDER_PROCESSING_FAILED_STEP_2 raised", "output": "ORDER_PROCESSING_FAILED_STEP_2 raised" },
+    { "name": "small numbers in a list are kept", "input": "values 1 2 3 4 5 6 7 8 9 and 10-20-30-40-50", "output": "values 1 2 3 4 5 6 7 8 9 and 10-20-30-40-50" },
+    { "name": "six digits", "input": "order 123456 failed", "output": "order [number] failed" },
+    { "name": "five digits are kept", "input": "port 12345", "output": "port 12345" },
+    { "name": "card number with spaces", "input": "card 4111 1111 1111 1111 declined", "output": "card [number] declined" },
+    { "name": "phone number", "input": "call +55 11 99999-9999", "output": "call +[number]" },
+    { "name": "date and time are kept", "input": "at 2026-10-17 12:30 retry 3 of 5", "output": "at 2026-10-17 12:30 retry 3 of 5" },
+    { "name": "version and architecture are kept", "input": "app 1.4.2+57 on x86_64", "output": "app 1.4.2+57 on x86_64" },
+    { "name": "non-ascii text is kept", "input": "falha na conexão ✓ para ana@example.com", "output": "falha na conexão ✓ para [email]" },
+    { "name": "several kinds together", "input": "ana@example.com opened https://x.example.com/p?a=1 as 0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e (1234567)", "output": "[email] opened https://x.example.com/p?[query] as [uuid] ([number])" }
+  ]
+}

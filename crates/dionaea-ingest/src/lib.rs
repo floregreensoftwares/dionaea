@@ -10,6 +10,7 @@ mod cache;
 mod dedup;
 mod drops;
 mod enrich;
+mod health;
 mod identify;
 mod limit;
 mod pipeline;

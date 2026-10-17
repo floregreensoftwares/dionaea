@@ -12,7 +12,7 @@ mod parse;
 mod schema;
 mod wire;
 
-pub use builtin::reserved_event_names;
+pub use builtin::{MAX_FRAMES_CHARS, MAX_MESSAGE_CHARS, MAX_ROUTE_CHARS, reserved_event_names};
 pub use diff::{Change, ChangeKind, Severity, diff, is_breaking};
 pub use guard::{DropReason, Dropped, FieldValue, Guarded, is_id};
 pub use json_schema::schema_file_json_schema;

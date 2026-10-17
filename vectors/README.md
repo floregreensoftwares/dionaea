@@ -38,6 +38,7 @@ The `schema` is parsed with the schema file rules (`docs/wire-format.md` and
 | File | Covers |
 |---|---|
 | `kinds.json` | each field kind: accepted values, cleaning, clamping and rejection |
+| `health.json` | the fixed shapes of the app health events |
 | `drops.json` | every drop reason, the order of the checks, the property limit, built-in events |
 | `text.json` | the characters `text` replaces with a space, trimming and the cut |
 | `traits.json` | identity traits |
@@ -83,3 +84,21 @@ Variation selectors are kept (U+FE0F is legitimate after an emoji), so "a" and
 "a" followed by U+FE0F are stored as different values although they can look
 alike. The rules remove the characters that render as nothing on their own; they
 do not make every pair of look-alike strings equal.
+
+## Health vectors (`health/*.json`)
+
+Rules for what is stored of an error or a network call, for any implementation
+that applies them on the device or on the server:
+
+```json
+{ "description": "...", "cases": [ { "name": "...", "input": "...", "output": "..." } ] }
+```
+
+| File | Rule |
+|---|---|
+| `scrub.json` | masking of e-mail addresses, URL query strings and user info, UUIDs, tokens and long digit runs in an error message |
+| `route.json` | turning a path or URL into a route template |
+| `frames.json` | reading and writing the `frames` text of an `app_error` |
+
+Every rule is idempotent: applying it to its own output changes nothing, and
+the runner checks that for each case.

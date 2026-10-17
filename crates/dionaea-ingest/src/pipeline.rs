@@ -222,7 +222,7 @@ pub fn process_with(
             schema_version,
             anon_id: event.anon_id,
             session_id: event.session_id,
-            screen: event.screen,
+            screen: event.screen.as_deref().map(crate::health::screen),
             strings,
             numbers,
             app_version: batch.release.clone(),
@@ -269,6 +269,7 @@ fn guard(admission: &Admission, event: &WireEvent) -> Result<Fields, DropReason>
                         FieldValue::Integer(number) => numbers.push((name, number as f64)),
                     }
                 }
+                crate::health::sanitize(&event.name, &mut strings);
                 return Ok((*version, strings, numbers));
             }
             Err(dropped) => {
