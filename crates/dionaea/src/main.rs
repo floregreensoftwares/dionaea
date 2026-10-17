@@ -1,3 +1,6 @@
+mod account_cli;
+mod api;
+mod api_http;
 mod collect;
 mod config;
 mod erasure;
@@ -62,6 +65,93 @@ enum Command {
     Retention {
         #[command(subcommand)]
         command: RetentionCommand,
+    },
+    /// Members who log in to the API: create, list, change roles, disable
+    Member {
+        #[command(subcommand)]
+        command: MemberCommand,
+    },
+    /// Read tokens for scripts: issue, list, revoke
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemberCommand {
+    /// Add a member; the password is read from standard input (one line)
+    Create {
+        email: String,
+        #[arg(long)]
+        name: String,
+        /// Organization to add the member to (made if missing)
+        #[arg(long)]
+        organization: Option<String>,
+        /// viewer, admin or owner
+        #[arg(long, default_value = "owner")]
+        role: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List members as id, address, name, state and roles
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Give a member a role in an organization (viewer, admin, owner), or none to remove them
+    Role {
+        member: u32,
+        organization: String,
+        role: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Stop a member logging in and end their sessions
+    Disable {
+        member: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Let a disabled member log in again
+    Enable {
+        member: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Replace a member's password (read from standard input) and end their sessions
+    Password {
+        member: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Issue a read token for a site; prints its id and the token, once
+    Issue {
+        #[arg(long)]
+        site: u32,
+        #[arg(long, default_value = "default")]
+        label: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List the tokens of a site as id, label, state and creation time
+    List {
+        #[arg(long)]
+        site: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Revoke a read token
+    Revoke {
+        #[arg(long)]
+        site: u32,
+        id: u32,
+        #[command(flatten)]
+        store: StoreArgs,
     },
 }
 
@@ -305,7 +395,128 @@ fn main() -> ExitCode {
         Command::Settings { command } => settings_command(command),
         Command::Erase { command } => erase(command),
         Command::Retention { command } => retention(command),
+        Command::Member { command } => member(command),
+        Command::Token { command } => token(command),
     }
+}
+
+fn hasher() -> Result<dionaea_auth::Hasher, String> {
+    dionaea_auth::Hasher::new().map_err(|e| e.to_string())
+}
+
+fn member(command: MemberCommand) -> ExitCode {
+    use account_cli as cli;
+    let password = || cli::read_password(&mut std::io::stdin().lock());
+    match command {
+        MemberCommand::Create {
+            email,
+            name,
+            organization,
+            role,
+            store,
+        } => with_accounts(&store, |_, meta, out, err| {
+            let Ok(hasher) = hasher() else {
+                return meta_cli::UNUSABLE;
+            };
+            cli::member_create(
+                meta,
+                hasher,
+                &email,
+                &name,
+                password(),
+                organization.as_deref(),
+                &role,
+                out,
+                err,
+            )
+        }),
+        MemberCommand::List { store } => {
+            with_accounts(&store, |_, meta, out, err| cli::member_list(meta, out, err))
+        }
+        MemberCommand::Role {
+            member,
+            organization,
+            role,
+            store,
+        } => with_accounts(&store, |_, meta, _, err| {
+            cli::member_role(meta, member, &organization, &role, err)
+        }),
+        MemberCommand::Disable { member, store } => with_accounts(&store, |_, meta, _, err| {
+            cli::member_disable(meta, member, true, err)
+        }),
+        MemberCommand::Enable { member, store } => with_accounts(&store, |_, meta, _, err| {
+            cli::member_disable(meta, member, false, err)
+        }),
+        MemberCommand::Password { member, store } => with_accounts(&store, |_, meta, _, err| {
+            let Ok(hasher) = hasher() else {
+                return meta_cli::UNUSABLE;
+            };
+            cli::member_password(meta, hasher, member, password(), err)
+        }),
+    }
+}
+
+fn token(command: TokenCommand) -> ExitCode {
+    use account_cli as cli;
+    match command {
+        TokenCommand::Issue { site, label, store } => {
+            let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+            let opened = load_config(store.config.clone()).and_then(|config| config.open_meta());
+            match opened {
+                Ok(meta) => {
+                    let Ok(hasher) = hasher() else {
+                        return ExitCode::from(meta_cli::UNUSABLE);
+                    };
+                    ExitCode::from(cli::token_issue(
+                        std::sync::Arc::new(meta),
+                        hasher,
+                        site,
+                        &label,
+                        &mut out,
+                        &mut err,
+                    ))
+                }
+                Err(message) => {
+                    let _ = writeln!(err, "error: {message}");
+                    ExitCode::from(meta_cli::UNUSABLE)
+                }
+            }
+        }
+        TokenCommand::List { site, store } => with_accounts(&store, |_, meta, out, err| {
+            cli::token_list(meta, site, out, err)
+        }),
+        TokenCommand::Revoke { site, id, store } => with_accounts(&store, |_, meta, _, err| {
+            cli::token_revoke(meta, site, id, err)
+        }),
+    }
+}
+
+/// The same as `with_config_store`, for work on members and tokens.
+fn with_accounts(
+    args: &StoreArgs,
+    work: impl FnOnce(
+        &Config,
+        &dionaea_meta::SqliteMeta,
+        &mut std::io::StdoutLock<'_>,
+        &mut std::io::StderrLock<'_>,
+    ) -> u8,
+) -> ExitCode {
+    let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+    let config = match load_config(args.config.clone()) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return ExitCode::from(meta_cli::UNUSABLE);
+        }
+    };
+    let store = match config.open_meta() {
+        Ok(store) => store,
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}");
+            return ExitCode::from(meta_cli::UNUSABLE);
+        }
+    };
+    ExitCode::from(work(&config, &store, &mut out, &mut err))
 }
 
 fn retention(command: RetentionCommand) -> ExitCode {

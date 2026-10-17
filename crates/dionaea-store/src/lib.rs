@@ -19,6 +19,7 @@
 mod erase;
 mod http;
 mod migrations;
+pub mod report;
 mod retention;
 mod rows;
 mod time;
@@ -103,6 +104,8 @@ pub enum Error {
     Tls(String),
     /// Too many rows for one insert.
     TooManyRows,
+    /// A read would return more data than a read may.
+    AnswerTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -116,6 +119,7 @@ impl fmt::Display for Error {
             Self::InvalidRow(message) => write!(f, "a row cannot be stored: {message}"),
             Self::InvalidName(message) => write!(f, "invalid name: {message}"),
             Self::TooManyRows => write!(f, "more than {MAX_ROWS_PER_INSERT} rows in one insert"),
+            Self::AnswerTooLarge => f.write_str("the answer is larger than a read may return"),
         }
     }
 }
@@ -123,6 +127,18 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+    /// The ClickHouse error code in a server answer, when it names one
+    /// (`Code: 159` is a read that ran out of time, `Code: 158` or `396` one
+    /// that would return too many rows).
+    pub fn server_code(&self) -> Option<u32> {
+        let Self::Server { message, .. } = self else {
+            return None;
+        };
+        let rest = message.split("Code: ").nth(1)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+
     /// Whether trying the same call again cannot succeed: the server refused
     /// the data itself (400, 413 or 422) or the row is invalid. Everything else
     /// may pass on a later try, including 401, 403 and 404: a wrong password, a
@@ -132,7 +148,11 @@ impl Error {
     /// batch would block the spool forever.
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::InvalidRow(_) | Self::InvalidName(_) | Self::TooManyRows | Self::Tls(_) => true,
+            Self::InvalidRow(_)
+            | Self::InvalidName(_)
+            | Self::TooManyRows
+            | Self::AnswerTooLarge
+            | Self::Tls(_) => true,
             Self::Server { status, .. } => {
                 matches!(status, 400 | 413 | 422)
             }

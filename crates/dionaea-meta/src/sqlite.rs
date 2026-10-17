@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dionaea_core::{Change, Schema, diff, is_breaking, parse_schema};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::accounts::site_from_row;
 use crate::erasure_sql;
 use crate::migrations::MIGRATIONS;
 use crate::retention;
@@ -124,6 +125,11 @@ impl SqliteMeta {
         self
     }
 
+    /// The current time, in seconds since the Unix epoch.
+    pub(crate) fn clock_now(&self) -> i64 {
+        (self.clock)()
+    }
+
     fn migrate(&mut self) -> Result<(), MetaError> {
         let connection = self
             .connection
@@ -165,7 +171,7 @@ impl SqliteMeta {
     }
 
     /// Runs `work` in a write transaction and commits it.
-    fn write<T>(
+    pub(crate) fn write<T>(
         &self,
         work: impl FnOnce(&Transaction<'_>, i64) -> Result<T, MetaError>,
     ) -> Result<T, MetaError> {
@@ -183,7 +189,7 @@ impl SqliteMeta {
 
     /// Runs `work` in a read transaction: everything it reads is one
     /// consistent state.
-    fn read<T>(
+    pub(crate) fn read<T>(
         &self,
         work: impl FnOnce(&Transaction<'_>) -> Result<T, MetaError>,
     ) -> Result<T, MetaError> {
@@ -232,7 +238,7 @@ pub(crate) fn id_of(value: i64) -> Result<u32, MetaError> {
     u32::try_from(value).map_err(|_| MetaError::Corrupt(format!("id {value} is out of range")))
 }
 
-fn clean_label(value: &str, what: &str) -> Result<String, MetaError> {
+pub(crate) fn clean_label(value: &str, what: &str) -> Result<String, MetaError> {
     let value = value.trim();
     let length = value.chars().count();
     if length == 0 || length > MAX_LABEL_LEN {
@@ -433,6 +439,7 @@ impl MetaStore for SqliteMeta {
                 id: id_of(tx.last_insert_rowid())?,
                 organization_id,
                 name,
+                time_zone: "UTC".to_owned(),
             })
         })
     }
@@ -461,22 +468,64 @@ impl MetaStore for SqliteMeta {
     fn sites(&self) -> Result<Vec<Site>, MetaError> {
         self.read(|tx| {
             let mut statement = tx
-                .prepare("SELECT id, org_id, name FROM sites ORDER BY id")
+                .prepare("SELECT id, org_id, name, time_zone FROM sites ORDER BY id")
                 .map_err(storage)?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get(2)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
                 })
                 .map_err(storage)?;
             rows.map(|row| {
-                let (id, organization_id, name) = row.map_err(storage)?;
-                Ok(Site {
-                    id: id_of(id)?,
-                    organization_id: id_of(organization_id)?,
-                    name,
-                })
+                let (id, organization_id, name, time_zone) = row.map_err(storage)?;
+                site_from_row(id, organization_id, name, time_zone)
             })
             .collect()
+        })
+    }
+
+    fn site(&self, site_id: u32) -> Result<Site, MetaError> {
+        self.read(|tx| {
+            let (id, organization_id, name, time_zone) = tx
+                .query_row(
+                    "SELECT id, org_id, name, time_zone FROM sites WHERE id = ?1",
+                    [site_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(storage)?
+                .ok_or(MetaError::NotFound("site"))?;
+            site_from_row(id, organization_id, name, time_zone)
+        })
+    }
+
+    fn set_site_time_zone(&self, site_id: u32, time_zone: &str) -> Result<(), MetaError> {
+        let shape = !time_zone.is_empty()
+            && time_zone.len() <= crate::MAX_TIME_ZONE_LEN
+            && !time_zone.contains("..")
+            && time_zone
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'/' | b'+' | b'-'));
+        if !shape {
+            return Err(MetaError::Invalid(
+                "a time zone name is letters, digits and `_/+-`".to_owned(),
+            ));
+        }
+        self.write(|tx, _| {
+            let changed = tx
+                .execute(
+                    "UPDATE sites SET time_zone = ?1 WHERE id = ?2",
+                    params![time_zone, site_id],
+                )
+                .map_err(storage)?;
+            if changed == 0 {
+                return Err(MetaError::NotFound("site"));
+            }
+            Ok(())
         })
     }
 
@@ -820,6 +869,15 @@ impl MetaStore for SqliteMeta {
         self.read(|tx| erasure_sql::list(tx, state))
     }
 
+    fn site_erasure_requests(
+        &self,
+        site_id: u32,
+        state: Option<ErasureState>,
+        limit: u32,
+    ) -> Result<Vec<ErasureRequest>, MetaError> {
+        self.read(|tx| erasure_sql::list_for_site(tx, site_id, state, limit))
+    }
+
     fn claim_erasure(
         &self,
         state: ErasureState,
@@ -914,6 +972,30 @@ impl MetaStore for SqliteMeta {
 
     fn release_lease(&self, name: &str, holder: &str) -> Result<(), MetaError> {
         self.write(|tx, _| erasure_sql::release_lease(tx, name, holder))
+    }
+
+    fn site_schemas(&self, site_id: u32) -> Result<(u64, Vec<Schema>), MetaError> {
+        self.read(|tx| {
+            let generation = generation_of(tx)?;
+            let mut statement = tx
+                .prepare(
+                    "SELECT version, source FROM schema_versions
+                     WHERE site_id = ?1 AND retired_at IS NULL ORDER BY version",
+                )
+                .map_err(storage)?;
+            let rows = statement
+                .query_map([site_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage)?;
+            let schemas = rows
+                .map(|row| {
+                    let (version, source) = row.map_err(storage)?;
+                    parse_stored(&source, site_id, id_of(version)?)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((generation, schemas))
+        })
     }
 
     fn snapshot(&self) -> Result<Snapshot, MetaError> {

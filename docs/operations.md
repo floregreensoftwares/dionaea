@@ -20,6 +20,8 @@ operational and can also be stored in the metadata store with
 |---|---|---|
 | `listen` | `127.0.0.1:8080` | Where SDKs send events (`/v1/collect`, `/healthz`) |
 | `ops_listen` | `127.0.0.1:9100` | `/healthz`, `/readyz` and `/metrics`, apart from the public port so they need not be reachable from outside |
+| `api_listen` | `127.0.0.1:8090` | The [API](api.md) for members and scripts. Put TLS in front of it before exposing it |
+| `secure_cookies` | `true` | Whether the session cookie carries `Secure`; set `false` only for plain HTTP in local development |
 
 `/readyz` answers 503 when the spool is failing or nearly full (95% of its
 quota) or when keys and schemas cannot be read; a ClickHouse outage alone keeps
@@ -39,6 +41,7 @@ been prepared. Labels come from fixed sets, never from request content.
 | `spool_quota_bytes` | 1 GiB | The most disk the spool uses (at least 32 MiB). When it is full the endpoint answers 503 with `Retry-After` |
 | `clickhouse_url` | `http://127.0.0.1:8123` | `http://host[:port]` or `https://host[:port]` |
 | `clickhouse_user`, `clickhouse_password`, `clickhouse_database` | `default`, empty, `dionaea` | The password is never printed |
+| `clickhouse_query_user`, `clickhouse_query_password` | none | The ClickHouse user reports are read with. Give it `SELECT` and nothing else (`GRANT SELECT ON dionaea.* TO ...`); without it the user above reads too |
 | `clickhouse_ca_file` | none | PEM file with the certificates to trust for `https://`; without it the public roots are trusted |
 | `clickhouse_server_name` | the host | The name the ClickHouse certificate must carry |
 | `geoip_path` | none | A MaxMind country or city database (`.mmdb`); without it events have no country |
@@ -283,3 +286,19 @@ Metrics: `dionaea_retention_runs_total`, `_failures_total`, `_rows_expired_total
 The `events` table used to carry a rule of its own, 13 months for every site. A migration replaces it with one that cannot fire in the life of the product (60 years), so a site can keep its data longer than 13 months; it applies to databases made before as well. The links and traits of identified users (`identity_alias`, `user_traits`) have no age: they are removed by erasure. Raw errors and measurements will have a family of their own when they exist.
 
 Not covered: a site that is deleted from the metadata store keeps its rows until a month holding only them falls out of every remaining site's cutoff; and the data of two sites that share a month is never dropped whole before the site that keeps longer is done with it, only deleted row by row.
+
+## Members and read tokens
+
+People log in to the [API](api.md) with an address and a password, and scripts read reports with a token. Nobody can log in until the first member exists, and it comes from the command line:
+
+```
+echo 'a long password' | dionaea member create ana@example.com --name Ana --organization Acme --role owner
+```
+
+The password is read from standard input and must have 12 to 256 characters. Roles are `viewer`, `admin` and `owner`, per organization; an organization always keeps at least one owner. `dionaea member list|role|disable|enable|password` manage the rest, and the same can be done through the API by an owner.
+
+`dionaea token issue --site 1` prints a read token once; it can read that site's reports and nothing else, and `dionaea token revoke` ends it. Only a SHA-256 of the token is stored, so a lost token is replaced, not recovered.
+
+Failed logins are counted per account and per client (an IPv6 client is its /64) in memory, ten in fifteen minutes, and at most four passwords are hashed at once on a node (each takes 19 MiB), so a burst of logins is refused with 429 instead of exhausting memory. With several servers the count is per server. Sessions last seven days, end when the password changes or the member is disabled, and are not extended by use.
+
+Reports are read with `clickhouse_query_user` when it is set. Each read has a time limit of 30 seconds, a row limit of 20,000 and an answer limit of 16 MiB, and a node runs at most eight at once; the [API document](api.md) lists the rest.

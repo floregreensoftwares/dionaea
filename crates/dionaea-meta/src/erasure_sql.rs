@@ -107,6 +107,31 @@ pub(crate) fn list(
     rows.map(|row| build(row.map_err(storage)?)).collect()
 }
 
+/// The newest `limit` requests of one site, oldest first.
+pub(crate) fn list_for_site(
+    tx: &Transaction<'_>,
+    site_id: u32,
+    state: Option<ErasureState>,
+    limit: u32,
+) -> Result<Vec<ErasureRequest>, MetaError> {
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT {COLUMNS} FROM (
+                 SELECT {COLUMNS} FROM erasure_requests
+                 WHERE site_id = ?1 AND (?2 IS NULL OR state = ?2)
+                 ORDER BY id DESC LIMIT ?3
+             ) ORDER BY id"
+        ))
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(
+            params![site_id, state.map(ErasureState::as_str), limit],
+            request_of,
+        )
+        .map_err(storage)?;
+    rows.map(|row| build(row.map_err(storage)?)).collect()
+}
+
 fn tombstone(
     tx: &Transaction<'_>,
     site_id: u32,

@@ -53,7 +53,7 @@ fn report(error: &MetaError, label: &str, err: &mut impl Write) -> u8 {
     }
 }
 
-fn organization(store: &dyn MetaStore, name: &str) -> Result<Organization, MetaError> {
+pub(crate) fn organization(store: &dyn MetaStore, name: &str) -> Result<Organization, MetaError> {
     if let Some(found) = store.organizations()?.into_iter().find(|o| o.name == name) {
         return Ok(found);
     }

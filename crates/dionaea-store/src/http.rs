@@ -24,6 +24,9 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 /// Largest response body read; a ClickHouse answer to an insert or a DDL
 /// statement is empty or a short error.
 const MAX_BODY: usize = 1024 * 1024;
+/// The text of the error for an answer past the limit, so a caller can tell it
+/// from a broken connection.
+pub(crate) const TOO_LARGE: &str = "the response body is too large";
 const MAX_HEAD: usize = 16 * 1024;
 /// Idle connections kept per client.
 const MAX_IDLE: usize = 4;
@@ -161,6 +164,16 @@ impl Client {
 
     /// Sends `POST path` with `body` and returns the answer.
     pub(crate) fn post(&self, path: &str, body: &[u8]) -> io::Result<Response> {
+        self.post_limited(path, body, MAX_BODY)
+    }
+
+    /// The same, reading an answer of up to `max_response` bytes.
+    pub(crate) fn post_limited(
+        &self,
+        path: &str,
+        body: &[u8],
+        max_response: usize,
+    ) -> io::Result<Response> {
         let head = format!(
             "POST {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: {}\r\nContent-Length: {}\r\n\r\n",
             self.host,
@@ -173,7 +186,7 @@ impl Client {
                 Some(connection) => (connection, true),
                 None => (self.connect()?, false),
             };
-            match exchange(&mut *connection, &head, body) {
+            match exchange(&mut *connection, &head, body, max_response) {
                 Ok(response) => {
                     if response.keep_alive {
                         self.put_idle(connection);
@@ -200,17 +213,27 @@ fn is_stale(error: &io::Error) -> bool {
     )
 }
 
-fn exchange(connection: &mut dyn Transport, head: &str, body: &[u8]) -> io::Result<Response> {
+fn exchange(
+    connection: &mut dyn Transport,
+    head: &str,
+    body: &[u8],
+    max_response: usize,
+) -> io::Result<Response> {
     connection.write_all(head.as_bytes())?;
     connection.write_all(body)?;
     connection.flush()?;
-    read_response(connection)
+    read_response_limited(connection, max_response)
 }
 
 /// Reads one response: status line, headers, then a body framed by
 /// `Content-Length`, by chunks, or by the end of the connection. Reads nothing
 /// past the end of the response, so the connection can be reused.
+#[cfg(test)]
 pub(crate) fn read_response(reader: &mut dyn Read) -> io::Result<Response> {
+    read_response_limited(reader, MAX_BODY)
+}
+
+fn read_response_limited(reader: &mut dyn Read, max_body: usize) -> io::Result<Response> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -258,10 +281,10 @@ pub(crate) fn read_response(reader: &mut dyn Read) -> io::Result<Response> {
 
     let mut rest = buffer[head_end + 4..].to_vec();
     let (body, framed) = if chunked {
-        (read_chunked(reader, &mut rest)?, rest.is_empty())
+        (read_chunked(reader, &mut rest, max_body)?, rest.is_empty())
     } else if let Some(length) = content_length {
-        if length > MAX_BODY {
-            return Err(io::Error::other("the response body is too large"));
+        if length > max_body {
+            return Err(io::Error::other(TOO_LARGE));
         }
         while rest.len() < length {
             let n = reader.read(&mut chunk)?;
@@ -279,8 +302,8 @@ pub(crate) fn read_response(reader: &mut dyn Read) -> io::Result<Response> {
     } else {
         // No framing: the body runs to the end of the connection.
         loop {
-            if rest.len() > MAX_BODY {
-                return Err(io::Error::other("the response body is too large"));
+            if rest.len() > max_body {
+                return Err(io::Error::other(TOO_LARGE));
             }
             let n = reader.read(&mut chunk)?;
             if n == 0 {
@@ -299,7 +322,11 @@ pub(crate) fn read_response(reader: &mut dyn Read) -> io::Result<Response> {
 
 /// Decodes a chunked body, including its trailer. `pending` holds bytes
 /// already read past the head and ends up holding what follows the response.
-fn read_chunked(reader: &mut dyn Read, pending: &mut Vec<u8>) -> io::Result<Vec<u8>> {
+fn read_chunked(
+    reader: &mut dyn Read,
+    pending: &mut Vec<u8>,
+    max_body: usize,
+) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut fill = |pending: &mut Vec<u8>, reader: &mut dyn Read, what: &str| -> io::Result<()> {
@@ -341,8 +368,8 @@ fn read_chunked(reader: &mut dyn Read, pending: &mut Vec<u8>) -> io::Result<Vec<
                 }
             }
         }
-        if body.len() + size > MAX_BODY {
-            return Err(io::Error::other("the response body is too large"));
+        if body.len() + size > max_body {
+            return Err(io::Error::other(TOO_LARGE));
         }
         while pending.len() < size + 2 {
             fill(pending, reader, "a chunk ended early")?;
@@ -537,5 +564,16 @@ mod tests {
             MAX_BODY + 1
         );
         assert!(parse(chunked.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_larger_limit_admits_a_larger_body_and_the_error_says_it_was_the_size() {
+        let size = MAX_BODY + 10;
+        let mut raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n").into_bytes();
+        raw.extend(std::iter::repeat_n(b'x', size));
+        let refused = read_response_limited(&mut &raw[..], MAX_BODY).unwrap_err();
+        assert_eq!(refused.to_string(), TOO_LARGE);
+        let admitted = read_response_limited(&mut &raw[..], size).unwrap();
+        assert_eq!(admitted.body.len(), size);
     }
 }

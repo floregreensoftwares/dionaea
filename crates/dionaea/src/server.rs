@@ -12,6 +12,8 @@ use dionaea_spool::{Config as SpoolConfig, Spool};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::api::Api;
+use crate::api_http::{self, HttpState};
 use crate::collect::{self, Collect, Settings};
 use crate::config::Config;
 use crate::erasure::{Eraser, Job, Timing};
@@ -62,6 +64,7 @@ struct Node {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     batcher: Arc<Mutex<Option<Batcher>>>,
+    live: Live,
 }
 
 /// The settings in force and how to put new ones into force: the pieces the
@@ -458,6 +461,7 @@ impl Node {
                 stop,
                 threads,
                 batcher,
+                live,
             },
             collect,
         ))
@@ -481,6 +485,36 @@ impl Node {
     }
 }
 
+/// The API for members and scripts, with its own metadata connection and a
+/// ClickHouse handle that reads.
+fn build_api(config: &Config, live: Live) -> Result<Arc<HttpState>, String> {
+    let meta = Arc::new(config.open_meta()?);
+    let hasher = dionaea_auth::Hasher::new().map_err(|e| e.to_string())?;
+    let auth = Arc::new(dionaea_auth::Auth::new(
+        Arc::clone(&meta) as Arc<dyn dionaea_meta::AccountStore>,
+        hasher,
+        dionaea_auth::AuthConfig {
+            secure_cookies: config.secure_cookies,
+            ..dionaea_auth::AuthConfig::default()
+        },
+    ));
+    let limits = dionaea_query::Limits::default();
+    // A little longer than ClickHouse is allowed to run, so its own timeout
+    // answers first.
+    let store = config.clickhouse_query_store(Some(Duration::from_secs(
+        u64::from(limits.max_execution_secs) + 10,
+    )))?;
+    let tuning = live.tuning();
+    let api = Api::new(meta, auth, store, limits, move || {
+        live.tuning().retention_default_days
+    });
+    Ok(Arc::new(HttpState {
+        api: Arc::new(api),
+        trusted_proxy_hops: tuning.trusted_proxy_hops,
+        client_address_header: tuning.client_address_header.clone(),
+    }))
+}
+
 /// Serves until `shutdown` resolves, then stops accepting and drains
 /// in-flight requests.
 pub(crate) async fn run(
@@ -494,11 +528,13 @@ pub(crate) async fn run(
     };
     let public = bind(config.listen).await?;
     let operator = bind(config.ops_listen).await?;
-    let (public_address, ops_address) = (
+    let interface = bind(config.api_listen).await?;
+    let (public_address, ops_address, api_address) = (
         public.local_addr().map_err(|e| e.to_string())?,
         operator.local_addr().map_err(|e| e.to_string())?,
+        interface.local_addr().map_err(|e| e.to_string())?,
     );
-    info!(listen = %public_address, ops = %ops_address, "listening");
+    info!(listen = %public_address, ops = %ops_address, api = %api_address, "listening");
 
     let status = Arc::new(Status::new(config.spool_quota_bytes));
     let control = Arc::new(NetControl::new(
@@ -508,6 +544,13 @@ pub(crate) async fn run(
     let (node, collect) = {
         let (config, status, control) = (config.clone(), Arc::clone(&status), Arc::clone(&control));
         tokio::task::spawn_blocking(move || Node::start(&config, &status, &control))
+            .await
+            .map_err(|e| e.to_string())??
+    };
+
+    let api_state = {
+        let (config, live) = (config.clone(), node.live.clone());
+        tokio::task::spawn_blocking(move || build_api(&config, live))
             .await
             .map_err(|e| e.to_string())??
     };
@@ -532,6 +575,12 @@ pub(crate) async fn run(
             let _ = stopped.wait_for(|stop| *stop).await;
         }
     };
+    let wait_api = {
+        let mut stopped = stopped.clone();
+        async move {
+            let _ = stopped.wait_for(|stop| *stop).await;
+        }
+    };
     let wait_ops = async move {
         let _ = stopped.wait_for(|stop| *stop).await;
     };
@@ -539,6 +588,7 @@ pub(crate) async fn run(
     // The operator listener is small and local: a few connections, short
     // header time.
     let ops_control = Arc::new(NetControl::new(64, Duration::from_secs(10)));
+    let api_control = Arc::new(NetControl::new(256, Duration::from_secs(10)));
     tokio::join!(
         net::serve(
             public,
@@ -553,6 +603,13 @@ pub(crate) async fn run(
             ops_control,
             Arc::new(NetCounters::default()),
             wait_ops
+        ),
+        net::serve(
+            interface,
+            api_http::routes(api_state),
+            api_control,
+            Arc::new(NetCounters::default()),
+            wait_api
         ),
     );
     {

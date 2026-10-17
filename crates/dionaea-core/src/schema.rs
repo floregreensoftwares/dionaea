@@ -215,8 +215,9 @@ impl Schema {
         &self.traits
     }
 
-    /// Built-in events first, then the site's own.
-    pub(crate) fn event(&self, name: &str) -> Option<&EventDef> {
+    /// The definition of an event name: a built-in event first, then the
+    /// site's own.
+    pub fn event(&self, name: &str) -> Option<&EventDef> {
         builtin::event(name).or_else(|| self.events.get(name))
     }
 }

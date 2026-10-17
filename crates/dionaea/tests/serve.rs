@@ -45,6 +45,7 @@ fn command_for(dir: &Path, url: &str, database: Option<&str>) -> Command {
         .env("DIONAEA_CLICKHOUSE_DATABASE", database.unwrap_or("dionaea"))
         .env("DIONAEA_LISTEN", "127.0.0.1:0")
         .env("DIONAEA_OPS_LISTEN", "127.0.0.1:0")
+        .env("DIONAEA_API_LISTEN", "127.0.0.1:0")
         .env("DIONAEA_LOG_FORMAT", "json");
     command
 }

@@ -455,7 +455,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 8,
+        migrations, 9,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
