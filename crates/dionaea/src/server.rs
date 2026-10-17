@@ -9,15 +9,15 @@ use axum::Router;
 use axum::routing::get;
 use dionaea_ingest::{Batcher, BatcherConfig, Cache, Destination, MaxMind};
 use dionaea_spool::{Config as SpoolConfig, Spool};
-use dionaea_store::{Store, TlsConfig};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::collect::{self, Collect, Settings};
-use crate::config::{Config, clickhouse_endpoint};
+use crate::config::Config;
 use crate::erasure::{Eraser, Job, Timing};
 use crate::net::{self, NetControl, NetCounters};
 use crate::ops::{self, Ops, Status};
+use crate::retention::{Expirer, Job as RetentionJob};
 use crate::settings::{self, Origin, Tuning};
 
 /// The longest wait between attempts to prepare ClickHouse.
@@ -28,6 +28,8 @@ const SPOOL_RECORD_BYTES: u32 = 4 * 1024 * 1024;
 /// How long one erasure statement may run: rewriting the tables of a large
 /// installation takes far longer than an insert.
 const ERASE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How often the retention job looks at whether a run is due.
+const RETENTION_TICK: Duration = Duration::from_secs(30);
 /// How often the erasure job looks for work.
 const ERASE_TICK: Duration = Duration::from_secs(5);
 
@@ -203,7 +205,6 @@ impl Node {
         status: &Arc<Status>,
         control: &Arc<NetControl>,
     ) -> Result<(Self, Arc<Collect>), String> {
-        let endpoint = clickhouse_endpoint(&config.clickhouse_url)?;
         let meta = config.open_meta()?;
         let cache = Cache::new();
         cache
@@ -227,22 +228,10 @@ impl Node {
         let spool = Spool::open(spool_config)
             .map_err(|e| format!("cannot open the spool {}: {e}", config.spool_dir.display()))?;
 
-        let mut store_config =
-            dionaea_store::Config::new(&endpoint.host, endpoint.port, &config.clickhouse_database);
-        store_config.user.clone_from(&config.clickhouse_user);
-        store_config
-            .password
-            .clone_from(&config.clickhouse_password.0);
-        if endpoint.tls {
-            store_config.tls = Some(TlsConfig {
-                ca_file: config.clickhouse_ca_file.clone(),
-                server_name: config.clickhouse_server_name.clone(),
-            });
-        }
-        let mut erase_config = store_config.clone();
-        erase_config.timeout = ERASE_TIMEOUT;
-        let eraser = Store::new(erase_config).map_err(|e| format!("clickhouse settings: {e}"))?;
-        let store = Store::new(store_config).map_err(|e| format!("clickhouse settings: {e}"))?;
+        let eraser = config.clickhouse_store(Some(ERASE_TIMEOUT))?;
+        // Removing old data is as slow as erasing: the same long timeout.
+        let expirer = eraser.clone();
+        let store = config.clickhouse_store(None)?;
 
         // The user agent dataset compiles its patterns on first use; do it now
         // so the first request does not pay for it.
@@ -376,6 +365,36 @@ impl Node {
                 .map_err(|e| format!("cannot start the erasure thread: {e}"))?
         };
         threads.push(erasure);
+
+        // Old data is removed once per interval by whichever server finds the
+        // run unclaimed, once ClickHouse is prepared.
+        let retention = {
+            let meta = config.open_meta()?;
+            let (live, stop, status) = (live.clone(), Arc::clone(&stop), Arc::clone(status));
+            let job = RetentionJob::new(
+                Arc::new(meta),
+                Arc::new(expirer) as Arc<dyn Expirer>,
+                Arc::clone(&status.retention),
+            );
+            thread::Builder::new()
+                .name("dionaea-retention".to_owned())
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        nap(RETENTION_TICK, &stop);
+                        if !status.clickhouse_ready.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let tuning = live.tuning();
+                        job.run_if_due(
+                            tuning.retention_interval,
+                            tuning.retention_default_days,
+                            collect::system_clock(),
+                        );
+                    }
+                })
+                .map_err(|e| format!("cannot start the retention thread: {e}"))?
+        };
+        threads.push(retention);
 
         // The tables must exist before anything is inserted: a missing table
         // is an error the batcher would keep retrying, so it starts only once

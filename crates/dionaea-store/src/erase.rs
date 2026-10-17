@@ -136,7 +136,7 @@ fn conditions(
 
 impl Store {
     /// Runs one statement with extra ClickHouse settings in the URL.
-    fn execute_with(&self, sql: &str, settings: &str) -> Result<String, Error> {
+    pub(crate) fn execute_with(&self, sql: &str, settings: &str) -> Result<String, Error> {
         let path = format!(
             "/?database={}&{settings}",
             http::url_encode(&self.config.database)

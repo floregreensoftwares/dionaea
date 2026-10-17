@@ -4,6 +4,7 @@ mod erasure;
 mod meta_cli;
 mod net;
 mod ops;
+mod retention;
 mod schema_cli;
 mod server;
 mod settings;
@@ -56,6 +57,11 @@ enum Command {
     Erase {
         #[command(subcommand)]
         command: EraseCommand,
+    },
+    /// How long each site keeps its data
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
     },
 }
 
@@ -115,6 +121,38 @@ enum SiteCommand {
         store: StoreArgs,
     },
     /// List sites as id, name and organization
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum RetentionCommand {
+    /// Keep a site's analytics data for this many days (1 to 3650)
+    Set {
+        #[arg(long)]
+        site: u32,
+        #[arg(long)]
+        days: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Count what the next run would remove, per site and table, without
+    /// deleting anything: use it before lowering a number
+    Preview {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Go back to the default for a site
+    Unset {
+        #[arg(long)]
+        site: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List every site: id, family, days, and whether the number is the
+    /// site's own or the default
     List {
         #[command(flatten)]
         store: StoreArgs,
@@ -266,6 +304,60 @@ fn main() -> ExitCode {
         Command::Key { command } => key(command),
         Command::Settings { command } => settings_command(command),
         Command::Erase { command } => erase(command),
+        Command::Retention { command } => retention(command),
+    }
+}
+
+fn retention(command: RetentionCommand) -> ExitCode {
+    let now = || i64::try_from(collect::system_clock()).unwrap_or(i64::MAX / 2);
+    match command {
+        RetentionCommand::Set { site, days, store } => with_store(&store, |meta, _, err| {
+            meta_cli::retention_set(meta, site, Some(days), err)
+        }),
+        RetentionCommand::Unset { site, store } => with_store(&store, |meta, _, err| {
+            meta_cli::retention_set(meta, site, None, err)
+        }),
+        RetentionCommand::Preview { store } => {
+            with_config_store(&store, |config, meta, out, err| {
+                let clickhouse = match config.clickhouse_store(None) {
+                    Ok(clickhouse) => clickhouse,
+                    Err(message) => {
+                        let _ = writeln!(err, "error: {message}");
+                        return meta_cli::UNUSABLE;
+                    }
+                };
+                let default = meta_cli::retention_default_days(
+                    meta,
+                    &config.tuning,
+                    &config.tuning_origins,
+                    now(),
+                )
+                .unwrap_or(config.tuning.retention_default_days);
+                meta_cli::retention_preview(
+                    meta,
+                    &|site, cutoff| {
+                        clickhouse
+                            .count_expired(site, cutoff)
+                            .map(|found| found.into_iter().map(|e| (e.table, e.rows)).collect())
+                            .map_err(|e| format!("cannot count in ClickHouse: {e}"))
+                    },
+                    default,
+                    collect::system_clock(),
+                    out,
+                    err,
+                )
+            })
+        }
+        RetentionCommand::List { store } => with_config_store(&store, |config, meta, out, err| {
+            meta_cli::retention_list(
+                meta,
+                &config.tuning,
+                &config.tuning_origins,
+                now(),
+                out,
+                err,
+            )
+        }),
     }
 }
 

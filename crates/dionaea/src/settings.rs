@@ -74,6 +74,10 @@ pub(crate) struct Tuning {
     /// How long a failed erasure request keeps the user id and devices in the
     /// clear so that it can be retried; after that they are forgotten.
     pub(crate) erase_failed_keep: Duration,
+    /// How many days a site keeps its analytics data unless it has its own
+    /// number, and how often the retention job runs.
+    pub(crate) retention_default_days: u32,
+    pub(crate) retention_interval: Duration,
 }
 
 /// Where a setting's value came from.
@@ -404,6 +408,26 @@ pub(crate) static SPECS: &[Spec] = &[
         |t, v| t.erase_failed_keep = Duration::from_secs(v * 86_400),
         |t| (t.erase_failed_keep.as_secs() / 86_400).to_string()
     ),
+    spec!(
+        "retention_default_days",
+        "395",
+        "from 1 to 3650 days",
+        "how long a site keeps its analytics data unless `dionaea retention set` gave it another number",
+        u32,
+        |v| (1..=3650).contains(v),
+        |t, v| t.retention_default_days = v,
+        |t| t.retention_default_days.to_string()
+    ),
+    spec!(
+        "retention_interval_secs",
+        "86400",
+        "from 60 to 604800 seconds",
+        "how often old data is removed",
+        u64,
+        |v| (60..=604_800).contains(v),
+        |t, v| t.retention_interval = Duration::from_secs(v),
+        |t| secs(t.retention_interval)
+    ),
 ];
 
 /// The setting called `name`.
@@ -463,6 +487,8 @@ impl Tuning {
             erase_finish_after: Duration::ZERO,
             erase_max_attempts: 1,
             erase_failed_keep: Duration::ZERO,
+            retention_default_days: 1,
+            retention_interval: Duration::ZERO,
         }
     }
 

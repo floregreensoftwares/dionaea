@@ -192,6 +192,20 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             GROUP BY site_id, anon_id, number",
         ],
     },
+    Migration {
+        version: 5,
+        name: "retention",
+        statements: &[
+            // Each site keeps its events for its own number of days, applied by
+            // the retention job, so the table's own rule of 13 months for every
+            // site goes. What is left is a rule that cannot fire in the life of
+            // the product: removing a rule that is not there is an error and
+            // this statement must be safe to run again, and 60 years is the
+            // most that fits a DateTime (which ends in 2106) for any event
+            // time the ingest path accepts.
+            "ALTER TABLE events MODIFY TTL toDateTime(ts) + INTERVAL 60 YEAR",
+        ],
+    },
 ];
 
 #[cfg(test)]
@@ -211,7 +225,12 @@ mod tests {
     fn every_statement_is_idempotent_and_single() {
         for migration in MIGRATIONS {
             for statement in migration.statements {
-                assert!(statement.contains("IF NOT EXISTS"), "{statement}");
+                // A statement that sets a table property is the same when run
+                // again; the others must not fail when the object exists.
+                assert!(
+                    statement.contains("IF NOT EXISTS") || statement.contains(" MODIFY TTL "),
+                    "{statement}"
+                );
                 assert!(!statement.contains(';'), "one statement per entry");
             }
         }

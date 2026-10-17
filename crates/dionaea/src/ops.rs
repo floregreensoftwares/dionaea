@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::collect::Collect;
 use crate::erasure::JobStats;
 use crate::net::NetCounters;
+use crate::retention::RetentionStats;
 
 /// What the background threads tell the operator endpoints.
 #[derive(Debug)]
@@ -34,6 +35,8 @@ pub(crate) struct Status {
     pub(crate) batcher: Mutex<Option<Arc<BatcherStats>>>,
     /// What the erasure job did and the state of the requests.
     pub(crate) erasure: Arc<JobStats>,
+    /// What the retention job did.
+    pub(crate) retention: Arc<RetentionStats>,
     pub(crate) spool_quota_bytes: u64,
 }
 
@@ -46,6 +49,7 @@ impl Status {
             metadata_failing: AtomicBool::new(false),
             batcher: Mutex::new(None),
             erasure: Arc::default(),
+            retention: Arc::default(),
             spool_quota_bytes,
         }
     }
@@ -93,6 +97,56 @@ async fn readyz(State(ops): State<Arc<Ops>>) -> impl IntoResponse {
 fn metric(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+fn render_retention(out: &mut String, job: &RetentionStats) {
+    for (name, kind, help, value) in [
+        (
+            "dionaea_retention_runs_total",
+            "counter",
+            "Runs of the retention job by this server.",
+            job.runs.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_retention_failures_total",
+            "counter",
+            "Runs of the retention job that failed.",
+            job.failures.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_retention_failing",
+            "gauge",
+            "1 while the last run of the retention job failed.",
+            u64::from(job.failing.load(Ordering::Relaxed)),
+        ),
+        (
+            "dionaea_retention_rows_expired_total",
+            "counter",
+            "Rows removed because their site no longer keeps them.",
+            job.rows_expired.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_retention_partitions_dropped_total",
+            "counter",
+            "Months dropped whole because no site keeps them.",
+            job.partitions_dropped.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_retention_partitions_rewritten_total",
+            "counter",
+            "Months rewritten to remove expired rows from disk.",
+            job.partitions_rewritten.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_retention_last_success_timestamp_seconds",
+            "gauge",
+            "When the last run that succeeded finished (0: none yet).",
+            u64::try_from(job.last_success.load(Ordering::Relaxed)).unwrap_or(0),
+        ),
+    ] {
+        metric(out, name, kind, help);
+        let _ = writeln!(out, "{name} {value}");
+    }
 }
 
 fn render_erasure(out: &mut String, job: &JobStats) {
@@ -435,6 +489,7 @@ fn render(ops: &Ops) -> String {
     }
 
     render_erasure(&mut out, &ops.status.erasure);
+    render_retention(&mut out, &ops.status.retention);
 
     metric(
         &mut out,

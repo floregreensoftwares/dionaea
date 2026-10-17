@@ -435,3 +435,60 @@ fn a_device_can_be_erased_by_its_anonymous_id_and_a_request_names_one_subject() 
     assert_eq!(bad.status.code(), Some(1));
     assert!(err(&bad).contains("device id"), "{}", err(&bad));
 }
+
+#[test]
+fn an_operator_sets_lists_and_clears_how_long_a_site_keeps_its_data() {
+    let dir = dir("retention");
+    let db = dir.join("meta.db");
+    assert_eq!(run(&db, &["site", "create", "shop"]).status.code(), Some(0));
+    assert_eq!(run(&db, &["site", "create", "blog"]).status.code(), Some(0));
+
+    let listed = run(&db, &["retention", "list"]);
+    assert_eq!(listed.status.code(), Some(0), "{}", err(&listed));
+    assert_eq!(
+        out(&listed),
+        "1\tanalytics\t395\tdefault\n2\tanalytics\t395\tdefault\n"
+    );
+
+    let set = run(&db, &["retention", "set", "--site", "1", "--days", "90"]);
+    assert_eq!(set.status.code(), Some(0), "{}", err(&set));
+    assert_eq!(
+        out(&run(&db, &["retention", "list"])),
+        "1\tanalytics\t90\tsite\n2\tanalytics\t395\tdefault\n"
+    );
+    // The default is a setting like the others.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dionaea"));
+    command
+        .args(["retention", "list"])
+        .env("DIONAEA_METADATA_PATH", &db)
+        .env("DIONAEA_RETENTION_DEFAULT_DAYS", "200");
+    assert_eq!(
+        out(&command.output().expect("run")),
+        "1\tanalytics\t90\tsite\n2\tanalytics\t200\tdefault\n"
+    );
+
+    let unset = run(&db, &["retention", "unset", "--site", "1"]);
+    assert_eq!(unset.status.code(), Some(0));
+    assert!(out(&run(&db, &["retention", "list"])).starts_with("1\tanalytics\t395\tdefault"));
+}
+
+#[test]
+fn retention_refuses_numbers_and_sites_that_make_no_sense() {
+    let dir = dir("retention-refused");
+    let db = dir.join("meta.db");
+    assert_eq!(run(&db, &["site", "create", "shop"]).status.code(), Some(0));
+    for days in ["0", "3651"] {
+        let bad = run(&db, &["retention", "set", "--site", "1", "--days", days]);
+        assert_eq!(bad.status.code(), Some(1), "{days}");
+        assert!(err(&bad).contains("1 to 3650 days"), "{}", err(&bad));
+    }
+    let word = run(&db, &["retention", "set", "--site", "1", "--days", "many"]);
+    assert_eq!(word.status.code(), Some(2), "clap refuses a word");
+    let site = run(&db, &["retention", "set", "--site", "9", "--days", "10"]);
+    assert_eq!(site.status.code(), Some(1));
+    assert!(err(&site).contains("site not found"), "{}", err(&site));
+    assert_eq!(
+        out(&run(&db, &["retention", "list"])),
+        "1\tanalytics\t395\tdefault\n"
+    );
+}

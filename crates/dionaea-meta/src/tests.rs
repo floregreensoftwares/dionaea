@@ -455,7 +455,7 @@ fn a_file_database_survives_a_reopen_and_migrates_once() {
         .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
         .expect("count");
     assert_eq!(
-        migrations, 7,
+        migrations, 8,
         "each migration once, however many times it was opened"
     );
     let mode: String = connection
@@ -1880,4 +1880,114 @@ fn the_keys_in_use_are_listed_apart_so_that_checking_them_reads_no_tombstone() {
         "one key however many tombstones"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Retention and scheduled runs.
+
+#[test]
+fn a_site_can_keep_its_data_for_its_own_number_of_days_and_go_back_to_the_default() {
+    let store = store();
+    let first = site(&store);
+    let organization = store.organizations().unwrap()[0].id;
+    let second = store.create_site(organization, "Other").unwrap();
+    assert!(store.retentions().unwrap().is_empty(), "all on the default");
+
+    store
+        .set_retention(first.id, RetentionFamily::Analytics, Some(90))
+        .unwrap();
+    store
+        .set_retention(second.id, RetentionFamily::Analytics, Some(3650))
+        .unwrap();
+    assert_eq!(
+        store.retentions().unwrap(),
+        vec![
+            Retention {
+                site_id: first.id,
+                family: RetentionFamily::Analytics,
+                days: 90
+            },
+            Retention {
+                site_id: second.id,
+                family: RetentionFamily::Analytics,
+                days: 3650
+            },
+        ]
+    );
+    store
+        .set_retention(first.id, RetentionFamily::Analytics, Some(30))
+        .unwrap();
+    assert_eq!(
+        store.retentions().unwrap()[0].days,
+        30,
+        "replaced, not added"
+    );
+    store
+        .set_retention(first.id, RetentionFamily::Analytics, None)
+        .unwrap();
+    assert_eq!(store.retentions().unwrap().len(), 1);
+    store
+        .set_retention(first.id, RetentionFamily::Analytics, None)
+        .unwrap();
+}
+
+#[test]
+fn retention_is_bounded_and_needs_a_site() {
+    let store = store();
+    let site = site(&store);
+    for days in [0, 3651, u32::MAX] {
+        assert!(
+            matches!(
+                store.set_retention(site.id, RetentionFamily::Analytics, Some(days)),
+                Err(MetaError::Invalid(_))
+            ),
+            "{days}"
+        );
+    }
+    for days in [MIN_RETENTION_DAYS, MAX_RETENTION_DAYS] {
+        store
+            .set_retention(site.id, RetentionFamily::Analytics, Some(days))
+            .unwrap();
+    }
+    assert!(matches!(
+        store.set_retention(site.id + 9, RetentionFamily::Analytics, Some(10)),
+        Err(MetaError::NotFound("site"))
+    ));
+    assert_eq!(
+        RetentionFamily::parse("analytics"),
+        Some(RetentionFamily::Analytics)
+    );
+    assert_eq!(RetentionFamily::parse("health"), None);
+}
+
+#[test]
+fn a_scheduled_job_is_claimed_by_one_server_once_per_interval() {
+    let (store, now) = clocked();
+    assert_eq!(store.last_run("retention").unwrap(), None);
+    assert!(store.claim_run("retention", 100).unwrap(), "never ran: due");
+    assert_eq!(store.last_run("retention").unwrap(), Some(1_000));
+    assert!(!store.claim_run("retention", 100).unwrap(), "taken");
+    assert!(store.claim_run("other", 100).unwrap(), "another job");
+
+    now.store(1_099, Ordering::SeqCst);
+    assert!(!store.claim_run("retention", 100).unwrap());
+    now.store(1_100, Ordering::SeqCst);
+    assert!(
+        store.claim_run("retention", 100).unwrap(),
+        "an interval later"
+    );
+    assert_eq!(store.last_run("retention").unwrap(), Some(1_100));
+}
+
+#[test]
+fn a_failed_run_comes_due_again_after_the_retry_time_not_a_whole_interval() {
+    let (store, now) = clocked();
+    assert!(store.claim_run("retention", 1_000).unwrap());
+    store.postpone_run("retention", 1_000, 60).unwrap();
+    now.store(1_059, Ordering::SeqCst);
+    assert!(!store.claim_run("retention", 1_000).unwrap());
+    now.store(1_060, Ordering::SeqCst);
+    assert!(store.claim_run("retention", 1_000).unwrap());
+    // Postponing a job that never ran just records it.
+    store.postpone_run("new", 1_000, 5).unwrap();
+    assert!(!store.claim_run("new", 1_000).unwrap());
 }

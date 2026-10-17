@@ -13,11 +13,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::erasure_sql;
 use crate::migrations::MIGRATIONS;
+use crate::retention;
 use crate::{
     ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, KeyEntry,
     MAX_LABEL_LEN, MAX_ORIGINS, MAX_SETTING_NAME_LEN, MAX_SETTING_VALUE_LEN, MetaError, MetaStore,
-    Organization, Published, SchemaVersionInfo, Site, SiteSchemas, Snapshot, StoredSetting,
-    TombstoneBatch, WriteKeyInfo,
+    Organization, Published, Retention, RetentionFamily, SchemaVersionInfo, Site, SiteSchemas,
+    Snapshot, StoredSetting, TombstoneBatch, WriteKeyInfo,
 };
 
 pub(crate) const KEY_PREFIX: &str = "wk_";
@@ -866,6 +867,36 @@ impl MetaStore for SqliteMeta {
 
     fn erasure_keys(&self) -> HashKeys {
         self.keys.clone()
+    }
+
+    fn set_retention(
+        &self,
+        site_id: u32,
+        family: RetentionFamily,
+        days: Option<u32>,
+    ) -> Result<(), MetaError> {
+        self.write(|tx, _| retention::set(tx, site_id, family, days))
+    }
+
+    fn retentions(&self) -> Result<Vec<Retention>, MetaError> {
+        self.read(retention::all)
+    }
+
+    fn claim_run(&self, name: &str, every_secs: i64) -> Result<bool, MetaError> {
+        self.write(|tx, at| retention::claim_run(tx, name, every_secs, at))
+    }
+
+    fn postpone_run(
+        &self,
+        name: &str,
+        every_secs: i64,
+        retry_in_secs: i64,
+    ) -> Result<(), MetaError> {
+        self.write(|tx, at| retention::postpone_run(tx, name, every_secs, retry_in_secs, at))
+    }
+
+    fn last_run(&self, name: &str) -> Result<Option<i64>, MetaError> {
+        self.read(|tx| retention::last_run(tx, name))
     }
 
     fn purge_failed_erasures(&self, failed_before: i64) -> Result<u64, MetaError> {
