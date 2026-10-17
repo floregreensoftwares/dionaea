@@ -37,6 +37,7 @@ been prepared. Labels come from fixed sets, never from request content.
 | `metadata_path` | `dionaea.db` | The SQLite file with sites, keys and schemas; set it to an absolute path |
 | `erasure_key`, `erasure_key_file` | none | A random secret of 32 to 512 characters, or a file that holds it. Needed only to erase users (see below); the same on every server that shares the metadata |
 | `erasure_previous_keys`, `erasure_previous_keys_file` | none | Earlier erasure keys, kept after the key was replaced so older erasures are still recognised: a comma-separated list in the environment, an array in the file, or a file with one key per line |
+| `artifacts_dir` | `artifacts` | Where uploaded symbol files are kept (see [API](api.md#symbol-files)); keep it on a disk that survives restarts, and back it up with the metadata |
 | `spool_dir` | `spool` | The on-disk queue between the endpoint and ClickHouse; keep it on a disk that survives restarts |
 | `spool_quota_bytes` | 1 GiB | The most disk the spool uses (at least 32 MiB). When it is full the endpoint answers 503 with `Retry-After` |
 | `clickhouse_url` | `http://127.0.0.1:8123` | `http://host[:port]` or `https://host[:port]` |

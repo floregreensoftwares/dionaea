@@ -13,7 +13,8 @@ workspace = true
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dionaea-artifacts = { version = "0.0.0", path = "../dionaea-artifacts" }
 dionaea-auth = { version = "0.0.0", path = "../dionaea-auth" }
 dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
 dionaea-ingest = { version = "0.0.0", path = "../dionaea-ingest" }
@@ -31,6 +32,11 @@ toml = "1.1.8"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+# `dionaea symbols upload` sends files to a server over HTTP or HTTPS from CI.
+# Cost: a blocking client and its HTTP codec, on the rustls the store already
+# uses. Invariant: the token goes in a header only, and the client is used by
+# the command line, never by the server.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }

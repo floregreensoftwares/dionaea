@@ -29,6 +29,11 @@ A request carries one of:
   site. It cannot administer anything, not even its own site, and a request for
   another site answers `404`.
 
+- **An upload token**, as `Authorization: Bearer ut_...`, issued for one site by
+  an administrator. It can upload symbol files (below) to that site and do
+  nothing else: not read a report, not list files, not see the site. A read
+  token cannot upload and an upload token cannot read.
+
 Neither passwords nor tokens are stored: a password is kept as an argon2id
 hash (19 MiB, two passes), a session or token as the SHA-256 of a random
 256-bit secret. A token is shown once, when it is issued.
@@ -85,6 +90,11 @@ refused.
 | `GET`, `POST /sites/{site}/erasures` | admin | list (`?state=`); request `{user_id}` or `{device_id}` |
 | `GET /sites/{site}/erasures/{id}` | admin | one request and what the job reported |
 | `POST /sites/{site}/erasures/{id}/retry` | admin | put a failed request back |
+| `GET`, `POST /sites/{site}/upload-tokens` | admin | list; issue `{label}`; the answer holds `token`, once |
+| `DELETE /sites/{site}/upload-tokens/{id}` | admin | revoke |
+| `GET /sites/{site}/symbols` | admin | the symbol files, `?release=` for one release, with the bytes kept and the limit |
+| `POST /sites/{site}/symbols` | admin or its upload token | `?release=&kind=&name=` and the file as the body (below) |
+| `DELETE /sites/{site}/symbols` | admin | `?release=&kind=&name=` for one file, `?release=` alone for all of a release |
 | `POST /sites/{site}/query` | viewer or its token | a report |
 
 Adding a member answers `409` when the address already has an account, so an
@@ -155,6 +165,30 @@ Every value, name and time reaches ClickHouse as a query parameter and never as
 text in a statement. Sessions are read from the session summaries, so events
 sent without a session id are not part of session figures.
 
+## Symbol files
+
+The source maps and mapping files of a release let the server turn a minified or
+obfuscated stack back into code locations. `POST /sites/{site}/symbols` takes
+the file as the request body (`application/octet-stream`) and three parameters,
+percent-encoded in the query string:
+
+| Parameter | Meaning |
+|---|---|
+| `release` | The app version as the SDK reports it, 1 to 64 characters of letters, digits and `_.+/-` |
+| `kind` | `sourcemap` (a JSON object) or `proguard` (UTF-8 text) |
+| `name` | The file's name, up to 256 characters of letters, digits and `_.+/-@`, written as a relative path without empty, `.` or `..` parts (`static/js/main.js.map`) |
+
+A file is 1 byte to 64 MiB and a site keeps at most 1 GiB; uploading the same
+`release`, `kind` and `name` again replaces the file and counts it once. The
+answer holds the size and SHA-256 that were stored. The caller is checked
+before the body is read, so only someone allowed to upload can make the server
+buffer a large body, and at most four uploads are received at once per node
+(`429 busy`). Wrong content is refused with `422 invalid_symbol_file`, a file
+past the limits with `413`.
+
+The files are kept in `artifacts_dir`. No part of a release or a name becomes
+part of a path on disk: both are hashed.
+
 ## Command line
 
 The first member and the first tokens come from the command line, which reads
@@ -169,3 +203,16 @@ dionaea token issue --site 1 --label dashboard
 dionaea token list --site 1
 dionaea token revoke --site 1 3
 ```
+
+From CI, with an upload token an administrator issued
+(`POST /sites/1/upload-tokens`), the token in the environment and never in an
+argument:
+
+```
+DIONAEA_UPLOAD_TOKEN=ut_... dionaea symbols upload --url https://dionaea.example.com \
+    --site 1 --release 1.4.2+57 --kind sourcemap --root build build/static/js/*.map
+```
+
+Each stored file is printed as its name, size and SHA-256. The exit status is 0
+when every file was stored, 1 when the server refused one and 2 when a file
+could not be read or the server could not be reached.

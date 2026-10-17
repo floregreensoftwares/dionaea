@@ -16,6 +16,17 @@ const V2: &str =
     "[events.checkout.fields.coupon]\nkind = \"enum\"\nvalues = [\"a\", \"b\"]\n[events.search]\n";
 const BREAKING: &str = "[events.checkout.fields.coupon]\nkind = \"count\"\nmax = 5\n";
 
+fn artifacts_dir() -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "dionaea-api-artifacts-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 struct World {
     api: Api,
     meta: Arc<SqliteMeta>,
@@ -46,7 +57,14 @@ fn world() -> World {
     let shop = meta.create_site(acme, "shop").expect("site").id;
     let blog = meta.create_site(acme, "blog").expect("site").id;
     let elsewhere = meta.create_site(other, "elsewhere").expect("site").id;
-    let api = Api::new(Arc::clone(&meta), auth, store, Limits::default(), || 395);
+    let api = Api::new(
+        Arc::clone(&meta),
+        auth,
+        store,
+        Limits::default(),
+        Arc::new(dionaea_artifacts::LocalArtifacts::open(artifacts_dir()).expect("artifacts")),
+        || 395,
+    );
     World {
         api,
         meta,
@@ -1092,13 +1110,13 @@ fn queries_name_the_rule_they_break() {
 fn reads_in_flight_are_bounded() {
     let counter = AtomicUsize::new(0);
     let held: Vec<_> = (0..MAX_QUERIES_IN_FLIGHT)
-        .map(|_| InFlight::acquire(&counter).expect("room"))
+        .map(|_| InFlight::acquire(&counter, MAX_QUERIES_IN_FLIGHT).expect("room"))
         .collect();
-    assert!(InFlight::acquire(&counter).is_none());
+    assert!(InFlight::acquire(&counter, MAX_QUERIES_IN_FLIGHT).is_none());
     assert_eq!(counter.load(Ordering::Relaxed), MAX_QUERIES_IN_FLIGHT);
     drop(held);
     assert_eq!(counter.load(Ordering::Relaxed), 0);
-    assert!(InFlight::acquire(&counter).is_some());
+    assert!(InFlight::acquire(&counter, MAX_QUERIES_IN_FLIGHT).is_some());
 }
 
 #[test]
@@ -1176,4 +1194,357 @@ fn a_member_who_cannot_be_given_a_role_is_not_created() {
         1,
         "created with its role"
     );
+}
+
+// Symbol files.
+
+const SOURCE_MAP: &str = r#"{"version":3,"sources":["a.js"],"mappings":"AAAA"}"#;
+
+fn upload(w: &World, caller: &Caller, site: u32, query: &str, body: &[u8]) -> ApiResponse {
+    let mut r = request("POST", &format!("sites/{site}/symbols"), caller, None);
+    r.query = Some(query.to_owned());
+    r.body = body.to_vec();
+    r.content_type = Some("application/octet-stream".to_owned());
+    w.api.respond(&r)
+}
+
+fn upload_token_for(w: &World, caller: &Caller, site: u32) -> Caller {
+    let response = w.call(
+        "POST",
+        &format!("sites/{site}/upload-tokens"),
+        caller,
+        Some(json!({ "label": "ci" })),
+    );
+    assert_eq!(response.status, 201, "{:?}", response.body);
+    Caller {
+        cookie: None,
+        bearer: response.body["token"].as_str().map(str::to_owned),
+    }
+}
+
+const ONE: &str = "release=1.4.2%2B57&kind=sourcemap&name=static%2Fjs%2Fmain.js.map";
+
+#[test]
+fn an_upload_token_uploads_symbol_files_to_its_site_and_nothing_else() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let ci = upload_token_for(&w, &admin, w.shop);
+
+    let uploaded = upload(&w, &ci, w.shop, ONE, SOURCE_MAP.as_bytes());
+    assert_eq!(uploaded.status, 201, "{:?}", uploaded.body);
+    assert_eq!(uploaded.body["release"], "1.4.2+57");
+    assert_eq!(uploaded.body["name"], "static/js/main.js.map");
+    assert_eq!(uploaded.body["size"], SOURCE_MAP.len());
+    assert_eq!(uploaded.body["sha256"].as_str().map(str::len), Some(64));
+
+    // Other sites, other permissions.
+    assert_eq!(
+        upload(&w, &ci, w.blog, ONE, SOURCE_MAP.as_bytes()).status,
+        404
+    );
+    assert_eq!(
+        upload(&w, &ci, w.elsewhere, ONE, SOURCE_MAP.as_bytes()).status,
+        404
+    );
+    let shop = w.shop;
+    for (method, path, body) in [
+        ("GET", format!("sites/{shop}"), None),
+        ("POST", format!("sites/{shop}/query"), Some(bad_query())),
+        ("GET", format!("sites/{shop}/symbols"), None),
+        ("DELETE", format!("sites/{shop}/symbols"), None),
+        ("GET", format!("sites/{shop}/keys"), None),
+        ("GET", format!("sites/{shop}/upload-tokens"), None),
+        (
+            "POST",
+            format!("sites/{shop}/upload-tokens"),
+            Some(json!({ "label": "x" })),
+        ),
+        (
+            "POST",
+            format!("sites/{shop}/tokens"),
+            Some(json!({ "label": "x" })),
+        ),
+        ("GET", "organizations".to_owned(), None),
+    ] {
+        assert_eq!(w.status(method, &path, &ci, body), 403, "{method} {path}");
+    }
+    let me = w.call("GET", "me", &ci, None);
+    assert_eq!(me.body["type"], "upload_token");
+}
+
+#[test]
+fn only_an_upload_token_or_an_admin_uploads() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let viewer = login(&w, "viewer@example.com", &[(w.acme, Role::Viewer)]);
+    let read = token_for(&w, &admin, w.shop);
+    let other_admin = login(&w, "boss@example.com", &[(w.other, Role::Admin)]);
+
+    assert_eq!(
+        upload(&w, &viewer, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        403
+    );
+    assert_eq!(
+        upload(&w, &read, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        403
+    );
+    assert_eq!(
+        upload(&w, &Caller::nobody(), w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        401
+    );
+    assert_eq!(
+        upload(&w, &other_admin, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        404
+    );
+    assert_eq!(
+        upload(&w, &admin, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        201
+    );
+
+    // A revoked upload token stops working.
+    let ci = upload_token_for(&w, &admin, w.shop);
+    assert_eq!(
+        upload(&w, &ci, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        201
+    );
+    let id = w
+        .call(
+            "GET",
+            &format!("sites/{}/upload-tokens", w.shop),
+            &admin,
+            None,
+        )
+        .body["tokens"][0]["id"]
+        .as_u64()
+        .expect("an id");
+    assert_eq!(
+        w.status(
+            "DELETE",
+            &format!("sites/{}/upload-tokens/{id}", w.blog),
+            &admin,
+            None
+        ),
+        404
+    );
+    assert_eq!(
+        w.status(
+            "DELETE",
+            &format!("sites/{}/upload-tokens/{id}", w.shop),
+            &admin,
+            None
+        ),
+        204
+    );
+    assert_eq!(
+        upload(&w, &ci, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        401
+    );
+}
+
+#[test]
+fn uploads_are_checked_before_anything_is_stored() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let good = SOURCE_MAP.as_bytes();
+    for query in [
+        "kind=sourcemap&name=a.map",
+        "release=1&name=a.map",
+        "release=1&kind=sourcemap",
+        "release=1&kind=dsym&name=a.map",
+        "release=has%20space&kind=sourcemap&name=a.map",
+        "release=1&kind=sourcemap&name=..%2F..%2Fx",
+        "release=1&kind=sourcemap&name=a%2F..%2Fb",
+        "release=1&kind=sourcemap&name=%2Fabs",
+        "release=%zz&kind=sourcemap&name=a.map",
+    ] {
+        assert_eq!(
+            upload(&w, &admin, w.shop, query, good).status,
+            400,
+            "{query}"
+        );
+    }
+    assert_eq!(upload(&w, &admin, w.shop, ONE, b"not json").status, 422);
+    assert_eq!(upload(&w, &admin, w.shop, ONE, b"[1,2]").status, 422);
+    assert_eq!(upload(&w, &admin, w.shop, ONE, b"").status, 413);
+    assert_eq!(
+        upload(
+            &w,
+            &admin,
+            w.shop,
+            "release=1&kind=proguard&name=mapping.txt",
+            b"\xff\xfe"
+        )
+        .status,
+        422
+    );
+    assert_eq!(
+        w.call("GET", &format!("sites/{}/symbols", w.shop), &admin, None)
+            .body["files"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "nothing was kept"
+    );
+}
+
+#[test]
+fn symbol_files_are_listed_replaced_counted_and_deleted() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let mapping = b"com.example.A -> a:\n    void run() -> b\n";
+    assert_eq!(
+        upload(&w, &admin, w.shop, ONE, SOURCE_MAP.as_bytes()).status,
+        201
+    );
+    assert_eq!(
+        upload(
+            &w,
+            &admin,
+            w.shop,
+            "release=1.4.2%2B57&kind=proguard&name=mapping.txt",
+            mapping
+        )
+        .status,
+        201
+    );
+    assert_eq!(
+        upload(
+            &w,
+            &admin,
+            w.shop,
+            "release=1.5.0&kind=sourcemap&name=a.map",
+            SOURCE_MAP.as_bytes()
+        )
+        .status,
+        201
+    );
+
+    let path = format!("sites/{}/symbols", w.shop);
+    let all = w.call("GET", &path, &admin, None);
+    assert_eq!(all.body["files"].as_array().map(Vec::len), Some(3));
+    assert_eq!(all.body["bytes"], SOURCE_MAP.len() * 2 + mapping.len());
+    let one_release = ApiRequest {
+        query: Some("release=1.5.0".to_owned()),
+        ..request("GET", &path, &admin, None)
+    };
+    assert_eq!(
+        w.api.respond(&one_release).body["files"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // Uploading the same file again replaces it and counts it once.
+    let bigger = format!(r#"{{"version":3,"mappings":"{}"}}"#, "A".repeat(100));
+    assert_eq!(
+        upload(&w, &admin, w.shop, ONE, bigger.as_bytes()).status,
+        201
+    );
+    let again = w.call("GET", &path, &admin, None);
+    assert_eq!(again.body["files"].as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        again.body["bytes"],
+        bigger.len() + SOURCE_MAP.len() + mapping.len()
+    );
+
+    // Another site sees none of it.
+    assert_eq!(
+        w.call("GET", &format!("sites/{}/symbols", w.blog), &admin, None)
+            .body["files"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let delete = |query: &str| {
+        let r = ApiRequest {
+            query: Some(query.to_owned()),
+            ..request("DELETE", &path, &admin, None)
+        };
+        w.api.respond(&r).status
+    };
+    assert_eq!(
+        delete("release=1.4.2%2B57&kind=proguard"),
+        400,
+        "kind without name"
+    );
+    assert_eq!(delete("release=1.4.2%2B57&kind=proguard&name=nope"), 404);
+    assert_eq!(
+        delete("release=1.4.2%2B57&kind=proguard&name=mapping.txt"),
+        204
+    );
+    assert_eq!(
+        delete("release=1.4.2%2B57&kind=proguard&name=mapping.txt"),
+        404
+    );
+    assert_eq!(delete("release=1.4.2%2B57"), 204, "the rest of the release");
+    assert_eq!(delete("release=1.4.2%2B57"), 404);
+    assert_eq!(delete(""), 400);
+    assert_eq!(
+        w.call("GET", &path, &admin, None).body["files"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn the_body_limit_is_decided_after_the_caller_is_known() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let viewer = login(&w, "viewer@example.com", &[(w.acme, Role::Viewer)]);
+    let ci = upload_token_for(&w, &admin, w.shop);
+    let ordinary = 1000;
+    let limit = |caller: &Caller, method: &str, path: &str| {
+        let mut r = request(method, path, caller, None);
+        r.content_type = Some("application/octet-stream".to_owned());
+        w.api
+            .body_limit(&r, ordinary)
+            .map_err(|refusal| refusal.status)
+    };
+    let symbols = format!("sites/{}/symbols", w.shop);
+
+    assert_eq!(limit(&ci, "POST", &symbols), Ok(symbols::MAX_SYMBOL_BYTES));
+    assert_eq!(
+        limit(&admin, "POST", &symbols),
+        Ok(symbols::MAX_SYMBOL_BYTES)
+    );
+    assert_eq!(limit(&Caller::nobody(), "POST", &symbols), Err(401));
+    assert_eq!(limit(&viewer, "POST", &symbols), Err(403));
+    assert_eq!(
+        limit(&ci, "POST", &format!("sites/{}/symbols", w.blog)),
+        Err(404)
+    );
+    // Anything else keeps the ordinary limit, whoever asks.
+    assert_eq!(
+        limit(
+            &Caller::nobody(),
+            "POST",
+            &format!("sites/{}/query", w.shop)
+        ),
+        Ok(ordinary)
+    );
+    assert_eq!(limit(&Caller::nobody(), "GET", &symbols), Ok(ordinary));
+    assert_eq!(
+        limit(&Caller::nobody(), "POST", "sites/x/symbols"),
+        Ok(ordinary)
+    );
+    // A foreign origin is refused before the body is read.
+    let mut foreign = request("POST", &symbols, &admin, None);
+    foreign.origin = Some("https://evil.example".to_owned());
+    assert_eq!(
+        w.api.body_limit(&foreign, ordinary).map_err(|r| r.status),
+        Err(403)
+    );
+}
+
+#[test]
+fn uploads_in_progress_are_bounded() {
+    let counter = AtomicUsize::new(0);
+    let held: Vec<_> = (0..symbols::MAX_UPLOADS_IN_FLIGHT)
+        .map(|_| InFlight::acquire(&counter, symbols::MAX_UPLOADS_IN_FLIGHT).expect("room"))
+        .collect();
+    assert!(InFlight::acquire(&counter, symbols::MAX_UPLOADS_IN_FLIGHT).is_none());
+    drop(held);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
 }

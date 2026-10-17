@@ -11,6 +11,7 @@ mod retention;
 mod schema_cli;
 mod server;
 mod settings;
+mod symbols_cli;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -75,6 +76,34 @@ enum Command {
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+    /// Symbol files of a release: upload them from CI
+    Symbols {
+        #[command(subcommand)]
+        command: SymbolsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SymbolsCommand {
+    /// Upload source maps or mapping files for a release; the token is read from
+    /// DIONAEA_UPLOAD_TOKEN. Prints name, size and SHA-256 of each stored file
+    Upload {
+        /// The server, such as https://dionaea.example.com (or DIONAEA_URL)
+        #[arg(long, env = "DIONAEA_URL")]
+        url: String,
+        #[arg(long)]
+        site: u32,
+        /// The app version the files belong to, as the SDK reports it
+        #[arg(long)]
+        release: String,
+        /// sourcemap or proguard
+        #[arg(long)]
+        kind: String,
+        /// Store files under their path below this directory instead of their file name
+        #[arg(long)]
+        root: Option<PathBuf>,
+        files: Vec<PathBuf>,
     },
 }
 
@@ -397,7 +426,39 @@ fn main() -> ExitCode {
         Command::Retention { command } => retention(command),
         Command::Member { command } => member(command),
         Command::Token { command } => token(command),
+        Command::Symbols { command } => symbols(command),
     }
+}
+
+fn symbols(command: SymbolsCommand) -> ExitCode {
+    let SymbolsCommand::Upload {
+        url,
+        site,
+        release,
+        kind,
+        root,
+        files,
+    } = command;
+    let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+    let Some(kind) = dionaea_meta::SymbolKind::parse(&kind) else {
+        let _ = writeln!(err, "error: the kind is sourcemap or proguard");
+        return ExitCode::from(meta_cli::UNUSABLE);
+    };
+    let Ok(token) = std::env::var("DIONAEA_UPLOAD_TOKEN") else {
+        let _ = writeln!(err, "error: set DIONAEA_UPLOAD_TOKEN to an upload token");
+        return ExitCode::from(meta_cli::UNUSABLE);
+    };
+    ExitCode::from(symbols_cli::upload(
+        &url,
+        token.trim(),
+        site,
+        &release,
+        kind,
+        root.as_deref(),
+        &files,
+        &mut out,
+        &mut err,
+    ))
 }
 
 fn hasher() -> Result<dionaea_auth::Hasher, String> {

@@ -505,7 +505,14 @@ fn build_api(config: &Config, live: Live) -> Result<Arc<HttpState>, String> {
         u64::from(limits.max_execution_secs) + 10,
     )))?;
     let tuning = live.tuning();
-    let api = Api::new(meta, auth, store, limits, move || {
+    let artifacts =
+        dionaea_artifacts::LocalArtifacts::open(&config.artifacts_dir).map_err(|e| {
+            format!(
+                "cannot use the artifacts directory {}: {e}",
+                config.artifacts_dir.display()
+            )
+        })?;
+    let api = Api::new(meta, auth, store, limits, Arc::new(artifacts), move || {
         live.tuning().retention_default_days
     });
     Ok(Arc::new(HttpState {

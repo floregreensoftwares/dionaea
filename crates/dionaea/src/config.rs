@@ -51,6 +51,8 @@ pub(crate) struct Config {
     pub(crate) spool_dir: PathBuf,
     pub(crate) spool_quota_bytes: u64,
     pub(crate) metadata_path: PathBuf,
+    /// Where uploaded symbol files are kept.
+    pub(crate) artifacts_dir: PathBuf,
     /// The secret that keys the hashes erasure keeps (empty: none), or a file
     /// that holds it. The same on every server that shares the metadata.
     pub(crate) erasure_key: Secret,
@@ -111,6 +113,7 @@ const FILE_KEYS: &[&str] = &[
     "spool_dir",
     "spool_quota_bytes",
     "metadata_path",
+    "artifacts_dir",
     "erasure_key",
     "erasure_key_file",
     "erasure_previous_keys",
@@ -137,6 +140,7 @@ struct FileConfig {
     spool_dir: Option<PathBuf>,
     spool_quota_bytes: Option<u64>,
     metadata_path: Option<PathBuf>,
+    artifacts_dir: Option<PathBuf>,
     erasure_key: Option<String>,
     erasure_key_file: Option<PathBuf>,
     erasure_previous_keys: Option<Vec<String>>,
@@ -295,6 +299,9 @@ impl Config {
         let metadata_path = source
             .path("METADATA_PATH", file.metadata_path)
             .unwrap_or_else(|| PathBuf::from("dionaea.db"));
+        let artifacts_dir = source
+            .path("ARTIFACTS_DIR", file.artifacts_dir)
+            .unwrap_or_else(|| PathBuf::from("artifacts"));
         let geoip_path = source.path("GEOIP_PATH", file.geoip_path);
 
         let (tuning, tuning_origins) = settings::resolve(&table, &source.env)?;
@@ -358,6 +365,7 @@ impl Config {
             spool_dir,
             spool_quota_bytes,
             metadata_path,
+            artifacts_dir,
             erasure_key,
             erasure_key_file,
             erasure_previous_keys,

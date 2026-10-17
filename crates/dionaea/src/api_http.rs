@@ -68,7 +68,24 @@ async fn handle(
         body: Vec::new(),
         client,
     };
-    match tokio::time::timeout(BODY_TIMEOUT, axum::body::to_bytes(body, MAX_BODY_BYTES)).await {
+    // For an upload of symbols the caller is checked before the body is read.
+    let limit = {
+        let (api, head) = (Arc::clone(&state.api), api_request.clone());
+        match tokio::task::spawn_blocking(move || api.body_limit(&head, MAX_BODY_BYTES)).await {
+            Ok(Ok(limit)) => limit,
+            Ok(Err(refusal)) => return write(refusal),
+            Err(error) => {
+                error!(%error, "an API handler failed");
+                return plain(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+        }
+    };
+    match tokio::time::timeout(
+        BODY_TIMEOUT.max(upload_time(limit)),
+        axum::body::to_bytes(body, limit),
+    )
+    .await
+    {
         Ok(Ok(bytes)) => api_request.body = bytes.to_vec(),
         Ok(Err(_)) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
         Err(_) => return plain(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
@@ -93,6 +110,12 @@ fn client_key(
 ) -> String {
     crate::collect::address_bucket(crate::collect::client_address(headers, peer, hops, header))
         .to_string()
+}
+
+/// Time allowed to send a body of up to `limit` bytes: the ordinary time, and
+/// for a large one a second per 256 KiB (a client on 2 Mbit/s).
+fn upload_time(limit: usize) -> Duration {
+    Duration::from_secs((limit / (256 << 10)) as u64)
 }
 
 fn plain(status: StatusCode, code: &str) -> Response<Body> {

@@ -26,6 +26,7 @@ mod erasure_sql;
 mod migrations;
 mod retention;
 mod sqlite;
+mod symbols;
 #[cfg(test)]
 mod tests;
 
@@ -38,6 +39,10 @@ pub use erasure::{
     MAX_KEY_LEN, MIN_KEY_LEN, TombstoneBatch, Tombstones,
 };
 pub use sqlite::SqliteMeta;
+pub use symbols::{
+    MAX_RELEASE_CHARS, MAX_SYMBOL_NAME_CHARS, SymbolFile, SymbolIndex, SymbolKind, is_release,
+    is_symbol_name,
+};
 
 /// Most origins one write key may allow.
 pub const MAX_ORIGINS: usize = 32;

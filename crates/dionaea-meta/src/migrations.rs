@@ -222,4 +222,34 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         CREATE INDEX read_tokens_by_site ON read_tokens (site_id);
     ",
     },
+    Migration {
+        version: 10,
+        name: "upload_tokens_and_symbol_files",
+        sql: "
+        -- A token that can only upload symbol files for one site; kept apart
+        -- from read tokens so that one kind can never be looked up as the other.
+        CREATE TABLE upload_tokens (
+            id         INTEGER PRIMARY KEY,
+            site_id    INTEGER NOT NULL REFERENCES sites(id),
+            label      TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_by INTEGER REFERENCES members(id),
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE INDEX upload_tokens_by_site ON upload_tokens (site_id);
+        -- What was uploaded for which release. The bytes are in the artifact
+        -- store; this says what exists.
+        CREATE TABLE symbol_files (
+            site_id     INTEGER NOT NULL REFERENCES sites(id),
+            release     TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN ('sourcemap', 'proguard')),
+            name        TEXT NOT NULL,
+            size        INTEGER NOT NULL CHECK (size >= 0),
+            sha256      TEXT NOT NULL,
+            uploaded_at INTEGER NOT NULL,
+            PRIMARY KEY (site_id, release, kind, name)
+        );
+    ",
+    },
 ];

@@ -30,7 +30,9 @@ pub use cookie::{COOKIE_NAME, clear_cookie, from_header as cookie_from_header, s
 pub use limiter::LoginLimiter;
 pub use password::{Hasher, MAX_PASSWORD_CHARS, MIN_PASSWORD_CHARS, check_policy};
 pub use policy::{Permission, allows};
-pub use secret::{READ_TOKEN_PREFIX, SESSION_PREFIX, Secret, generate, has_shape, hash};
+pub use secret::{
+    READ_TOKEN_PREFIX, SESSION_PREFIX, Secret, UPLOAD_TOKEN_PREFIX, generate, has_shape, hash,
+};
 
 #[derive(Debug)]
 pub enum AuthError {
@@ -122,6 +124,8 @@ pub enum Principal {
         memberships: Vec<dionaea_meta::Membership>,
     },
     ReadToken(ReadTokenInfo),
+    /// A token that may only upload symbol files to one site.
+    UploadToken(ReadTokenInfo),
 }
 
 /// The caller may not do that.
@@ -151,13 +155,20 @@ impl Principal {
                     Err(Denied)
                 }
             }
+            Self::UploadToken(token) => {
+                if permission == Permission::Upload && scope.site_id == Some(token.site_id) {
+                    Ok(())
+                } else {
+                    Err(Denied)
+                }
+            }
         }
     }
 
     pub fn member(&self) -> Option<&Member> {
         match self {
             Self::Member { member, .. } => Some(member),
-            Self::ReadToken(_) => None,
+            Self::ReadToken(_) | Self::UploadToken(_) => None,
         }
     }
 
@@ -166,6 +177,7 @@ impl Principal {
         match self {
             Self::Member { member, .. } => member.email.clone(),
             Self::ReadToken(token) => format!("read-token:{}", token.id),
+            Self::UploadToken(token) => format!("upload-token:{}", token.id),
         }
     }
 }
@@ -400,6 +412,32 @@ impl Auth {
             .map(Principal::ReadToken))
     }
 
+    /// The caller behind an upload token.
+    pub fn authenticate_upload_token(&self, secret: &str) -> Result<Option<Principal>, AuthError> {
+        if !has_shape(UPLOAD_TOKEN_PREFIX, secret) {
+            return Ok(None);
+        }
+        Ok(self
+            .accounts
+            .upload_token(&hash(secret))?
+            .map(Principal::UploadToken))
+    }
+
+    /// Makes an upload token for a site. The secret in the result is the only
+    /// time it exists in the clear.
+    pub fn issue_upload_token(
+        &self,
+        site_id: u32,
+        label: &str,
+        created_by: Option<u32>,
+    ) -> Result<(ReadTokenInfo, String), AuthError> {
+        let secret = generate(UPLOAD_TOKEN_PREFIX)?;
+        let info = self
+            .accounts
+            .issue_upload_token(site_id, label, &secret.hash, created_by)?;
+        Ok((info, secret.value))
+    }
+
     /// Ends a session. A secret that is not one is ignored.
     pub fn logout(&self, secret: &str) -> Result<(), AuthError> {
         if has_shape(SESSION_PREFIX, secret) {
@@ -443,7 +481,7 @@ impl Auth {
                 .iter()
                 .find(|m| m.organization_id == organization_id)
                 .map(|m| m.role),
-            Principal::ReadToken(_) => None,
+            Principal::ReadToken(_) | Principal::UploadToken(_) => None,
         }
     }
 }
