@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use dionaea_meta::{HashKey, SqliteMeta};
+use dionaea_store::{Store, TlsConfig};
 use serde::Deserialize;
 
 use crate::settings::{self, Origin, Tuning};
@@ -368,6 +369,28 @@ impl Config {
                     .map_err(|e| format!("previous erasure key number {}: {e}", index + 1))
             })
             .collect()
+    }
+
+    /// A handle to ClickHouse as configured.
+    pub(crate) fn clickhouse_store(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Store, String> {
+        let endpoint = clickhouse_endpoint(&self.clickhouse_url)?;
+        let mut config =
+            dionaea_store::Config::new(&endpoint.host, endpoint.port, &self.clickhouse_database);
+        config.user.clone_from(&self.clickhouse_user);
+        config.password.clone_from(&self.clickhouse_password.0);
+        if endpoint.tls {
+            config.tls = Some(TlsConfig {
+                ca_file: self.clickhouse_ca_file.clone(),
+                server_name: self.clickhouse_server_name.clone(),
+            });
+        }
+        if let Some(timeout) = timeout {
+            config.timeout = timeout;
+        }
+        Store::new(config).map_err(|e| format!("clickhouse settings: {e}"))
     }
 
     /// Opens the metadata store with the erasure keys, if there are any.

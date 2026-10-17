@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
-use dionaea_store::{AliasRow, Config, DropRow, Error, EventRow, Store, TraitsRow};
+use dionaea_store::{AliasRow, Config, DropRow, Error, EventRow, Expired, Store, TraitsRow};
 use serde_json::Value;
 
 fn server() -> (String, u16, String, String) {
@@ -567,7 +567,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 4);
+    assert_eq!(count(&scratch.store, "_migrations"), 5);
 }
 
 #[test]
@@ -1429,4 +1429,182 @@ fn erasing_a_device_removes_its_sessions_too() {
         "a2",
         "and nothing of a1 is left on disk"
     );
+}
+
+// Retention.
+
+fn at(day: &str) -> u64 {
+    // Midnight UTC of a day in 2025, in milliseconds.
+    let days: u64 = match day {
+        "08-01" => 20_301,
+        "09-10" => 20_341,
+        "09-20" => 20_351,
+        "10-01" => 20_362,
+        "10-15" => 20_376,
+        "10-20" => 20_381,
+        "11-01" => 20_393,
+        other => panic!("no such day {other}"),
+    };
+    days * 86_400_000
+}
+
+fn dated(n: u64, site: u32, session: &str, day: &str) -> EventRow {
+    let mut row = session_event(n, session, "a1", "/home", at(day));
+    row.site_id = site;
+    row.received_ms = now_ms();
+    row
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn each_site_loses_only_what_is_older_than_its_own_cutoff() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                dated(1, 7, "s1", "08-01"),
+                dated(2, 7, "s2", "10-01"),
+                dated(3, 7, "s3", "11-01"),
+                dated(4, 8, "s4", "08-01"),
+                dated(5, 8, "s5", "09-20"),
+                dated(6, 8, "s6", "10-20"),
+            ],
+            "retention",
+        )
+        .expect("events");
+    assert_eq!(count(store, "events"), 6);
+    assert_eq!(count(store, "sessions"), 6);
+
+    // Site 7 keeps data from the 15th of October, site 8 from the 10th of
+    // September.
+    let seven = store.expire_analytics(7, at("10-15")).expect("site 7");
+    assert_eq!(
+        seven,
+        vec![
+            Expired {
+                table: "events",
+                rows: 2
+            },
+            Expired {
+                table: "sessions",
+                rows: 2
+            }
+        ]
+    );
+    let eight = store.expire_analytics(8, at("09-10")).expect("site 8");
+    assert_eq!(
+        eight[0],
+        Expired {
+            table: "events",
+            rows: 1
+        }
+    );
+    assert_eq!(
+        store.expire_analytics(8, at("09-10")).expect("again")[0].rows,
+        0,
+        "a second run finds nothing"
+    );
+    assert_eq!(count(store, "events"), 3, "queries see what is kept");
+
+    // The oldest cutoff drops whole months; the newest tells what to rewrite.
+    let dropped = store.drop_expired_partitions(at("09-10")).expect("drop");
+    assert!(
+        dropped.contains(&("events", 202_508)) && dropped.contains(&("sessions", 202_508)),
+        "{dropped:?}"
+    );
+    assert!(
+        dropped.iter().all(|(_, partition)| *partition == 202_508),
+        "{dropped:?}"
+    );
+    let rewritten = store.rewrite_expired(at("10-15")).expect("rewrite");
+    assert!(
+        rewritten
+            .iter()
+            .all(|r| matches!(r.partition, Some(202_509 | 202_510))),
+        "{rewritten:?}"
+    );
+
+    // Nothing that expired is left on disk, and what is kept is all there.
+    let physical = |table: &str| -> u64 {
+        store
+            .raw_query(&format!(
+                "SELECT count() FROM {table} SETTINGS apply_deleted_mask = 0"
+            ))
+            .expect("count")
+            .trim()
+            .parse()
+            .expect("number")
+    };
+    assert_eq!(physical("events"), 3);
+    assert_eq!(physical("sessions"), 3);
+    assert_eq!(
+        store
+            .raw_query("SELECT site_id, toString(toDate(ts)) FROM events ORDER BY site_id, ts FORMAT TabSeparated")
+            .expect("kept")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["7\t2025-11-01", "8\t2025-09-20", "8\t2025-10-20"]
+    );
+    assert!(
+        store
+            .rewrite_expired(at("10-15"))
+            .expect("again")
+            .is_empty(),
+        "nothing left to rewrite"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_site_with_nothing_old_loses_nothing_and_a_partition_someone_keeps_is_not_dropped() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[dated(1, 7, "s1", "09-20"), dated(2, 8, "s2", "09-20")],
+            "keep",
+        )
+        .expect("events");
+    let nothing = store.expire_analytics(7, at("08-01")).expect("expire");
+    assert!(nothing.iter().all(|e| e.rows == 0));
+    // The month of September is not over before the cutoff of the 10th.
+    assert!(
+        store
+            .drop_expired_partitions(at("09-10"))
+            .expect("drop")
+            .is_empty()
+    );
+    assert_eq!(count(store, "events"), 2);
+    // Dropping with a cutoff after the month removes it for everyone.
+    let dropped = store.drop_expired_partitions(at("10-15")).expect("drop");
+    assert!(dropped.contains(&("events", 202_509)), "{dropped:?}");
+    assert_eq!(count(store, "events"), 0);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn events_no_longer_expire_by_a_rule_of_the_table_itself() {
+    let scratch = Scratch::new();
+    let ddl = scratch
+        .store
+        .raw_query("SHOW CREATE TABLE events")
+        .expect("ddl");
+    assert!(
+        ddl.contains("INTERVAL 60 YEAR") || ddl.contains("toIntervalYear(60)"),
+        "{ddl}"
+    );
+    assert!(
+        !ddl.contains("13 MONTH") && !ddl.contains("toIntervalMonth(13)"),
+        "{ddl}"
+    );
+    // An event as old as the first one is not removed by a merge.
+    let mut row = dated(1, 7, "s1", "08-01");
+    row.ts_ms = 1_000_000_000_000; // 2001
+    scratch.store.insert_events(&[row], "old").expect("insert");
+    scratch
+        .store
+        .raw_query("OPTIMIZE TABLE events FINAL")
+        .expect("merge");
+    assert_eq!(count(&scratch.store, "events"), 1);
 }

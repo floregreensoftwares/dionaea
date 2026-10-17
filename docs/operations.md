@@ -71,6 +71,8 @@ the status listed in `wire-format.md`.
 | `erase_finish_after_secs` | 86400 | 0 to 604800 | How long an erased user stays hidden before the rows are physically removed, so a day of requests share one rewrite |
 | `erase_max_attempts` | 10 | 1 to 100 | How many times in a row an erasure step may meet trouble that retrying could fix before the request fails |
 | `erase_failed_keep_days` | 30 | 1 to 3650 | How long a failed erasure request keeps the user id and devices in the clear so that it can be retried; after that they are forgotten |
+| `retention_default_days` | 395 | 1 to 3650 | How long a site keeps its analytics data unless it has its own number |
+| `retention_interval_secs` | 86400 | 60 to 604800 | How often old data is removed |
 
 ## Changing limits while the server runs
 
@@ -260,3 +262,24 @@ A session with one event is a bounce. Events sent without a session id (plain HT
 The view runs with the rights of the user that migrated, so the ingest user, which may only insert into `events`, needs nothing else. `sessions` holds the device id and is one of the tables erasure covers.
 
 Not covered: events stored before the sessions migration ran are not summarized (the migration does not backfill, since a backfill would count events twice when events arrive meanwhile), and the worst error kind of a session arrives with the error events.
+
+## Retention
+
+Every site keeps its analytics data (events and the sessions summarized from them) for `retention_default_days`, 395 by default (13 months), unless it has a number of its own:
+
+```
+dionaea retention set --site 1 --days 90
+dionaea retention unset --site 1
+dionaea retention list
+dionaea retention preview
+```
+
+`list` prints, for each site, the family (`analytics`), the days and whether the number is the site's own or the default. `preview` counts, per site and table, the rows the next run would remove at the retention each site has now, and deletes nothing: use it before lowering a number, because a run cannot be undone. Setting a number deletes nothing by itself: the retention job applies it at its next run, once per `retention_interval_secs` (a day). One server takes each run, whichever finds it unclaimed in the metadata store, so any number of servers can run.
+
+A run works in three steps. Each site's rows older than its cutoff are deleted with a lightweight delete, which hides them from queries at once. A month of `events` or `sessions` that is entirely older than the cutoff of the site that keeps data the longest is dropped whole, which costs nothing. The months older than the newest cutoff that still hold deleted rows are rewritten, so the data leaves the disk. A run that fails (ClickHouse down, a timeout) is tried again 15 minutes later and not after a whole interval; `dionaea_retention_failing` is 1 until one succeeds.
+
+Metrics: `dionaea_retention_runs_total`, `_failures_total`, `_rows_expired_total`, `_partitions_dropped_total`, `_partitions_rewritten_total`, `dionaea_retention_failing` and `dionaea_retention_last_success_timestamp_seconds` (alert when it is older than a few intervals).
+
+The `events` table used to carry a rule of its own, 13 months for every site. A migration replaces it with one that cannot fire in the life of the product (60 years), so a site can keep its data longer than 13 months; it applies to databases made before as well. The links and traits of identified users (`identity_alias`, `user_traits`) have no age: they are removed by erasure. Raw errors and measurements will have a family of their own when they exist.
+
+Not covered: a site that is deleted from the metadata store keeps its rows until a month holding only them falls out of every remaining site's cutoff; and the data of two sites that share a month is never dropped whole before the site that keeps longer is done with it, only deleted row by row.

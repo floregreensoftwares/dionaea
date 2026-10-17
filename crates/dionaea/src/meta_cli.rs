@@ -14,6 +14,7 @@ use std::io::Write;
 use dionaea_core::Severity;
 use dionaea_meta::{
     ErasureRequest, ErasureState, ErasureSubject, MetaError, MetaStore, Organization,
+    RetentionFamily,
 };
 
 use crate::settings::{self, Origin, Tuning};
@@ -416,6 +417,111 @@ pub(crate) fn settings_unset(
     }
 }
 
+/// Sets how long a site keeps its analytics data, or with `None` goes back to
+/// the default. The retention job applies it at its next run.
+pub(crate) fn retention_set(
+    store: &dyn MetaStore,
+    site_id: u32,
+    days: Option<u32>,
+    err: &mut impl Write,
+) -> u8 {
+    match store.set_retention(site_id, RetentionFamily::Analytics, days) {
+        Ok(()) => OK,
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// What a run of the retention job would remove now, per site and table, at
+/// the retention each site has: nothing is deleted. A site's row is
+/// `site, table, rows older than the cutoff, the cutoff as a day`.
+pub(crate) fn retention_preview(
+    store: &dyn MetaStore,
+    clickhouse: &dyn Fn(u32, u64) -> Result<Vec<(&'static str, u64)>, String>,
+    default_days: u32,
+    now_ms: u64,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    let result = store
+        .sites()
+        .and_then(|sites| Ok((sites, store.retentions()?)));
+    let (sites, own) = match result {
+        Ok(found) => found,
+        Err(error) => return report(&error, "", err),
+    };
+    for site in sites {
+        let days = own
+            .iter()
+            .find(|r| r.site_id == site.id && r.family == RetentionFamily::Analytics)
+            .map_or(default_days, |r| r.days);
+        let cutoff = now_ms.saturating_sub(u64::from(days) * 86_400_000);
+        match clickhouse(site.id, cutoff) {
+            Ok(counts) => {
+                for (table, rows) in counts {
+                    let _ = writeln!(out, "{}\t{table}\t{rows}\t{days}", site.id);
+                }
+            }
+            Err(message) => {
+                let _ = writeln!(err, "error: {message}");
+                return UNUSABLE;
+            }
+        }
+    }
+    OK
+}
+
+/// The retention default in force, which a stored setting may have changed.
+pub(crate) fn retention_default_days(
+    store: &dyn MetaStore,
+    base: &Tuning,
+    origins: &BTreeMap<&'static str, Origin>,
+    now_ms: i64,
+) -> Option<u32> {
+    rows(store, base, origins, now_ms)
+        .ok()?
+        .iter()
+        .find(|row| row.spec.name == "retention_default_days")
+        .and_then(|row| row.value.parse().ok())
+}
+
+/// Lists every site's retention as: site, family, days, and `site` when the
+/// site has its own number or `default` when it follows the default.
+pub(crate) fn retention_list(
+    store: &dyn MetaStore,
+    base: &Tuning,
+    origins: &BTreeMap<&'static str, Origin>,
+    now_ms: i64,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    let result = rows(store, base, origins, now_ms).and_then(|rows| {
+        let default = rows
+            .iter()
+            .find(|row| row.spec.name == "retention_default_days")
+            .and_then(|row| row.value.parse::<u32>().ok())
+            .ok_or_else(|| MetaError::Corrupt("no default retention".to_owned()))?;
+        Ok((default, store.sites()?, store.retentions()?))
+    });
+    match result {
+        Ok((default, sites, own)) => {
+            for site in sites {
+                let (days, from) = own
+                    .iter()
+                    .find(|r| r.site_id == site.id && r.family == RetentionFamily::Analytics)
+                    .map_or((default, "default"), |r| (r.days, "site"));
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\t{days}\t{from}",
+                    site.id,
+                    RetentionFamily::Analytics.as_str()
+                );
+            }
+            OK
+        }
+        Err(error) => report(&error, "", err),
+    }
+}
+
 fn erasure_line(request: &ErasureRequest) -> String {
     let time = |value: Option<i64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
     format!(
@@ -682,5 +788,67 @@ mod tests {
         assert_eq!(code, OK);
         let (_, versions, _) = run(|o, e| schema_versions(&store, 1, o, e));
         assert_eq!(versions, "1\tretired\n2\tactive\n");
+    }
+
+    #[test]
+    fn the_preview_asks_for_each_site_at_its_own_cutoff_and_deletes_nothing() {
+        let store = store();
+        let organization = store.create_organization("o").unwrap();
+        let first = store.create_site(organization.id, "a").unwrap();
+        let second = store.create_site(organization.id, "b").unwrap();
+        store
+            .set_retention(second.id, RetentionFamily::Analytics, Some(10))
+            .unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let now = 100 * 86_400_000;
+        let (code, out, err) = run(|out, err| {
+            retention_preview(
+                &store,
+                &|site, cutoff| {
+                    asked.borrow_mut().push((site, cutoff));
+                    Ok(vec![("events", u64::from(site) * 5), ("sessions", 1)])
+                },
+                30,
+                now,
+                out,
+                err,
+            )
+        });
+        assert_eq!((code, err.as_str()), (OK, ""));
+        assert_eq!(
+            *asked.borrow(),
+            vec![(first.id, 70 * 86_400_000), (second.id, 90 * 86_400_000)]
+        );
+        assert_eq!(
+            out,
+            format!(
+                "{a}	events	5	30
+{a}	sessions	1	30
+{b}	events	10	10
+{b}	sessions	1	10
+",
+                a = first.id,
+                b = second.id
+            )
+        );
+    }
+
+    #[test]
+    fn a_preview_that_cannot_reach_clickhouse_says_so_and_exits_with_the_unusable_code() {
+        let store = store();
+        let organization = store.create_organization("o").unwrap();
+        store.create_site(organization.id, "a").unwrap();
+        let (code, out, err) = run(|out, err| {
+            retention_preview(
+                &store,
+                &|_, _| Err("cannot count in ClickHouse: down".to_owned()),
+                30,
+                0,
+                out,
+                err,
+            )
+        });
+        assert_eq!((code, out.as_str()), (UNUSABLE, ""));
+        assert!(err.contains("down"), "{err}");
     }
 }

@@ -2298,3 +2298,91 @@ fn a_device_that_never_identified_can_be_erased_by_its_id() {
         202
     );
 }
+
+/// Each site loses only what is older than its own number of days, once the
+/// job has run, and says so in the metrics.
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_retention_job_removes_a_sites_old_events_and_keeps_the_others() {
+    let database = ScratchDatabase::new("retention");
+    let dir = dir("retention");
+    let cli = |args: &[&str]| {
+        let output = in_clickhouse(&dir, &database.name)
+            .args(args)
+            .output()
+            .expect("run the binary");
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    cli(&["site", "create", "shop"]);
+    cli(&["site", "create", "blog"]);
+    cli(&["retention", "set", "--site", "1", "--days", "30"]);
+
+    // Events of 100 days ago and of yesterday, for both sites, stored before
+    // the server starts so that its first run finds them.
+    let admin = ScratchDatabase::store(&database.name);
+    admin.migrate().expect("tables");
+    let insert = |site: u32, n: u32, days_ago: u32| {
+        admin
+            .raw_query(&format!(
+                "INSERT INTO events (site_id, event_id, ts, received_at, name, schema_version,
+                    anon_id, session_id, screen, country, platform, os, browser, device_class,
+                    app_version, sdk)
+                 VALUES ({site}, generateUUIDv4(), now64(3) - INTERVAL {days_ago} DAY, now64(3),
+                    'e{n}', 1, 'a{n}', 's{n}', '/', '', '', '', '', '', '', 't/1')"
+            ))
+            .expect("insert");
+    };
+    insert(1, 1, 100);
+    insert(1, 2, 1);
+    insert(2, 3, 100);
+    insert(2, 4, 1);
+    assert_eq!(database.number("SELECT count() FROM events"), 4);
+
+    // The preview says what the first run will do, and deletes nothing.
+    let preview = cli(&["retention", "preview"]);
+    assert_eq!(
+        preview.lines().collect::<Vec<_>>(),
+        vec![
+            "1	events	1	30",
+            "1	sessions	1	30",
+            "2	events	0	395",
+            "2	sessions	0	395"
+        ],
+        "{preview}"
+    );
+    assert_eq!(database.number("SELECT count() FROM events"), 4);
+
+    let mut command = in_clickhouse(&dir, &database.name);
+    command.env("DIONAEA_RETENTION_INTERVAL_SECS", "60");
+    let server = Server::start_with(command);
+
+    eventually("the first run", 120, || {
+        metric(
+            &server.ops("/metrics").1,
+            "dionaea_retention_rows_expired_total",
+        ) >= 1
+    });
+    // Site 1 keeps 30 days: its 100-day-old event went. Site 2 keeps the
+    // default of 395: nothing of it did.
+    assert_eq!(
+        database.text(
+            "SELECT groupArray(toString(site_id) || ':' || name) FROM
+             (SELECT site_id, name FROM events ORDER BY site_id, name)"
+        ),
+        "['1:e2','2:e3','2:e4']"
+    );
+    // The run ends after it has removed the rows (it drops and rewrites
+    // months last), so its success is waited for.
+    eventually("the run to finish", 60, || {
+        metric(
+            &server.ops("/metrics").1,
+            "dionaea_retention_last_success_timestamp_seconds ",
+        ) > 0
+    });
+    let metrics = server.ops("/metrics").1;
+    assert_eq!(metric(&metrics, "dionaea_retention_failing "), 0);
+    assert!(metric(&metrics, "dionaea_retention_runs_total ") >= 1);
+    // The sessions of the removed event went with it.
+    assert_eq!(database.number("SELECT count() FROM sessions"), 3);
+}

@@ -19,6 +19,7 @@
 mod erase;
 mod http;
 mod migrations;
+mod retention;
 mod rows;
 mod time;
 
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use erase::{IDENTIFIER_TABLES, IdentifierTable, Rewrite, TableCount};
+pub use retention::Expired;
 pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key};
 
 /// Most rows one insert call accepts.

@@ -161,4 +161,22 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         ALTER TABLE erasure_requests ADD COLUMN is_device INTEGER NOT NULL DEFAULT 0;
     ",
     },
+    Migration {
+        version: 8,
+        name: "retention",
+        sql: "
+        -- How long a site keeps each family of data, when it differs from the
+        -- default; and when each scheduled job last started.
+        CREATE TABLE site_retention (
+            site_id INTEGER NOT NULL REFERENCES sites(id),
+            family  TEXT NOT NULL CHECK (family IN ('analytics')),
+            days    INTEGER NOT NULL CHECK (days BETWEEN 1 AND 3650),
+            PRIMARY KEY (site_id, family)
+        );
+        CREATE TABLE job_runs (
+            name     TEXT PRIMARY KEY,
+            last_run INTEGER NOT NULL
+        );
+    ",
+    },
 ];

@@ -21,6 +21,7 @@ use dionaea_core::{Change, Diagnostic, Schema};
 mod erasure;
 mod erasure_sql;
 mod migrations;
+mod retention;
 mod sqlite;
 #[cfg(test)]
 mod tests;
@@ -79,6 +80,41 @@ pub struct Published {
     pub version: u32,
     /// What changed against the previous active version; empty for the first.
     pub changes: Vec<Change>,
+}
+
+/// The families of data that have a retention of their own. Raw errors and
+/// measurements will be another, shorter one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RetentionFamily {
+    /// Events and the sessions summarized from them.
+    Analytics,
+}
+
+impl RetentionFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Analytics => "analytics",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "analytics" => Some(Self::Analytics),
+            _ => None,
+        }
+    }
+}
+
+/// Shortest and longest retention, in days.
+pub const MIN_RETENTION_DAYS: u32 = 1;
+pub const MAX_RETENTION_DAYS: u32 = 3650;
+
+/// A site's retention for a family, when it is not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    pub site_id: u32,
+    pub family: RetentionFamily,
+    pub days: u32,
 }
 
 /// A live write key: what the ingest path needs to admit a request.
@@ -301,6 +337,36 @@ pub trait MetaStore: Send + Sync {
 
     /// Puts a failed request back to `requested`.
     fn retry_erasure(&self, id: u64) -> Result<ErasureRequest, MetaError>;
+
+    /// Sets how long the site keeps a family of data, or with `None` goes back
+    /// to the default. Nothing is deleted by this call: the retention job
+    /// applies it.
+    fn set_retention(
+        &self,
+        site_id: u32,
+        family: RetentionFamily,
+        days: Option<u32>,
+    ) -> Result<(), MetaError>;
+
+    /// Every site's retention that differs from the default.
+    fn retentions(&self) -> Result<Vec<Retention>, MetaError>;
+
+    /// Whether the scheduled job `name` is due, that is, it did not start in
+    /// the last `every_secs`. When it is, the run is recorded as started, so
+    /// only one server takes it.
+    fn claim_run(&self, name: &str, every_secs: i64) -> Result<bool, MetaError>;
+
+    /// A run that failed becomes due again after `retry_in_secs` rather than
+    /// after the whole `every_secs`.
+    fn postpone_run(
+        &self,
+        name: &str,
+        every_secs: i64,
+        retry_in_secs: i64,
+    ) -> Result<(), MetaError>;
+
+    /// When the scheduled job `name` last started (seconds since the epoch).
+    fn last_run(&self, name: &str) -> Result<Option<i64>, MetaError>;
 
     /// The keys that key the tombstone hashes: the one new tombstones use and
     /// the earlier ones older tombstones were made with.
