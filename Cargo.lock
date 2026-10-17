@@ -585,6 +585,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dionaea-query"
+version = "0.0.0"
+dependencies = [
+ "dionaea-core",
+ "dionaea-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dionaea-spool"
 version = "0.0.0"
 dependencies = [

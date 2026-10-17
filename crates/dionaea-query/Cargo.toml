@@ -1,0 +1,21 @@
+[package]
+name = "dionaea-query"
+description = "Typed report queries for Dionaea, validated against the site schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
+dionaea-store = { version = "0.0.0", path = "../dionaea-store" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
