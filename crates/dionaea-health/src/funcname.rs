@@ -31,20 +31,25 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-/// The byte offset of 1-based `line` and `column` (counted in characters).
+/// The byte offset of 1-based `line` and `column`, the column counted in
+/// UTF-16 code units as source maps and JavaScript engines count it. A column
+/// past the end of the line is the end of the line.
 fn offset_of(text: &str, line: u32, column: u32) -> Option<usize> {
     let mut start = 0;
     for _ in 1..line {
         start += text[start..].find('\n')? + 1;
     }
     let rest = &text[start..];
-    let mut chars = rest.char_indices();
+    let line_end = rest.find('\n').unwrap_or(rest.len());
+    let mut units = 0u32;
+    let wanted = column.saturating_sub(1);
     let mut at = 0;
-    for _ in 1..column {
-        match chars.next() {
-            Some((i, c)) => at = i + c.len_utf8(),
-            None => break,
+    for (i, c) in rest[..line_end].char_indices() {
+        if units >= wanted {
+            break;
         }
+        units += u32::try_from(c.len_utf16()).unwrap_or(2);
+        at = i + c.len_utf8();
     }
     Some(start + at)
 }
@@ -221,6 +226,25 @@ mod tests {
         assert_eq!(enclosing_function(SOURCE, 999, 1), None);
         assert_eq!(enclosing_function(SOURCE, 0, 0), None);
         assert_eq!(enclosing_function("", 1, 1), None);
+    }
+
+    #[test]
+    fn the_column_counts_utf16_units_and_stops_at_the_end_of_the_line() {
+        // `}` is at UTF-16 column 13: the emoji takes two units, one character.
+        let text = "function f() {\n  x = \"\u{1f600}\"; }\nfoo();\n";
+        assert_eq!(enclosing_function(text, 2, 13).as_deref(), Some("f"));
+        // A column past the end of the line does not reach the next line.
+        assert_eq!(
+            enclosing_function(text, 2, 9999).as_deref(),
+            None,
+            "after the closing brace"
+        );
+        assert_eq!(
+            enclosing_function("function f() {\n}\nfoo", 1, 999).as_deref(),
+            Some("f")
+        );
+        assert_eq!(offset_of("ab\ncd", 1, 99), Some(2));
+        assert_eq!(offset_of("\u{1f600}x", 1, 3), Some(4), "two units, then x");
     }
 
     #[test]

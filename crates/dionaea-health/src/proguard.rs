@@ -223,8 +223,8 @@ impl ProguardMap {
             // methods that have no range, or the only method of that name.
             let mut unranged = candidates.iter().filter(|m| m.obf_range.is_none());
             if let Some(m) = unranged.next() {
-                found.push(self.frame(class, m, 0, 0));
-                found.extend(unranged.map(|m| self.frame(class, m, 0, 0)));
+                found.push(self.frame(class, m, line, 0));
+                found.extend(unranged.map(|m| self.frame(class, m, line, 0)));
             } else if line == 0 && candidates.len() == 1 {
                 found.push(self.frame(class, &candidates[0], 0, 0));
             }
@@ -234,11 +234,13 @@ impl ProguardMap {
 
     fn frame(&self, class: &Class, m: &Method, line: u32, obf_start: u32) -> Retraced {
         let original_line = match m.original_range {
-            Some((start, end)) if line > 0 => {
+            Some((start, end)) if line > 0 && m.obf_range.is_some() => {
                 start.saturating_add(line - obf_start).min(end.max(start))
             }
             Some((start, _)) => start,
-            None => 0,
+            // The mapping keeps no line numbers for this method: the stack's
+            // own line is the original one.
+            None => line,
         };
         Retraced {
             class: m.class.clone().unwrap_or_else(|| class.original.clone()),
@@ -369,13 +371,14 @@ com.example.Plain -> com.example.Plain:
     #[test]
     fn a_method_without_lines_matches_any_line_or_none() {
         assert_eq!(at("a.a", "c", 0), vec![t("com.example.Cart", "noLines", 0)]);
+        // No line mapping for the method: the stack's own line is kept.
         assert_eq!(
             at("a.a", "c", 77),
-            vec![t("com.example.Cart", "noLines", 0)]
+            vec![t("com.example.Cart", "noLines", 77)]
         );
         assert_eq!(
             at("com.example.Plain", "run", 3),
-            vec![t("com.example.Plain", "run", 0)]
+            vec![t("com.example.Plain", "run", 3)]
         );
     }
 
