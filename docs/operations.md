@@ -244,3 +244,19 @@ The job's own metrics: `dionaea_erasure_requests{state}` (requests by state), `d
 Requests are for one subject: `--user` or `--anon`, not both.
 
 Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `sessions`, `errors` and `measurements`, which do not exist yet and will join the list of identifier tables a test enforces.
+
+## Sessions
+
+The SDK generates the session id and sends it with every event. A materialized view (`sessions_mv`) summarizes the events that carry one into the `sessions` table as they are inserted: first and last event time, how many events, the entry and exit screen, how many distinct screens, and the platform, app version and country of the first event. Rows of one session that arrive in separate inserts are merged in the background and, until then, read with `GROUP BY`:
+
+```sql
+SELECT session_id, anon_id, min(first_ts), max(last_ts), sum(events),
+       argMinMerge(entry_screen), argMaxMerge(exit_screen), uniqMerge(screens)
+FROM sessions GROUP BY site_id, session_id, anon_id
+```
+
+A session with one event is a bounce. Events sent without a session id (plain HTTP integrations) are not in the table; the view `derived_sessions` groups them per device at query time with the 30 minute inactivity rule (a gap of more than 30 minutes starts a new session), with `session_number` counting a device's sessions in order.
+
+The view runs with the rights of the user that migrated, so the ingest user, which may only insert into `events`, needs nothing else. `sessions` holds the device id and is one of the tables erasure covers.
+
+Not covered: events stored before the sessions migration ran are not summarized (the migration does not backfill, since a backfill would count events twice when events arrive meanwhile), and the worst error kind of a session arrives with the error events.

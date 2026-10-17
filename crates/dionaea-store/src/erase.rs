@@ -28,7 +28,8 @@ pub struct IdentifierTable {
     pub partition: Option<&'static str>,
 }
 
-/// Every table that holds an anonymous id, a user id or a session id. All of
+/// Every table that holds an anonymous id, a user id or a session id. Views
+/// store nothing and are not listed. All of
 /// them have a `site_id` column.
 pub const IDENTIFIER_TABLES: &[IdentifierTable] = &[
     IdentifierTable {
@@ -48,6 +49,12 @@ pub const IDENTIFIER_TABLES: &[IdentifierTable] = &[
         anon_column: None,
         user_column: Some("user_id"),
         partition: None,
+    },
+    IdentifierTable {
+        name: "sessions",
+        anon_column: Some("anon_id"),
+        user_column: None,
+        partition: Some("toYYYYMM(started)"),
     },
 ];
 

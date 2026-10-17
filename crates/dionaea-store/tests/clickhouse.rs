@@ -126,10 +126,13 @@ fn migrate_creates_the_tables_and_is_idempotent() {
         tables.lines().collect::<Vec<_>>(),
         vec![
             "_migrations",
+            "derived_sessions",
             "drops_daily",
             "event_ids",
             "events",
             "identity_alias",
+            "sessions",
+            "sessions_mv",
             "user_traits"
         ]
     );
@@ -172,7 +175,7 @@ fn two_nodes_migrating_at_once_both_succeed() {
             ))
             .expect("count")
             .trim(),
-        "6"
+        "9"
     );
     let _ = scratch
         .admin
@@ -564,7 +567,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 3);
+    assert_eq!(count(&scratch.store, "_migrations"), 4);
 }
 
 #[test]
@@ -964,7 +967,12 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
                 .count_user_rows(7, Some("u1"), &anons, false)
                 .expect("before")
         ),
-        vec![("events", 3), ("identity_alias", 3), ("user_traits", 1)],
+        vec![
+            ("events", 3),
+            ("identity_alias", 3),
+            ("user_traits", 1),
+            ("sessions", 2)
+        ],
         "a1 twice and a2 once; both links of a2 and the link of a1; the traits"
     );
 
@@ -977,7 +985,12 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
                 .count_user_rows(7, Some("u1"), &anons, false)
                 .expect("seen")
         ),
-        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
+        vec![
+            ("events", 0),
+            ("identity_alias", 0),
+            ("user_traits", 0),
+            ("sessions", 0)
+        ],
         "queries no longer see the rows"
     );
     // Whether the data is still in the parts here depends on the version: 26.8
@@ -1006,7 +1019,12 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
                 .count_user_rows(7, Some("u1"), &anons, true)
                 .expect("gone")
         ),
-        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)],
+        vec![
+            ("events", 0),
+            ("identity_alias", 0),
+            ("user_traits", 0),
+            ("sessions", 0)
+        ],
         "now it is gone from disk"
     );
 
@@ -1057,7 +1075,12 @@ fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
                 .count_user_rows(7, Some("u2"), &anons, true)
                 .expect("gone")
         ),
-        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
+        vec![
+            ("events", 0),
+            ("identity_alias", 0),
+            ("user_traits", 0),
+            ("sessions", 0)
+        ]
     );
 }
 
@@ -1162,7 +1185,12 @@ fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
                 .count_user_rows(7, Some("u1"), &anons, true)
                 .expect("gone")
         ),
-        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
+        vec![
+            ("events", 0),
+            ("identity_alias", 0),
+            ("user_traits", 0),
+            ("sessions", 0)
+        ]
     );
     assert_eq!(count(store, "events"), 2, "the other person's two events");
     assert_eq!(count(store, "identity_alias"), 1);
@@ -1192,7 +1220,12 @@ fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits()
                 .count_user_rows(7, None, &device, false)
                 .expect("before")
         ),
-        vec![("events", 1), ("identity_alias", 2), ("user_traits", 0)],
+        vec![
+            ("events", 1),
+            ("identity_alias", 2),
+            ("user_traits", 0),
+            ("sessions", 1)
+        ],
         "the event of a2 and both links to it; no user, so no traits"
     );
     store.delete_user_rows(7, None, &device).expect("delete");
@@ -1200,10 +1233,200 @@ fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits()
     store.apply_rewrites(&needed).expect("rewrite");
     assert_eq!(
         rows(&store.count_user_rows(7, None, &device, true).expect("gone")),
-        vec![("events", 0), ("identity_alias", 0), ("user_traits", 0)]
+        vec![
+            ("events", 0),
+            ("identity_alias", 0),
+            ("user_traits", 0),
+            ("sessions", 0)
+        ]
     );
     // Everything else stays: the other events, the other links, all traits.
     assert_eq!(count(store, "events"), 4);
     assert_eq!(count(store, "identity_alias"), 3);
     assert_eq!(count(store, "user_traits"), 3);
+}
+
+// Sessions.
+
+fn session_event(n: u64, session: &str, anon: &str, screen: &str, ts: u64) -> EventRow {
+    let mut row = event(n);
+    row.session_id = session.to_owned();
+    row.anon_id = anon.to_owned();
+    row.screen = screen.to_owned();
+    row.ts_ms = ts;
+    row
+}
+
+const T0: u64 = 1_760_000_000_000;
+const MINUTE: u64 = 60_000;
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn events_with_a_session_id_are_summarized_even_when_they_arrive_in_separate_inserts() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                session_event(1, "s1", "a1", "/home", T0),
+                session_event(2, "s1", "a1", "/cart", T0 + 5 * MINUTE),
+                session_event(3, "s2", "a2", "/home", T0 + MINUTE),
+                // No session id: not part of the aggregate.
+                session_event(4, "", "a3", "/home", T0),
+            ],
+            "sessions-1",
+        )
+        .expect("first insert");
+    store
+        .insert_events(
+            &[session_event(5, "s1", "a1", "/pay", T0 + 9 * MINUTE)],
+            "sessions-2",
+        )
+        .expect("second insert");
+
+    let rows = store
+        .raw_query(
+            "SELECT session_id, anon_id, toString(min(first_ts)), toString(max(last_ts)),
+                    sum(events), argMinMerge(entry_screen), argMaxMerge(exit_screen),
+                    uniqMerge(screens), argMinMerge(platform)
+             FROM sessions GROUP BY site_id, session_id, anon_id
+             ORDER BY session_id FORMAT TabSeparated",
+        )
+        .expect("sessions");
+    let lines: Vec<Vec<&str>> = rows.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(lines.len(), 2, "two sessions, not three: {rows}");
+    // s1: three events over nine minutes, in two inserts.
+    assert_eq!(lines[0][..2], ["s1", "a1"]);
+    assert_eq!(lines[0][4], "3");
+    assert_eq!(
+        (lines[0][5], lines[0][6], lines[0][7], lines[0][8]),
+        ("/home", "/pay", "3", "ios")
+    );
+    let first: u64 = scratch
+        .admin
+        .raw_query(&format!(
+            "SELECT toUnixTimestamp64Milli(toDateTime64('{}', 3, 'UTC'))",
+            lines[0][2]
+        ))
+        .expect("time")
+        .trim()
+        .parse()
+        .expect("ms");
+    let last: u64 = scratch
+        .admin
+        .raw_query(&format!(
+            "SELECT toUnixTimestamp64Milli(toDateTime64('{}', 3, 'UTC'))",
+            lines[0][3]
+        ))
+        .expect("time")
+        .trim()
+        .parse()
+        .expect("ms");
+    assert_eq!((first, last), (T0, T0 + 9 * MINUTE));
+    assert_eq!(lines[1][..2], ["s2", "a2"]);
+    assert_eq!(lines[1][4], "1", "a bounce: one event");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn events_without_a_session_id_are_split_by_thirty_minutes_of_inactivity_at_query_time() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                session_event(1, "", "h1", "/a", T0),
+                session_event(2, "", "h1", "/b", T0 + 10 * MINUTE),
+                // 50 minutes later: a new session of the same device.
+                session_event(3, "", "h1", "/c", T0 + 60 * MINUTE),
+                session_event(4, "", "h2", "/a", T0 + 61 * MINUTE),
+                // Exactly 30 minutes after the previous event is still the same.
+                session_event(5, "", "h3", "/a", T0),
+                session_event(6, "", "h3", "/b", T0 + 30 * MINUTE),
+                // One with an id of its own is left to the aggregate.
+                session_event(7, "own", "h4", "/a", T0),
+            ],
+            "derived",
+        )
+        .expect("insert");
+    let rows = store
+        .raw_query(
+            "SELECT anon_id, session_number, events, entry_screen, exit_screen
+             FROM derived_sessions ORDER BY anon_id, session_number FORMAT TabSeparated",
+        )
+        .expect("derived");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        vec![
+            "h1\t1\t2\t/a\t/b",
+            "h1\t2\t1\t/c\t/c",
+            "h2\t1\t1\t/a\t/a",
+            "h3\t1\t2\t/a\t/b",
+        ],
+        "{rows}"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_ingest_user_fills_the_sessions_by_inserting_events_and_can_read_neither() {
+    let scratch = Scratch::new();
+    let roles = roles("sessions");
+    let _cleanup = UsersGuard(
+        &scratch.admin,
+        vec![roles.ingest_user.clone(), roles.query_user.clone()],
+    );
+    scratch.store.provision_roles(&roles).expect("provision");
+    let ingest = user_store(
+        &scratch.database,
+        &roles.ingest_user,
+        &roles.ingest_password,
+    );
+    ingest
+        .insert_events(
+            &[session_event(1, "s1", "a1", "/home", T0)],
+            "ingest-sessions",
+        )
+        .expect("the ingest user inserts events");
+    assert_eq!(
+        count(&scratch.store, "sessions"),
+        1,
+        "and the view followed"
+    );
+    for sql in ["SELECT count() FROM sessions", "SELECT count() FROM events"] {
+        let error = ingest.raw_query(sql).expect_err(sql);
+        assert!(denied(&error), "{sql}: {error:?}");
+    }
+    let query = user_store(&scratch.database, &roles.query_user, &roles.query_password);
+    assert_eq!(count(&query, "sessions"), 1, "the query user reads them");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn erasing_a_device_removes_its_sessions_too() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                session_event(1, "s1", "a1", "/home", T0),
+                session_event(2, "s2", "a2", "/home", T0),
+            ],
+            "erase-sessions",
+        )
+        .expect("insert");
+    assert_eq!(count(store, "sessions"), 2);
+    let devices = vec!["a1".to_owned()];
+    store.delete_user_rows(7, None, &devices).expect("delete");
+    let needed = store.rewrites_needed(7, None, &devices).expect("needed");
+    store.apply_rewrites(&needed).expect("rewrite");
+    assert_eq!(count(store, "sessions"), 1);
+    assert_eq!(
+        store
+            .raw_query("SELECT anon_id FROM sessions SETTINGS apply_deleted_mask = 0")
+            .expect("left")
+            .trim(),
+        "a2",
+        "and nothing of a1 is left on disk"
+    );
 }

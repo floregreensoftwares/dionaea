@@ -108,6 +108,90 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             SETTINGS non_replicated_deduplication_window = 1000",
         ],
     },
+    Migration {
+        version: 4,
+        name: "sessions",
+        statements: &[
+            // One row per session and device and insert block; rows of one
+            // session merge into one in the background and are always read
+            // with GROUP BY, so a session split over blocks is one session.
+            // It holds the device id, so erasure covers it.
+            "CREATE TABLE IF NOT EXISTS sessions (
+                site_id      UInt32,
+                session_id   String,
+                anon_id      String,
+                started      Date,
+                first_ts     SimpleAggregateFunction(min, DateTime64(3, 'UTC')),
+                last_ts      SimpleAggregateFunction(max, DateTime64(3, 'UTC')),
+                events       SimpleAggregateFunction(sum, UInt64),
+                entry_screen AggregateFunction(argMin, LowCardinality(String), DateTime64(3, 'UTC')),
+                exit_screen  AggregateFunction(argMax, LowCardinality(String), DateTime64(3, 'UTC')),
+                screens      AggregateFunction(uniq, LowCardinality(String)),
+                platform     AggregateFunction(argMin, LowCardinality(String), DateTime64(3, 'UTC')),
+                app_version  AggregateFunction(argMin, LowCardinality(String), DateTime64(3, 'UTC')),
+                country      AggregateFunction(argMin, LowCardinality(String), DateTime64(3, 'UTC'))
+            )
+            ENGINE = AggregatingMergeTree
+            PARTITION BY toYYYYMM(started)
+            ORDER BY (site_id, session_id, anon_id)",
+            // Fed by every insert into events; only events that carry the
+            // session id the SDK generated take part. Events stored before
+            // this migration are not summarized. It runs with the rights of
+            // the user that migrates, so the ingest user, which may only
+            // insert into events, needs no other privilege for it.
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS sessions_mv TO sessions
+            DEFINER = CURRENT_USER SQL SECURITY DEFINER AS
+            SELECT
+                site_id, session_id, anon_id,
+                toDate(min(ts)) AS started,
+                min(ts) AS first_ts,
+                max(ts) AS last_ts,
+                count() AS events,
+                argMinState(screen, ts) AS entry_screen,
+                argMaxState(screen, ts) AS exit_screen,
+                uniqState(screen) AS screens,
+                argMinState(platform, ts) AS platform,
+                argMinState(app_version, ts) AS app_version,
+                argMinState(country, ts) AS country
+            FROM events
+            WHERE session_id != ''
+            GROUP BY site_id, session_id, anon_id",
+            // For plain HTTP integrations whose events carry no session id: the
+            // session is derived at query time with the 30 minute inactivity
+            // rule. A view stores nothing.
+            "CREATE VIEW IF NOT EXISTS derived_sessions AS
+            SELECT
+                site_id, anon_id, number AS session_number,
+                min(ts) AS first_ts,
+                max(ts) AS last_ts,
+                count() AS events,
+                argMin(screen, ts) AS entry_screen,
+                argMax(screen, ts) AS exit_screen,
+                uniq(screen) AS screens
+            FROM (
+                SELECT
+                    site_id, anon_id, ts, screen,
+                    sum(starts) OVER (
+                        PARTITION BY site_id, anon_id ORDER BY ts, event_id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS number
+                FROM (
+                    SELECT
+                        site_id, anon_id, ts, screen, event_id,
+                        if(
+                            lagInFrame(ts, 1, toDateTime64(0, 3, 'UTC')) OVER (
+                                PARTITION BY site_id, anon_id ORDER BY ts, event_id
+                                ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+                            ) + INTERVAL 30 MINUTE < ts,
+                            1, 0
+                        ) AS starts
+                    FROM events
+                    WHERE session_id = ''
+                )
+            )
+            GROUP BY site_id, anon_id, number",
+        ],
+    },
 ];
 
 #[cfg(test)]
