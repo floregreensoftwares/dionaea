@@ -10,6 +10,8 @@ pub enum Permission {
     Manage,
     /// Change who belongs to the organization and with which role.
     ManageMembers,
+    /// Upload the symbol files of a release.
+    Upload,
 }
 
 impl Permission {
@@ -19,6 +21,7 @@ impl Permission {
             Self::Read => Role::Viewer,
             Self::Manage => Role::Admin,
             Self::ManageMembers => Role::Owner,
+            Self::Upload => Role::Admin,
         }
     }
 }
@@ -34,15 +37,16 @@ mod tests {
     #[test]
     fn each_role_has_exactly_the_permissions_it_should() {
         let table = [
-            (Role::Viewer, [true, false, false]),
-            (Role::Admin, [true, true, false]),
-            (Role::Owner, [true, true, true]),
+            (Role::Viewer, [true, false, false, false]),
+            (Role::Admin, [true, true, false, true]),
+            (Role::Owner, [true, true, true, true]),
         ];
         for (role, expected) in table {
             let got = [
                 allows(role, Permission::Read),
                 allows(role, Permission::Manage),
                 allows(role, Permission::ManageMembers),
+                allows(role, Permission::Upload),
             ];
             assert_eq!(got, expected, "{role:?}");
         }

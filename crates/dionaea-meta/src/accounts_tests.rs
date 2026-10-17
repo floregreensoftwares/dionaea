@@ -372,3 +372,209 @@ fn erasure_requests_of_one_site_are_listed_newest_first_within_a_limit() {
             .is_empty()
     );
 }
+
+#[test]
+fn an_upload_token_is_never_found_as_a_read_token_or_the_other_way_round() {
+    let store = store_at(&clock());
+    let org = store.create_organization("Acme").expect("org");
+    let shop = store.create_site(org.id, "shop").expect("site");
+    let blog = store.create_site(org.id, "blog").expect("site");
+
+    let upload = store
+        .issue_upload_token(shop.id, "ci", HASH_A, None)
+        .expect("token");
+    store
+        .issue_read_token(shop.id, "dashboard", HASH_B, None)
+        .expect("token");
+    assert_eq!(
+        store.upload_token(HASH_A).expect("lookup").map(|t| t.id),
+        Some(upload.id)
+    );
+    assert!(store.read_token(HASH_A).expect("lookup").is_none());
+    assert!(store.upload_token(HASH_B).expect("lookup").is_none());
+    assert!(store.read_token(HASH_B).expect("lookup").is_some());
+
+    assert_eq!(store.upload_tokens(shop.id).expect("list").len(), 1);
+    assert!(store.upload_tokens(blog.id).expect("list").is_empty());
+    assert_eq!(store.read_tokens(shop.id).expect("list").len(), 1);
+
+    assert!(matches!(
+        store.revoke_upload_token(blog.id, upload.id),
+        Err(MetaError::NotFound("upload token"))
+    ));
+    store
+        .revoke_upload_token(shop.id, upload.id)
+        .expect("revoke");
+    store
+        .revoke_upload_token(shop.id, upload.id)
+        .expect("again");
+    assert!(store.upload_token(HASH_A).expect("lookup").is_none());
+    assert!(
+        store
+            .issue_upload_token(shop.id, "x", "short", None)
+            .is_err()
+    );
+    assert!(matches!(
+        store.issue_upload_token(99, "x", HASH_B, None),
+        Err(MetaError::NotFound("site"))
+    ));
+}
+
+fn file(site: u32, release: &str, kind: SymbolKind, name: &str, size: u64) -> SymbolFile {
+    SymbolFile {
+        site_id: site,
+        release: release.to_owned(),
+        kind,
+        name: name.to_owned(),
+        size,
+        sha256: "c".repeat(64),
+        uploaded_at: 0,
+    }
+}
+
+#[test]
+fn symbol_files_are_indexed_replaced_totalled_and_removed_with_their_release() {
+    let store = store_at(&clock());
+    let org = store.create_organization("Acme").expect("org");
+    let shop = store.create_site(org.id, "shop").expect("site");
+    let blog = store.create_site(org.id, "blog").expect("site");
+
+    let map = file(
+        shop.id,
+        "1.4.2+57",
+        SymbolKind::SourceMap,
+        "app.js.map",
+        100,
+    );
+    assert!(store.record_symbol_file(&map).expect("record").is_none());
+    store
+        .record_symbol_file(&file(
+            shop.id,
+            "1.4.2+57",
+            SymbolKind::Proguard,
+            "mapping.txt",
+            50,
+        ))
+        .expect("record");
+    store
+        .record_symbol_file(&file(
+            shop.id,
+            "1.5.0",
+            SymbolKind::SourceMap,
+            "app.js.map",
+            7,
+        ))
+        .expect("record");
+    store
+        .record_symbol_file(&file(
+            blog.id,
+            "1.4.2+57",
+            SymbolKind::SourceMap,
+            "app.js.map",
+            9999,
+        ))
+        .expect("record");
+
+    let replaced = store
+        .record_symbol_file(&file(
+            shop.id,
+            "1.4.2+57",
+            SymbolKind::SourceMap,
+            "app.js.map",
+            120,
+        ))
+        .expect("record")
+        .expect("it replaced one");
+    assert_eq!(replaced.size, 100);
+    assert_eq!(store.symbol_bytes(shop.id).expect("bytes"), 120 + 50 + 7);
+    assert_eq!(store.symbol_bytes(blog.id).expect("bytes"), 9999);
+
+    assert_eq!(store.symbol_files(shop.id, None).expect("list").len(), 3);
+    let release = store.symbol_files(shop.id, Some("1.4.2+57")).expect("list");
+    assert_eq!(release.len(), 2);
+    assert!(
+        store
+            .symbol_file(shop.id, "1.4.2+57", SymbolKind::Proguard, "mapping.txt")
+            .expect("lookup")
+            .is_some()
+    );
+    assert!(
+        store
+            .symbol_file(blog.id, "1.4.2+57", SymbolKind::Proguard, "mapping.txt")
+            .expect("lookup")
+            .is_none()
+    );
+
+    let removed = store
+        .remove_release_symbols(shop.id, "1.4.2+57")
+        .expect("remove");
+    assert_eq!(removed.len(), 2);
+    assert_eq!(store.symbol_files(shop.id, None).expect("list").len(), 1);
+    assert_eq!(
+        store.symbol_files(blog.id, None).expect("list").len(),
+        1,
+        "another site is untouched"
+    );
+    assert!(
+        store
+            .remove_symbol_file(shop.id, "1.5.0", SymbolKind::SourceMap, "app.js.map")
+            .expect("remove")
+    );
+    assert!(
+        !store
+            .remove_symbol_file(shop.id, "1.5.0", SymbolKind::SourceMap, "app.js.map")
+            .expect("remove again")
+    );
+}
+
+#[test]
+fn symbol_names_and_releases_are_checked() {
+    for good in ["1.4.2+57", "release-1", "a/b", "v1_2"] {
+        assert!(is_release(good), "{good}");
+    }
+    for bad in ["", "a b", "x'y", "caf\u{e9}", &"r".repeat(65)] {
+        assert!(!is_release(bad), "{bad:?}");
+    }
+    for good in [
+        "app.js.map",
+        "static/js/main.abc123.js.map",
+        "@scope/pkg.map",
+    ] {
+        assert!(is_symbol_name(good), "{good}");
+    }
+    for bad in [
+        "",
+        "..",
+        "../x",
+        "a/../b",
+        "/abs",
+        "a//b",
+        "a/",
+        "./a",
+        "a b",
+        "a\\b",
+        "a;b",
+        &"n".repeat(257),
+    ] {
+        assert!(!is_symbol_name(bad), "{bad:?}");
+    }
+
+    let store = store_at(&clock());
+    let org = store.create_organization("Acme").expect("org");
+    let shop = store.create_site(org.id, "shop").expect("site");
+    let mut bad = file(shop.id, "1", SymbolKind::SourceMap, "a b", 1);
+    assert!(matches!(
+        store.record_symbol_file(&bad),
+        Err(MetaError::Invalid(_))
+    ));
+    bad = file(shop.id, "1", SymbolKind::SourceMap, "ok", 1);
+    bad.sha256 = "XYZ".to_owned();
+    assert!(matches!(
+        store.record_symbol_file(&bad),
+        Err(MetaError::Invalid(_))
+    ));
+    assert!(matches!(
+        store.record_symbol_file(&file(99, "1", SymbolKind::SourceMap, "ok", 1)),
+        Err(MetaError::NotFound("site"))
+    ));
+}

@@ -175,6 +175,23 @@ pub trait AccountStore: Send + Sync {
     /// Revokes a token of the site. Revoking a revoked token is not an error;
     /// a token of another site is not found.
     fn revoke_read_token(&self, site_id: u32, id: u32) -> Result<(), MetaError>;
+
+    /// The same four operations for upload tokens, which can only upload
+    /// symbol files to one site. A token of one kind is never found as the
+    /// other: they are kept in separate tables.
+    fn issue_upload_token(
+        &self,
+        site_id: u32,
+        label: &str,
+        token_hash: &str,
+        created_by: Option<u32>,
+    ) -> Result<ReadTokenInfo, MetaError>;
+
+    fn upload_token(&self, token_hash: &str) -> Result<Option<ReadTokenInfo>, MetaError>;
+
+    fn upload_tokens(&self, site_id: u32) -> Result<Vec<ReadTokenInfo>, MetaError>;
+
+    fn revoke_upload_token(&self, site_id: u32, id: u32) -> Result<(), MetaError>;
 }
 
 fn is_hex_hash(text: &str) -> bool {
@@ -720,6 +737,69 @@ impl AccountStore for SqliteMeta {
         })
     }
 
+    fn issue_upload_token(
+        &self,
+        site_id: u32,
+        label: &str,
+        token_hash: &str,
+        created_by: Option<u32>,
+    ) -> Result<ReadTokenInfo, MetaError> {
+        issue_upload(self, site_id, label, token_hash, created_by)
+    }
+
+    fn upload_token(&self, token_hash: &str) -> Result<Option<ReadTokenInfo>, MetaError> {
+        if !is_hex_hash(token_hash) {
+            return Ok(None);
+        }
+        self.read(|tx| {
+            let raw = tx
+                .query_row(
+                    &format!(
+                        "SELECT id, site_id, label, created_at, revoked_at FROM {UPLOAD_TOKENS}
+                         WHERE token_hash = ?1 AND revoked_at IS NULL"
+                    ),
+                    [token_hash],
+                    token_columns,
+                )
+                .optional()
+                .map_err(storage)?;
+            raw.map(token_of).transpose()
+        })
+    }
+
+    fn upload_tokens(&self, site_id: u32) -> Result<Vec<ReadTokenInfo>, MetaError> {
+        self.read(|tx| {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT id, site_id, label, created_at, revoked_at FROM {UPLOAD_TOKENS}
+                     WHERE site_id = ?1 ORDER BY id"
+                ))
+                .map_err(storage)?;
+            let rows = statement
+                .query_map([site_id], token_columns)
+                .map_err(storage)?;
+            rows.map(|row| token_of(row.map_err(storage)?)).collect()
+        })
+    }
+
+    fn revoke_upload_token(&self, site_id: u32, id: u32) -> Result<(), MetaError> {
+        self.write(|tx, at| {
+            let changed = tx
+                .execute(
+                    &format!(
+                        "UPDATE {UPLOAD_TOKENS} SET revoked_at = COALESCE(revoked_at, ?1)
+                         WHERE id = ?2 AND site_id = ?3"
+                    ),
+                    params![at, id, site_id],
+                )
+                .map_err(storage)?;
+            if changed == 0 {
+                return Err(MetaError::NotFound("upload token"));
+            }
+            Ok(())
+        })
+    }
+
     fn revoke_read_token(&self, site_id: u32, id: u32) -> Result<(), MetaError> {
         self.write(|tx, at| {
             let found: bool = tx
@@ -740,6 +820,58 @@ impl AccountStore for SqliteMeta {
             Ok(())
         })
     }
+}
+
+const UPLOAD_TOKENS: &str = "upload_tokens";
+
+fn issue_upload(
+    store: &SqliteMeta,
+    site_id: u32,
+    label: &str,
+    token_hash: &str,
+    created_by: Option<u32>,
+) -> Result<ReadTokenInfo, MetaError> {
+    check_hash(token_hash, "the upload token hash")?;
+    let label = crate::sqlite::clean_label(label, "a token label")?;
+    store.write(|tx, at| {
+        let site: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sites WHERE id = ?1)",
+                [site_id],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if !site {
+            return Err(MetaError::NotFound("site"));
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO {UPLOAD_TOKENS} (site_id, label, token_hash, created_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            ),
+            params![site_id, label, token_hash, created_by, at],
+        )
+        .map_err(storage)?;
+        Ok(ReadTokenInfo {
+            id: id_of(tx.last_insert_rowid())?,
+            site_id,
+            label,
+            created_at: at,
+            revoked_at: None,
+        })
+    })
+}
+
+fn token_columns(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, i64, String, i64, Option<i64>)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 /// Everything about a site a read needs besides its schemas.

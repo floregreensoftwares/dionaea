@@ -518,3 +518,85 @@ fn a_member_is_added_to_an_organization_in_one_step() {
             .is_none()
     );
 }
+
+#[test]
+fn an_upload_token_uploads_to_its_site_and_does_nothing_else() {
+    let w = world();
+    let acme = w.meta.create_organization("Acme").expect("org");
+    let shop = w.meta.create_site(acme.id, "shop").expect("site");
+    let blog = w.meta.create_site(acme.id, "blog").expect("site");
+    let (_, secret) = w
+        .auth
+        .issue_upload_token(shop.id, "ci", None)
+        .expect("token");
+    assert!(has_shape(UPLOAD_TOKEN_PREFIX, &secret));
+    let token = w
+        .auth
+        .authenticate_upload_token(&secret)
+        .expect("lookup")
+        .expect("valid");
+    let scope = |site_id| Scope {
+        organization_id: acme.id,
+        site_id,
+    };
+
+    assert_eq!(
+        token.authorize(Permission::Upload, scope(Some(shop.id))),
+        Ok(())
+    );
+    assert_eq!(
+        token.authorize(Permission::Upload, scope(Some(blog.id))),
+        Err(Denied)
+    );
+    assert_eq!(
+        token.authorize(Permission::Upload, scope(None)),
+        Err(Denied)
+    );
+    for permission in [
+        Permission::Read,
+        Permission::Manage,
+        Permission::ManageMembers,
+    ] {
+        assert_eq!(
+            token.authorize(permission, scope(Some(shop.id))),
+            Err(Denied),
+            "{permission:?}"
+        );
+    }
+
+    // The two kinds of token are not interchangeable.
+    assert!(
+        w.auth
+            .authenticate_read_token(&secret)
+            .expect("lookup")
+            .is_none()
+    );
+    let (_, read) = w
+        .auth
+        .issue_read_token(shop.id, "dash", None)
+        .expect("token");
+    assert!(
+        w.auth
+            .authenticate_upload_token(&read)
+            .expect("lookup")
+            .is_none()
+    );
+    let read_principal = w
+        .auth
+        .authenticate_read_token(&read)
+        .expect("lookup")
+        .expect("valid");
+    assert_eq!(
+        read_principal.authorize(Permission::Upload, scope(Some(shop.id))),
+        Err(Denied)
+    );
+
+    assert_eq!(
+        token.describe(),
+        format!(
+            "upload-token:{}",
+            w.meta.upload_tokens(shop.id).unwrap()[0].id
+        )
+    );
+    assert!(token.member().is_none());
+}

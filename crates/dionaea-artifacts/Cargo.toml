@@ -1,0 +1,22 @@
+[package]
+name = "dionaea-artifacts"
+description = "Storage for the files an app uploads for a release, behind a trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+bench = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Random temporary file names, so servers sharing a directory never pick the same one.
+getrandom = "0.4.3"
+# The SHA-256 of what is stored, so a file can be checked when it is read.
+# Invariant: it is computed over exactly the bytes written.
+sha2 = "0.11.1"

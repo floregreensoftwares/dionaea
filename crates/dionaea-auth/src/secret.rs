@@ -13,6 +13,7 @@ use crate::AuthError;
 
 pub const SESSION_PREFIX: &str = "ds_";
 pub const READ_TOKEN_PREFIX: &str = "rt_";
+pub const UPLOAD_TOKEN_PREFIX: &str = "ut_";
 /// 32 random bytes in lowercase base32 without padding.
 const BODY_CHARS: usize = 52;
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";

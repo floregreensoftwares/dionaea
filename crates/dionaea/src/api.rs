@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use dionaea_artifacts::ArtifactStore;
 use dionaea_auth::{Auth, AuthError, Denied, Permission, Principal, Scope, cookie_from_header};
 use dionaea_core::Schema;
 use dionaea_meta::{
@@ -43,6 +44,7 @@ const MAX_QUERIES_IN_FLIGHT: usize = 8;
 /// Most erasure requests one listing returns (the newest).
 const MAX_LISTED_ERASURES: u32 = 500;
 
+#[derive(Clone)]
 pub(crate) struct ApiRequest {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -260,9 +262,9 @@ type SchemaCache = HashMap<u32, (u64, Arc<Vec<Schema>>)>;
 struct InFlight<'a>(&'a AtomicUsize);
 
 impl<'a> InFlight<'a> {
-    fn acquire(counter: &'a AtomicUsize) -> Option<Self> {
+    fn acquire(counter: &'a AtomicUsize, max: usize) -> Option<Self> {
         let before = counter.fetch_add(1, Ordering::AcqRel);
-        if before >= MAX_QUERIES_IN_FLIGHT {
+        if before >= max {
             counter.fetch_sub(1, Ordering::AcqRel);
             None
         } else {
@@ -286,6 +288,11 @@ pub(crate) struct Api {
     /// Active schemas by site and the metadata generation they were read at.
     schemas: Mutex<SchemaCache>,
     in_flight: AtomicUsize,
+    artifacts: Arc<dyn ArtifactStore>,
+    /// Symbol uploads being received (taken before the body is read).
+    uploads: Arc<AtomicUsize>,
+    /// One upload at a time is checked against the quota and recorded.
+    upload_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for Api {
@@ -457,6 +464,10 @@ fn principal_json(principal: &Principal) -> Value {
             "type": "read_token",
             "read_token": token_json(token),
         }),
+        Principal::UploadToken(token) => json!({
+            "type": "upload_token",
+            "upload_token": token_json(token),
+        }),
     }
 }
 
@@ -466,9 +477,13 @@ impl Api {
         auth: Arc<Auth>,
         store: Store,
         limits: Limits,
+        artifacts: Arc<dyn ArtifactStore>,
         default_retention_days: impl Fn() -> u32 + Send + Sync + 'static,
     ) -> Self {
         Self {
+            artifacts,
+            uploads: Arc::new(AtomicUsize::new(0)),
+            upload_lock: Mutex::new(()),
             meta,
             auth,
             store,
@@ -554,6 +569,16 @@ impl Api {
             ("POST", ["sites", site, "erasures", id, "retry"]) => {
                 self.retry_erasure(p, id_of(site)?, id)
             }
+            ("GET", ["sites", site, "symbols"]) => self.symbols(req, p, id_of(site)?),
+            ("POST", ["sites", site, "symbols"]) => self.upload_symbol(req, p, id_of(site)?),
+            ("DELETE", ["sites", site, "symbols"]) => self.delete_symbols(req, p, id_of(site)?),
+            ("GET", ["sites", site, "upload-tokens"]) => self.upload_tokens(p, id_of(site)?),
+            ("POST", ["sites", site, "upload-tokens"]) => {
+                self.issue_upload_token(req, p, id_of(site)?)
+            }
+            ("DELETE", ["sites", site, "upload-tokens", token]) => {
+                self.revoke_upload_token(p, id_of(site)?, id_of(token)?)
+            }
             ("POST", ["sites", site, "query"]) => self.query(req, p, id_of(site)?),
             _ => Err(ApiError::not_found()),
         }
@@ -567,7 +592,11 @@ impl Api {
                 .strip_prefix("Bearer ")
                 .or_else(|| header.strip_prefix("bearer "))
                 .ok_or_else(ApiError::unauthorized)?;
-            self.auth.authenticate_read_token(token.trim())?
+            let token = token.trim();
+            match self.auth.authenticate_read_token(token)? {
+                Some(principal) => Some(principal),
+                None => self.auth.authenticate_upload_token(token)?,
+            }
         } else if let Some(cookie) = req.cookie.as_deref().and_then(cookie_from_header) {
             self.auth.authenticate_session(cookie)?
         } else {
@@ -602,7 +631,7 @@ impl Api {
                     return Err(ApiError::not_found());
                 }
             }
-            Principal::ReadToken(token) => {
+            Principal::ReadToken(token) | Principal::UploadToken(token) => {
                 if token.site_id != site.id {
                     return Err(ApiError::not_found());
                 }
@@ -627,7 +656,9 @@ impl Api {
                     return Err(ApiError::not_found());
                 }
             }
-            Principal::ReadToken(_) => return Err(ApiError::forbidden()),
+            Principal::ReadToken(_) | Principal::UploadToken(_) => {
+                return Err(ApiError::forbidden());
+            }
         }
         principal.authorize(
             permission,
@@ -1106,7 +1137,7 @@ impl Api {
         let site = self.site_access(principal, site, Permission::Read)?;
         let query: Query = Self::json(req)?;
         let schemas = self.schemas_of(site.id)?;
-        let _slot = InFlight::acquire(&self.in_flight).ok_or_else(|| {
+        let _slot = InFlight::acquire(&self.in_flight, MAX_QUERIES_IN_FLIGHT).ok_or_else(|| {
             let mut busy = ApiError::new(
                 429,
                 "busy",
@@ -1145,6 +1176,9 @@ fn same_origin(req: &ApiRequest) -> bool {
         (Some(_), None) => false,
     }
 }
+
+#[path = "api_symbols.rs"]
+mod symbols;
 
 #[cfg(test)]
 #[path = "api_tests.rs"]
