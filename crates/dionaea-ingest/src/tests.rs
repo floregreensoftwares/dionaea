@@ -688,3 +688,65 @@ fn settings_stored_in_the_metadata_reach_the_cache_when_the_generation_moves() {
     let removed = cache.settings();
     assert_eq!(removed.get("key_burst").and_then(|s| s.at(2_000)), None);
 }
+
+// Health events.
+
+#[test]
+fn health_events_are_stored_without_what_must_not_be_kept() {
+    let admission = admission(&[V1]);
+    let processed = run(
+        &admission,
+        NOW,
+        &[
+            event(
+                1,
+                NOW,
+                "app_error",
+                json!({
+                    "kind": "unhandled",
+                    "type": "TypeError",
+                    "message": "no account for ana@example.com at https://x.example.com/p?a=1",
+                    "frames": "app/cart.js|checkout|42|7|1",
+                }),
+            ),
+            event(
+                2,
+                NOW,
+                "http_request",
+                json!({
+                    "method": "get",
+                    "host": "api.example.com",
+                    "route": "https://api.example.com/v1/orders/123456?token=abc",
+                    "status": 200,
+                    "duration": 120,
+                }),
+            ),
+        ],
+    );
+    assert_eq!(processed.accepted.len(), 2);
+    let text = |index: usize, name: &str| -> String {
+        processed.accepted[index]
+            .strings
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        text(0, "message"),
+        "no account for [email] at https://x.example.com/p?[query]"
+    );
+    assert_eq!(text(0, "frames"), "app/cart.js|checkout|42|7|1");
+    assert_eq!(text(1, "route"), "/v1/orders/:id");
+}
+
+#[test]
+fn a_site_cannot_redefine_a_health_event() {
+    let (store, _, _) = world(&[], &[]);
+    let site = store.sites().expect("sites")[0].id;
+    let refused = store.publish_schema(
+        site,
+        "[events.app_error.fields.message]\nkind = \"text\"\nmax = 10\n",
+    );
+    assert!(refused.is_err());
+}

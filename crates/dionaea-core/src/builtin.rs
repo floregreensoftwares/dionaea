@@ -21,6 +21,21 @@ const RESERVED: &[&str] = &[
     "app_crash",
 ];
 
+/// Longest error message kept, before scrubbing, in characters.
+pub const MAX_MESSAGE_CHARS: usize = 512;
+/// Longest `frames` text of an error, in characters.
+pub const MAX_FRAMES_CHARS: usize = 4096;
+/// Longest host of a network call, in characters.
+const MAX_HOST_CHARS: usize = 128;
+/// Longest route template, in characters.
+pub const MAX_ROUTE_CHARS: usize = 256;
+/// Longest duration of a health event: ten minutes, in milliseconds.
+const MAX_DURATION_MS: u64 = 600_000;
+/// Largest request or response size: 4 GiB.
+const MAX_BYTES: u64 = 1 << 32;
+/// Largest web vital value: an hour, in milliseconds.
+const MAX_VITAL: u64 = 3_600_000;
+
 pub(crate) fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&name)
 }
@@ -45,7 +60,83 @@ static BUILTIN: LazyLock<BTreeMap<&'static str, EventDef>> = LazyLock::new(|| {
         FieldKind::enumeration(["launch", "foreground", "background", "terminate"].map(v))
             .expect("built-in enum is valid");
 
+    let required = |kind: FieldKind| FieldDef::required(kind);
+    let optional = |kind: FieldKind| FieldDef::optional(kind);
+    let words = |values: &[&str]| {
+        FieldKind::enumeration(values.iter().copied().map(v)).expect("built-in enum is valid")
+    };
+    let text = |max| FieldKind::text(max).expect("built-in text maximum is valid");
+    let duration = || FieldKind::duration(MAX_DURATION_MS).expect("built-in maximum is valid");
+    let count = |max| FieldKind::count(max).expect("built-in maximum is valid");
+
     BTreeMap::from([
+        // App health. The shapes are fixed here, and the server applies more
+        // rules to some fields (scrubbing a message, templating a route)
+        // after the guard.
+        (
+            "app_error",
+            def(&[
+                (
+                    "kind",
+                    required(words(&["handled", "unhandled", "boundary", "crash"])),
+                ),
+                ("type", id()),
+                ("message", optional(text(MAX_MESSAGE_CHARS))),
+                ("frames", optional(text(MAX_FRAMES_CHARS))),
+            ]),
+        ),
+        (
+            "app_start",
+            def(&[
+                ("start", required(words(&["cold", "warm"]))),
+                ("first_frame", required(duration())),
+                ("interactive", optional(duration())),
+            ]),
+        ),
+        (
+            "screen_load",
+            def(&[
+                ("render", required(duration())),
+                ("interactive", optional(duration())),
+            ]),
+        ),
+        (
+            "http_request",
+            def(&[
+                (
+                    "method",
+                    required(words(&[
+                        "get", "post", "put", "patch", "delete", "head", "options", "other",
+                    ])),
+                ),
+                ("host", required(text(MAX_HOST_CHARS))),
+                ("route", required(text(MAX_ROUTE_CHARS))),
+                ("status", required(count(599))),
+                ("duration", required(duration())),
+                ("request_size", optional(count(MAX_BYTES))),
+                ("response_size", optional(count(MAX_BYTES))),
+                (
+                    "connection",
+                    optional(words(&["wifi", "cellular", "ethernet", "other", "none"])),
+                ),
+            ]),
+        ),
+        (
+            "web_vital",
+            def(&[
+                (
+                    "name",
+                    required(words(&["lcp", "inp", "cls", "ttfb", "fcp"])),
+                ),
+                // Milliseconds; a layout shift score in thousandths.
+                ("value", required(count(MAX_VITAL))),
+                (
+                    "rating",
+                    optional(words(&["good", "needs_improvement", "poor"])),
+                ),
+                ("route", optional(text(MAX_ROUTE_CHARS))),
+            ]),
+        ),
         ("screen", def(&[("name", id())])),
         ("ui_tap", def(&[("screen", id()), ("element", id())])),
         (
@@ -86,8 +177,20 @@ mod tests {
     }
 
     #[test]
-    fn health_names_are_reserved_but_have_no_shape_yet() {
-        assert!(is_reserved("app_error"));
-        assert!(event("app_error").is_none());
+    fn health_events_have_a_shape_except_the_ones_not_built_yet() {
+        for name in [
+            "app_error",
+            "app_start",
+            "screen_load",
+            "http_request",
+            "web_vital",
+        ] {
+            assert!(is_reserved(name), "{name}");
+            assert!(event(name).is_some(), "{name}");
+        }
+        for name in ["frame_stats", "anr", "app_crash"] {
+            assert!(is_reserved(name), "{name}");
+            assert!(event(name).is_none(), "{name}");
+        }
     }
 }

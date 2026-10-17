@@ -188,9 +188,76 @@ What is stored:
 - Time is the server's arrival time, not `sent_at`, so a delayed retry of an
   old identify replaces a newer one.
 
+## Health events
+
+Errors and performance travel through `POST /v1/collect` as events with fixed
+names and shapes that a site cannot declare or change. Everything is a scalar
+property like any other event, so no wire change is involved. Durations are
+whole milliseconds, up to ten minutes; sizes are bytes. Enum values are
+lowercase.
+
+| Event | Property | Required | Meaning |
+|---|---|---|---|
+| `app_error` | `kind` | yes | `handled`, `unhandled`, `boundary` or `crash` |
+| | `type` | yes | The exception type, an id (`TypeError`, `java.io.IOException`) |
+| | `message` | no | Text up to 512 characters; masked by the server (below) |
+| | `frames` | no | The stack, up to 4096 characters (below) |
+| `app_start` | `start` | yes | `cold` or `warm` |
+| | `first_frame` | yes | Time to the first frame |
+| | `interactive` | no | Time until the app is usable, when the app marks it |
+| `screen_load` | `render` | yes | Time to first render of the event's `screen` |
+| | `interactive` | no | Time to interactive |
+| `http_request` | `method` | yes | `get`, `post`, `put`, `patch`, `delete`, `head`, `options` or `other` |
+| | `host` | yes | The host and port, text up to 128 characters (an IPv6 address in brackets is fine) |
+| | `route` | yes | The route; a template is best, the server templates what it gets |
+| | `status` | yes | The status code, up to 599 |
+| | `duration` | yes | Time to the response |
+| | `request_size`, `response_size` | no | Bytes |
+| | `connection` | no | `wifi`, `cellular`, `ethernet`, `other` or `none` |
+| `web_vital` | `name` | yes | `lcp`, `inp`, `cls`, `ttfb` or `fcp` |
+| | `value` | yes | Milliseconds; a layout shift score (`cls`) in thousandths |
+| | `rating` | no | `good`, `needs_improvement` or `poor` |
+| | `route` | no | The route pattern |
+
+`frame_stats`, `anr` and `app_crash` are reserved and have no shape yet; events
+with those names are dropped as unknown.
+
+There is no property for a URL query string, a request or response body, a
+header, or a local variable, so there is nowhere for one to travel: such
+properties are stripped as undeclared.
+
+### Frames
+
+A stack is code locations only, written in one text: frames joined by `;`, each
+`module|function|line|column|flag`. `module` is a file or class, `line` and
+`column` may be empty, and `flag` is `1` for the app's own code and `0` for a
+library or the platform. The first frame is the top of the stack. A `%`, `|` or
+`;` inside a name is written `%25`, `%7C` or `%3B`. The server keeps at most 64
+well-formed frames, cuts a module to 256 characters and a function to 128, and
+removes the user name and password, the query string and the fragment of a module; a frame that does not parse
+(one cut in half by the length limit, for example) is dropped.
+
+### What the server does to the text
+
+- **Messages** are masked before storage: e-mail addresses, the user name,
+  password, query string and fragment of URLs, UUIDs, JWT-like and other long
+  tokens, and long digit runs are replaced by `[email]`, `[userinfo]`,
+  `?[query]`, `#[fragment]`, `[uuid]`, `[token]` and `[number]`.
+- **A message the guard cut** at 512 characters loses its last word, which may
+  be the front of an address or a number the masks no longer recognise.
+- **The `screen` of every event** loses a query string or fragment, and a
+  screen that is a path (starts with `/`) has identifier-like segments turned
+  into `:id`; a screen name such as `Home` is kept.
+- **A host** keeps only what follows the last `@`, so `user:password@host` is stored as `host`.
+- **Routes** lose the scheme, host, query string, fragment and matrix
+  parameters, and a segment that looks like an identifier becomes `:id`. A
+  segment already written `:name`, `{name}` or `[name]` is kept.
+
+Both rules are pinned by the vectors in `vectors/health/`, which an SDK that
+applies them on the device passes too. A site cannot turn the built-in masks
+off.
+
 ## What is not here yet
 
 - Request headers, authentication with the write key, and the HTTP status
   codes come with the ingest handlers.
-- The health event shapes (errors, performance) are added with the app health
-  work; their names are already reserved.

@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
+dionaea-health = { version = "0.0.0", path = "../dionaea-health" }
 dionaea-meta = { version = "0.0.0", path = "../dionaea-meta" }
 dionaea-spool = { version = "0.0.0", path = "../dionaea-spool" }
 dionaea-store = { version = "0.0.0", path = "../dionaea-store" }

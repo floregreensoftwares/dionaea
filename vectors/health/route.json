@@ -1,0 +1,20 @@
+{
+  "description": "Route templating. The scheme, host, query string, fragment and matrix parameters are dropped; a segment that looks like an identifier becomes :id; a segment already written as :name, {name} or [name] is kept. At most 16 segments and 256 characters.",
+  "cases": [
+    { "name": "numeric id", "input": "/orders/12345/items", "output": "/orders/:id/items" },
+    { "name": "uuid", "input": "/users/0190f7e2-7c3e-7a52-9a0e-5f3c2a1b4d6e", "output": "/users/:id" },
+    { "name": "long hex", "input": "/files/9f86d081884c7d659a2feaa0c55ad015", "output": "/files/:id" },
+    { "name": "letters with several digits", "input": "/orders/A12345", "output": "/orders/:id" },
+    { "name": "email in a segment", "input": "/profile/ana@example.com", "output": "/profile/:id" },
+    { "name": "words and versions stay", "input": "/api/v2/users/search", "output": "/api/v2/users/search" },
+    { "name": "root", "input": "/", "output": "/" },
+    { "name": "empty", "input": "", "output": "/" },
+    { "name": "full url", "input": "https://api.example.com/v1/orders/77?token=abc#x", "output": "/v1/orders/:id" },
+    { "name": "url without a path", "input": "https://api.example.com", "output": "/" },
+    { "name": "matrix parameters", "input": "/a/b;jsessionid=1/c", "output": "/a/b" },
+    { "name": "template from the sdk", "input": "/orders/:orderId/items/{item}", "output": "/orders/:orderId/items/{item}" },
+    { "name": "bracket template", "input": "/blog/[slug]", "output": "/blog/[slug]" },
+    { "name": "a very long segment", "input": "/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "output": "/:id" },
+    { "name": "duplicate slashes", "input": "//a///b/", "output": "/a/b" }
+  ]
+}

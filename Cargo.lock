@@ -616,11 +616,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dionaea-health"
+version = "0.0.0"
+dependencies = [
+ "criterion",
+ "dionaea-core",
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
 name = "dionaea-ingest"
 version = "0.0.0"
 dependencies = [
  "criterion",
  "dionaea-core",
+ "dionaea-health",
  "dionaea-meta",
  "dionaea-spool",
  "dionaea-store",

@@ -753,9 +753,16 @@ mod tests {
 
     #[test]
     fn reserved_health_events_are_unknown_until_their_shapes_exist() {
+        for name in ["frame_stats", "anr", "app_crash"] {
+            assert_eq!(
+                Schema::default().guard_event(name, &props(json!({}))),
+                Err(DropReason::UnknownEvent.into()),
+                "{name}"
+            );
+        }
         assert_eq!(
             Schema::default().guard_event("app_error", &props(json!({}))),
-            Err(DropReason::UnknownEvent.into())
+            Err(dropped(DropReason::MissingRequiredField, "kind"))
         );
     }
 
