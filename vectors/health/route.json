@@ -15,6 +15,7 @@
     { "name": "template from the sdk", "input": "/orders/:orderId/items/{item}", "output": "/orders/:orderId/items/{item}" },
     { "name": "bracket template", "input": "/blog/[slug]", "output": "/blog/[slug]" },
     { "name": "a very long segment", "input": "/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "output": "/:id" },
+    { "name": "whitespace around a segment", "input": "/orders/\u00a0123\u00a0/items", "output": "/orders/:id/items" },
     { "name": "duplicate slashes", "input": "//a///b/", "output": "/a/b" }
   ]
 }
