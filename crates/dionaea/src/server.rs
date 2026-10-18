@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::routing::get;
-use dionaea_ingest::{Batcher, BatcherConfig, Cache, Destination, MaxMind};
+use dionaea_ingest::{
+    Batcher, BatcherConfig, Cache, Destination, MaxMind, SymbolConfig, Symbolicator,
+};
 use dionaea_spool::{Config as SpoolConfig, Spool};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -80,6 +82,8 @@ struct Live {
     control: Arc<NetControl>,
     batcher: Arc<Mutex<Option<Batcher>>>,
     status: Arc<Status>,
+    /// Translates the stacks of error events in the batcher.
+    symbols: Arc<Symbolicator>,
     /// What was last reported in the log, so a standing condition is said once.
     reported: Arc<Mutex<Vec<String>>>,
 }
@@ -91,6 +95,15 @@ fn batcher_config(tuning: &Tuning) -> BatcherConfig {
         min_interval: tuning.batch_min_interval,
         shared_dedup: tuning.shared_dedup,
         ..BatcherConfig::default()
+    }
+}
+
+fn symbol_config(tuning: &Tuning) -> SymbolConfig {
+    SymbolConfig {
+        workers: tuning.symbol_workers,
+        deadline: tuning.symbol_deadline,
+        cache_bytes: tuning.symbol_cache_bytes,
+        recheck: tuning.symbol_recheck,
     }
 }
 
@@ -168,6 +181,7 @@ impl Live {
         // The shared copy first: a batcher that starts at this moment reads it.
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(tuning.clone());
         self.collect.apply(Settings::from_tuning(&tuning));
+        self.symbols.reconfigure(symbol_config(&tuning));
         self.control
             .set(tuning.max_connections, tuning.header_timeout);
         if let Some(batcher) = self
@@ -257,6 +271,25 @@ impl Node {
         let collect = Arc::new(collect);
         let stop = Arc::new(AtomicBool::new(false));
         let batcher = Arc::new(Mutex::new(None));
+        // The files the stacks are translated with: the index in the metadata
+        // store (its own connection) and the artifact directory the API fills.
+        let symbols = {
+            let index = Arc::new(config.open_meta()?) as Arc<dyn dionaea_meta::SymbolIndex>;
+            let artifacts = dionaea_artifacts::LocalArtifacts::open(&config.artifacts_dir)
+                .map_err(|e| {
+                    format!(
+                        "cannot use the artifacts directory {}: {e}",
+                        config.artifacts_dir.display()
+                    )
+                })?;
+            let symbols = Arc::new(Symbolicator::new(
+                index,
+                Arc::new(artifacts),
+                symbol_config(&tuning),
+            ));
+            status.set_symbols(symbols.stats());
+            symbols
+        };
         let live = Live {
             base: Arc::new(config.tuning.clone()),
             origins: Arc::new(config.tuning_origins.clone()),
@@ -266,6 +299,7 @@ impl Node {
             control: Arc::clone(control),
             batcher: Arc::clone(&batcher),
             status: Arc::clone(status),
+            symbols,
         };
         let mut threads = Vec::new();
 
@@ -426,7 +460,13 @@ impl Node {
                                     let collect = Arc::clone(&live.collect);
                                     Arc::new(move || collect.cache.tombstones())
                                 };
-                                match Batcher::start_with(spool, destination, config, erased) {
+                                match Batcher::start_with_symbols(
+                                    spool,
+                                    destination,
+                                    config,
+                                    erased,
+                                    Some(Arc::clone(&live.symbols)),
+                                ) {
                                     Ok(started) => {
                                         *status
                                             .batcher

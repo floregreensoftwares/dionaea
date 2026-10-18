@@ -15,6 +15,7 @@ bench = false
 workspace = true
 
 [dependencies]
+dionaea-artifacts = { version = "0.0.0", path = "../dionaea-artifacts" }
 dionaea-core = { version = "0.0.0", path = "../dionaea-core" }
 dionaea-health = { version = "0.0.0", path = "../dionaea-health" }
 dionaea-meta = { version = "0.0.0", path = "../dionaea-meta" }

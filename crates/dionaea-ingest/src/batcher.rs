@@ -28,6 +28,7 @@ use dionaea_spool::{Record, Spool};
 use dionaea_store::{Error, Store};
 
 use crate::sink;
+use crate::symbolicate::Symbolicator;
 
 /// Where batches go. [`Store`] is the implementation; tests use their own to
 /// make failures happen on demand.
@@ -221,6 +222,22 @@ impl Batcher {
         config: BatcherConfig,
         erased: TombstoneSource,
     ) -> std::io::Result<Self> {
+        Self::start_with_symbols(spool, destination, config, erased, None)
+    }
+
+    /// [`start_with`](Self::start_with) and a symbolicator that translates
+    /// the stack of every error event before it is inserted.
+    ///
+    /// # Errors
+    ///
+    /// When the operating system cannot start a thread.
+    pub fn start_with_symbols(
+        spool: Spool,
+        destination: Arc<dyn Destination>,
+        config: BatcherConfig,
+        erased: TombstoneSource,
+        symbols: Option<Arc<Symbolicator>>,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(BatcherStats::default());
         let config = Arc::new(RwLock::new(config));
@@ -235,6 +252,7 @@ impl Batcher {
                         destination.as_ref(),
                         &config,
                         erased.as_ref(),
+                        symbols.as_deref(),
                         &stop,
                         &stats,
                     );
@@ -307,6 +325,7 @@ fn run(
     destination: &dyn Destination,
     shared: &RwLock<BatcherConfig>,
     erased: &(dyn Fn() -> Arc<Tombstones> + Send + Sync),
+    symbols: Option<&Symbolicator>,
     stop: &AtomicBool,
     stats: &BatcherStats,
 ) {
@@ -342,7 +361,10 @@ fn run(
             &records,
             destination,
             config,
-            &erased,
+            &Hooks {
+                erased: &erased,
+                symbols,
+            },
             stop,
             stats,
             &mut backoff,
@@ -366,6 +388,14 @@ fn run(
 enum Delivered {
     Done,
     Stopped,
+}
+
+/// What is done to the rows of a batch before they are inserted.
+struct Hooks<'a> {
+    /// Rows of erased users and devices are left out.
+    erased: &'a Tombstones,
+    /// Error events get their stack translated and a fingerprint.
+    symbols: Option<&'a Symbolicator>,
 }
 
 /// The two kinds of line a record carries. Each is inserted, retried and, if
@@ -412,7 +442,7 @@ fn deliver(
     records: &[Record],
     destination: &dyn Destination,
     config: &BatcherConfig,
-    erased: &Tombstones,
+    hooks: &Hooks<'_>,
     stop: &AtomicBool,
     stats: &BatcherStats,
     backoff: &mut Duration,
@@ -429,7 +459,7 @@ fn deliver(
             part,
             destination,
             config,
-            erased,
+            hooks,
             stop,
             stats,
             backoff,
@@ -578,7 +608,7 @@ fn deliver_part(
     part: Part,
     destination: &dyn Destination,
     config: &BatcherConfig,
-    erased: &Tombstones,
+    hooks: &Hooks<'_>,
     stop: &AtomicBool,
     stats: &BatcherStats,
     backoff: &mut Duration,
@@ -593,7 +623,7 @@ fn deliver_part(
             Part::Traits => lines.traits,
         })
         .collect();
-    let (lines, removed) = without_erased(lines, part, erased);
+    let (lines, removed) = without_erased(lines, part, hooks.erased);
     stats.erased_rows.fetch_add(removed, Ordering::Relaxed);
     if lines.is_empty() {
         return Delivered::Done;
@@ -629,6 +659,13 @@ fn deliver_part(
         return Delivered::Done;
     }
 
+    // After the duplicates are gone, so no time goes to events not inserted,
+    // and once per attempt: a retry sends the same text.
+    let lines = match (part, hooks.symbols) {
+        (Part::Events, Some(symbols)) => symbols.process(lines),
+        _ => lines,
+    };
+
     let inserted = retry(config, stop, stats, backoff, || match part {
         Part::Events => destination.insert_event_lines(&lines, &token),
         Part::Drops => destination.insert_drop_lines(&lines, &token),
@@ -653,7 +690,7 @@ fn deliver_part(
                 for record in records {
                     let one = std::slice::from_ref(record);
                     if let Delivered::Stopped =
-                        deliver_part(one, part, destination, config, erased, stop, stats, backoff)
+                        deliver_part(one, part, destination, config, hooks, stop, stats, backoff)
                     {
                         return Delivered::Stopped;
                     }

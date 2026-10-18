@@ -1250,3 +1250,57 @@ fn a_tombstone_that_arrives_later_applies_to_the_next_batch() {
     batcher.stop();
     assert_eq!(fake.events().len(), 1, "only what came before");
 }
+
+#[test]
+fn error_events_are_translated_before_the_insert_and_a_retry_sends_the_same_rows() {
+    use dionaea_artifacts::LocalArtifacts;
+    use dionaea_meta::{SqliteMeta, SymbolIndex};
+
+    let dir = spool_dir("symbols");
+    let spool = open(&dir);
+    let mut error = accepted(1, 1);
+    error.name = "app_error".to_owned();
+    error.platform = "web".to_owned();
+    error.strings = vec![
+        ("type".to_owned(), "TypeError".to_owned()),
+        (
+            "frames".to_owned(),
+            "https://x.test/a.js|f|1|5|1".to_owned(),
+        ),
+    ];
+    enqueue(&spool, &request(vec![error, accepted(2, 1)], 0), 7, NOW).unwrap();
+
+    let artifacts =
+        std::env::temp_dir().join(format!("dionaea-ingest-symbols-{}", std::process::id()));
+    let symbols = Arc::new(Symbolicator::new(
+        Arc::new(SqliteMeta::open_in_memory().unwrap()) as Arc<dyn SymbolIndex>,
+        Arc::new(LocalArtifacts::open(&artifacts).unwrap()),
+        SymbolConfig::default(),
+    ));
+    let fake = Arc::new(Fake::default());
+    fake.transient_failures.store(2, Ordering::Relaxed);
+    let batcher = Batcher::start_with_symbols(
+        spool.clone(),
+        Arc::clone(&fake) as Arc<dyn Destination>,
+        fast(),
+        Arc::new(|| Arc::new(dionaea_meta::Tombstones::default())),
+        Some(Arc::clone(&symbols)),
+    )
+    .expect("thread");
+    wait_for("the rows", || batcher.stats().event_rows() == 2);
+    batcher.stop();
+    let _ = std::fs::remove_dir_all(&artifacts);
+
+    let events = fake.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    let lines: Vec<&str> = events.iter().map(String::as_str).collect();
+    assert!(lines[0].contains("\"symbols\":\"missing\""), "{}", lines[0]);
+    assert!(lines[0].contains("\"fingerprint\":\""));
+    // The other event is stored as it always was.
+    assert!(!lines[1].contains("symbols") && !lines[1].contains("fingerprint"));
+    let outcomes = symbols.stats().outcomes();
+    assert!(
+        outcomes.contains(&("missing", 1)),
+        "translated once, however many attempts: {outcomes:?}"
+    );
+}

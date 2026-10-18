@@ -15,6 +15,7 @@ mod identify;
 mod limit;
 mod pipeline;
 mod sink;
+mod symbolicate;
 
 pub use batcher::{Batcher, BatcherConfig, BatcherStats, Destination, TombstoneSource};
 pub use cache::{Admission, Cache, Refusal};
@@ -31,6 +32,7 @@ pub use sink::{
     CHUNK_BYTES, Enqueued, INVALID_ROW, enqueue, enqueue_drop_rows, enqueue_identified,
     enqueue_identity,
 };
+pub use symbolicate::{MAPPING_NAME, MAX_FILES_PER_EVENT, SymbolConfig, SymbolStats, Symbolicator};
 
 #[cfg(test)]
 mod tests;
@@ -43,3 +45,6 @@ mod enrich_tests;
 
 #[cfg(test)]
 mod identify_tests;
+
+#[cfg(test)]
+mod symbolicate_tests;

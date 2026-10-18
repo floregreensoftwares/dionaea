@@ -257,6 +257,32 @@ Both rules are pinned by the vectors in `vectors/health/`, which an SDK that
 applies them on the device passes too. A site cannot turn the built-in masks
 off.
 
+### Stacks translated by the server
+
+When the symbol files of the event's release were uploaded (see
+[API](api.md#symbol-files)), the server turns the `frames` of an `app_error`
+back into the code the developer wrote before the event is stored, after the
+event is acknowledged: a request never waits for it. A frame whose module is a
+path, an URL or ends in a script extension (`.js`, `.bundle`, ...) is looked up
+in the release's source map named like the module with `.map` added, as the
+path below the host (`static/js/main.js.map`) and then as the file name alone
+(`main.js.map`). Any other frame of an Android event is looked up in the
+release's `mapping.txt` (kind `proguard`), with inlined frames returned callee
+first. The release is the `release` of the request.
+
+The stored event has two properties of its own, which a sender cannot set:
+
+| Property | Value |
+|---|---|
+| `fingerprint` | 32 hex characters, `v1`: the error type and the first 10 app frames (module and function, never line or column; the first 5 frames when none is the app's) of the translated stack. One line added above a function does not change it |
+| `symbols` | `ok` every file needed was found; `partial` some frames had no file; `missing` no file for the release; `failed` a file was found and could not be used; `none` nothing to translate; `skipped` the batch ran out of time |
+
+An event whose files are missing is stored with the frames it was sent and is
+**not** translated later, even if the files are uploaded afterwards. Upload a
+release's files before the release reaches users. The translated stack still
+has to fit the 4096-character limit of `frames`; frames from the end are left
+out until it does.
+
 ## What is not here yet
 
 - Request headers, authentication with the write key, and the HTTP status

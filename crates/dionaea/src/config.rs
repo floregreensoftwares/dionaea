@@ -647,7 +647,8 @@ mod tests {
                     batch_max_records = 10\nbatch_max_bytes = 100000\nbatch_min_interval_ms = 0\n\
                     trusted_proxy_hops = 2\nclient_address_header = \"x-real-ip\"\n\
                     dedup_capacity = 0\ndedup_window_secs = 5\nshared_dedup = false\n\
-                    drop_flush_secs = 9\n";
+                    drop_flush_secs = 9\nsymbol_workers = 3\nsymbol_deadline_ms = 500\n\
+                    symbol_cache_bytes = 2097152\nsymbol_recheck_secs = 11\n";
         let t = Config::resolve(Some(file), no_env).unwrap().tuning;
         assert_eq!((t.key_rate_per_sec, t.key_burst), (1000.5, 2000.0));
         assert_eq!((t.address_rate_per_sec, t.address_burst), (5.0, 10.0));
@@ -661,6 +662,10 @@ mod tests {
         assert_eq!(t.refresh_every, Duration::from_secs(7));
         assert_eq!((t.batch_max_records, t.batch_max_bytes), (10, 100_000));
         assert_eq!(t.batch_min_interval, Duration::ZERO);
+        assert_eq!(t.symbol_workers, 3);
+        assert_eq!(t.symbol_deadline, Duration::from_millis(500));
+        assert_eq!(t.symbol_cache_bytes, 2_097_152);
+        assert_eq!(t.symbol_recheck, Duration::from_secs(11));
         assert!(!t.shared_dedup);
         assert_eq!(t.drop_flush, Duration::from_secs(9));
         assert_eq!(t.trusted_proxy_hops, 2);
@@ -697,6 +702,10 @@ mod tests {
             ("DEDUP_WINDOW_SECS", "dedup_window_secs", "0"),
             ("DROP_FLUSH_SECS", "drop_flush_secs", "0"),
             ("SHARED_DEDUP", "shared_dedup", "sometimes"),
+            ("SYMBOL_WORKERS", "symbol_workers", "0"),
+            ("SYMBOL_DEADLINE_MS", "symbol_deadline_ms", "99"),
+            ("SYMBOL_CACHE_BYTES", "symbol_cache_bytes", "1000"),
+            ("SYMBOL_RECHECK_SECS", "symbol_recheck_secs", "0"),
         ] {
             let leaked: &'static str = Box::leak(bad.to_owned().into_boxed_str());
             assert_eq!(

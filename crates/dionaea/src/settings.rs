@@ -45,6 +45,12 @@ pub(crate) struct Tuning {
     pub(crate) batch_max_records: usize,
     pub(crate) batch_max_bytes: usize,
     pub(crate) batch_min_interval: Duration,
+    /// Translating the stacks of error events: threads, time per batch, memory
+    /// for parsed files and how long an index answer is trusted.
+    pub(crate) symbol_workers: usize,
+    pub(crate) symbol_deadline: Duration,
+    pub(crate) symbol_cache_bytes: usize,
+    pub(crate) symbol_recheck: Duration,
     /// How many reverse proxies sit in front of the server. With 0 the client
     /// address is the socket peer and `client_address_header` is ignored.
     pub(crate) trusted_proxy_hops: u8,
@@ -309,6 +315,46 @@ pub(crate) static SPECS: &[Spec] = &[
         |t| t.batch_min_interval.as_millis().to_string()
     ),
     spec!(
+        "symbol_workers",
+        "2",
+        "from 1 to 16",
+        "threads that translate error stacks for one batch",
+        usize,
+        |v| (1..=16).contains(v),
+        |t, v| t.symbol_workers = v,
+        |t| t.symbol_workers.to_string()
+    ),
+    spec!(
+        "symbol_deadline_ms",
+        "2000",
+        "from 100 to 60000 milliseconds",
+        "most time one batch spends translating error stacks; events not reached are stored raw and flagged",
+        u64,
+        |v| (100..=60_000).contains(v),
+        |t, v| t.symbol_deadline = Duration::from_millis(v),
+        |t| t.symbol_deadline.as_millis().to_string()
+    ),
+    spec!(
+        "symbol_cache_bytes",
+        "134217728",
+        "from 1048576 to 4294967296",
+        "memory for parsed source maps and mapping files",
+        usize,
+        |v| ((1 << 20)..=(4 << 30)).contains(v),
+        |t, v| t.symbol_cache_bytes = v,
+        |t| t.symbol_cache_bytes.to_string()
+    ),
+    spec!(
+        "symbol_recheck_secs",
+        "30",
+        "from 1 to 3600 seconds",
+        "how long a symbol file is trusted before the index is asked again (also how soon an upload is noticed)",
+        u64,
+        |v| (1..=3600).contains(v),
+        |t, v| t.symbol_recheck = Duration::from_secs(v),
+        |t| secs(t.symbol_recheck)
+    ),
+    spec!(
         "trusted_proxy_hops",
         "0",
         "from 0 to 8",
@@ -477,6 +523,10 @@ impl Tuning {
             batch_max_records: 1,
             batch_max_bytes: 1,
             batch_min_interval: Duration::ZERO,
+            symbol_workers: 1,
+            symbol_deadline: Duration::ZERO,
+            symbol_cache_bytes: 1,
+            symbol_recheck: Duration::ZERO,
             trusted_proxy_hops: 0,
             client_address_header: String::new(),
             dedup_capacity: 0,
