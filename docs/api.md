@@ -189,6 +189,13 @@ past the limits with `413`.
 The files are kept in `artifacts_dir`. No part of a release or a name becomes
 part of a path on disk: both are hashed.
 
+**Names the server looks for.** A JavaScript frame is translated with the source
+map named like its module plus `.map`: for `https://cdn.example.com/static/js/main.3f9a.js`
+the file `static/js/main.3f9a.js.map`, then `main.3f9a.js.map`. Uploading from the
+build directory with `--root` gives exactly these names. An Android release has
+one file named `mapping.txt` (kind `proguard`). A file is looked up by its
+release, so upload it for the `release` the app reports.
+
 ## Command line
 
 The first member and the first tokens come from the command line, which reads

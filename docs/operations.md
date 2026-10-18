@@ -68,6 +68,8 @@ the status listed in `wire-format.md`.
 | `max_event_future_secs` | 3600 | 0 to 86400 | Furthest ahead an event may be |
 | `refresh_secs` | 2 | 1 to 3600 | How often keys and schemas are checked for changes; a revoked key stops working within this time |
 | `batch_max_records`, `batch_max_bytes`, `batch_min_interval_ms` | 1000, 8 MiB, 200 | 1 to 1000, 64 KiB to 64 MiB, 0 to 60000 | How events are grouped into ClickHouse inserts |
+| `symbol_workers`, `symbol_deadline_ms` | 2, 2000 | 1 to 16, 100 to 60000 | Threads that translate error stacks for one batch, and the most time a batch spends on it; events not reached are stored as sent with `symbols = skipped` |
+| `symbol_cache_bytes`, `symbol_recheck_secs` | 128 MiB, 30 | 1 MiB to 4 GiB, 1 to 3600 | Memory for parsed source maps and mapping files, and how long an answer of the index is trusted (so how soon an upload is noticed, and how long a missing or unusable file is remembered) |
 | `dedup_capacity`, `dedup_window_secs` | 1000000, 600 (about 80 MB at the default capacity) | 0 to 100000000 (0 is off), 1 to 86400 | Event ids remembered to drop an event sent again |
 | `shared_dedup` | true | true or false | Ask ClickHouse which events another node stored, and record this node's ids |
 | `drop_flush_secs` | 5 | 1 to 300 | How often the drop counts of requests that kept no event are written |
@@ -250,6 +252,31 @@ The job's own metrics: `dionaea_erasure_requests{state}` (requests by state), `d
 Requests are for one subject: `--user` or `--anon`, not both.
 
 Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `sessions`, `errors` and `measurements`, which do not exist yet and will join the list of identifier tables a test enforces.
+
+## Error stacks
+
+Error events are translated (see [wire format](wire-format.md#stacks-translated-by-the-server))
+by the thread that moves events to ClickHouse, after they are durable in the
+spool, so collecting is never slowed by it. What bounds it:
+
+- A batch is at most `batch_max_bytes`, and spends at most `symbol_deadline_ms`
+  on translation; the rest of its error events are stored as sent and flagged
+  `skipped`. Measured on a release build with 20,000 error events, each
+  naming a release of its own, and a 100 ms deadline: 0.38 s for the whole
+  batch, 17,801 of them skipped.
+- Parsed files stay in memory up to `symbol_cache_bytes` (least recently used
+  first); a file larger than that is `failed`. Entries for files that do not exist or
+  cannot be used are remembered too, at most 4096 of them and the first to go, so a
+  sender who invents release names can neither grow memory nor push real files out. One event
+  opens at most 8 files. Reading a file takes up to its size (64 MiB at most) for
+  as long as it is parsed, for each worker at a time.
+- A file replaced or uploaded is noticed within `symbol_recheck_secs`.
+
+Metrics: `dionaea_symbolication_events_total{outcome}` (`ok`, `partial`,
+`missing`, `failed`, `none`, `skipped`; alert when `missing` or `failed` grows
+after a release), `_cache_hits_total`, `_file_loads_total`, `_index_errors_total`,
+`_panics_total` (a bug, contained to one event), `_microseconds_total`, and the
+gauges `_cache_bytes` and `_cache_entries`.
 
 ## Sessions
 

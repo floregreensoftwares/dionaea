@@ -32,7 +32,7 @@ use std::time::Duration;
 
 pub use erase::{IDENTIFIER_TABLES, IdentifierTable, Rewrite, TableCount};
 pub use retention::Expired;
-pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key};
+pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key, with_props_str};
 
 /// Most rows one insert call accepts.
 pub const MAX_ROWS_PER_INSERT: usize = 100_000;

@@ -213,11 +213,18 @@ impl SourceMap {
             return Err(SourceMapError::TooLarge);
         }
         let root = raw.source_root.unwrap_or_default();
-        let sources: Vec<String> = raw
-            .sources
-            .into_iter()
-            .map(|s| join_root(&root, &s.unwrap_or_default()))
-            .collect();
+        // A long root joined to many short sources would take memory in the
+        // product of the two; the joined names may not exceed the input bound.
+        let mut joined = 0usize;
+        let mut sources: Vec<String> = Vec::with_capacity(raw.sources.len());
+        for source in raw.sources {
+            let name = join_root(&root, &source.unwrap_or_default());
+            joined = joined.saturating_add(name.len());
+            if joined > max_bytes {
+                return Err(SourceMapError::TooLarge);
+            }
+            sources.push(name);
+        }
         let names: Vec<String> = raw
             .names
             .into_iter()
@@ -570,6 +577,21 @@ mod tests {
             SourceMap::parse(&map(&many_lines), 1 << 30).unwrap_err(),
             SourceMapError::TooLarge
         );
+    }
+
+    #[test]
+    fn a_long_root_joined_to_many_sources_is_bounded_by_the_input_limit() {
+        let sources = vec!["\"a.js\""; 2000].join(",");
+        let text = format!(
+            "{{\"version\":3,\"sourceRoot\":\"{}\",\"sources\":[{sources}],\"mappings\":\"AAAA\"}}",
+            "r".repeat(1000)
+        );
+        // About 14 KB in, about 2 MB once every source carries the root.
+        assert_eq!(
+            SourceMap::parse(text.as_bytes(), 20_000).unwrap_err(),
+            SourceMapError::TooLarge
+        );
+        assert!(SourceMap::parse(text.as_bytes(), 4 << 20).is_ok());
     }
 
     #[test]

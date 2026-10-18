@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use dionaea_ingest::BatcherStats;
+use dionaea_ingest::{BatcherStats, SymbolStats};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,6 +33,8 @@ pub(crate) struct Status {
     /// The last attempt to read keys and schemas failed.
     pub(crate) metadata_failing: AtomicBool,
     pub(crate) batcher: Mutex<Option<Arc<BatcherStats>>>,
+    /// What the symbolication of error stacks did, set once at start.
+    symbols: std::sync::OnceLock<Arc<SymbolStats>>,
     /// What the erasure job did and the state of the requests.
     pub(crate) erasure: Arc<JobStats>,
     /// What the retention job did.
@@ -41,6 +43,10 @@ pub(crate) struct Status {
 }
 
 impl Status {
+    pub(crate) fn set_symbols(&self, stats: Arc<SymbolStats>) {
+        let _ = self.symbols.set(stats);
+    }
+
     pub(crate) fn new(spool_quota_bytes: u64) -> Self {
         Self {
             clickhouse_ready: AtomicBool::new(false),
@@ -48,6 +54,7 @@ impl Status {
             settings_skipped: AtomicU64::new(0),
             metadata_failing: AtomicBool::new(false),
             batcher: Mutex::new(None),
+            symbols: std::sync::OnceLock::new(),
             erasure: Arc::default(),
             retention: Arc::default(),
             spool_quota_bytes,
@@ -486,6 +493,68 @@ fn render(ops: &Ops) -> String {
             "dionaea_batcher_rows_total{{table=\"identity\"}} {}",
             stats.identity_rows()
         );
+    }
+
+    if let Some(stats) = ops.status.symbols.get() {
+        metric(
+            &mut out,
+            "dionaea_symbolication_events_total",
+            "counter",
+            "Error events by how their stack was translated.",
+        );
+        for (outcome, count) in stats.outcomes() {
+            let _ = writeln!(
+                out,
+                "dionaea_symbolication_events_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
+        for (name, kind, help, value) in [
+            (
+                "dionaea_symbolication_cache_hits_total",
+                "counter",
+                "Symbol file lookups answered by the cache.",
+                stats.hits(),
+            ),
+            (
+                "dionaea_symbolication_file_loads_total",
+                "counter",
+                "Symbol files read from storage and parsed.",
+                stats.loads(),
+            ),
+            (
+                "dionaea_symbolication_index_errors_total",
+                "counter",
+                "Times the index of symbol files could not be read.",
+                stats.index_errors(),
+            ),
+            (
+                "dionaea_symbolication_panics_total",
+                "counter",
+                "Events whose symbolication panicked and was contained.",
+                stats.panics(),
+            ),
+            (
+                "dionaea_symbolication_microseconds_total",
+                "counter",
+                "Time spent translating error stacks, summed over the workers.",
+                stats.micros(),
+            ),
+            (
+                "dionaea_symbolication_cache_bytes",
+                "gauge",
+                "Memory the cache of parsed symbol files counts.",
+                stats.cache_bytes() as u64,
+            ),
+            (
+                "dionaea_symbolication_cache_entries",
+                "gauge",
+                "Symbol files, found or not, the cache remembers.",
+                stats.cache_entries() as u64,
+            ),
+        ] {
+            metric(&mut out, name, kind, help);
+            let _ = writeln!(out, "{name} {value}");
+        }
     }
 
     render_erasure(&mut out, &ops.status.erasure);
