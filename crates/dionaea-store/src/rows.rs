@@ -144,6 +144,34 @@ pub fn event_key(line: &str) -> Option<(u32, &str)> {
     Some((site.parse().ok()?, id))
 }
 
+/// The line `line` (written by [`EventRow::to_json_line`]) with its string
+/// properties replaced by `props`. Everything else stays byte for byte, so the
+/// site and event id stay the first two fields ([`event_key`]). `None` when the
+/// line does not have the layout `to_json_line` writes.
+///
+/// The cut points are `,"props_str":{` and the first `},"props_num":{` after
+/// it. Both contain an unescaped quote, which never occurs inside a string
+/// written by `push_string`, and no value of `props_str` starts with `{`, so
+/// neither can be matched inside content a sender chose.
+pub fn with_props_str(line: &str, props: &[(String, String)]) -> Option<String> {
+    const START: &str = ",\"props_str\":{";
+    const END: &str = "},\"props_num\":{";
+    let from = line.find(START)? + START.len();
+    let to = from + line[from..].find(END)?;
+    let mut out = String::with_capacity(line.len() + 64);
+    out.push_str(&line[..from]);
+    for (index, (key, value)) in props.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_string(&mut out, key);
+        out.push(':');
+        push_string(&mut out, value);
+    }
+    out.push_str(&line[to..]);
+    Some(out)
+}
+
 impl EventRow {
     /// One `JSONEachRow` line, written straight into a string: building a
     /// generic JSON tree first cost several times more.
@@ -342,6 +370,31 @@ mod tests {
         assert_eq!(value["name"], nasty);
         assert_eq!(value["props_str"][nasty], nasty);
         assert_eq!(value["props_num"][nasty], -0.5);
+    }
+
+    #[test]
+    fn replacing_the_string_properties_keeps_every_other_byte() {
+        let nasty = "},\"props_num\":{\"x\":1},\"props_str\":{ \\\" é";
+        let mut row = event();
+        row.props_str = vec![(nasty.to_owned(), nasty.to_owned())];
+        row.screen = nasty.to_owned();
+        let line = row.to_json_line().unwrap();
+        let props = vec![
+            ("frames".to_owned(), nasty.to_owned()),
+            ("symbols".to_owned(), "ok".to_owned()),
+        ];
+        let changed = with_props_str(&line, &props).unwrap();
+        let value: Value = serde_json::from_str(&changed).unwrap();
+        assert_eq!(value["props_str"]["frames"], nasty);
+        assert_eq!(value["props_str"]["symbols"], "ok");
+        assert_eq!(value["props_str"].as_object().unwrap().len(), 2);
+        assert_eq!(value["screen"], nasty);
+        assert_eq!(value["props_num"]["ratio"], 0.25);
+        assert_eq!(value.as_object().unwrap().len(), 18);
+        assert_eq!(event_key(&changed), event_key(&line));
+        // Writing the original properties back gives the original line.
+        assert_eq!(with_props_str(&line, &row.props_str).unwrap(), line);
+        assert!(with_props_str("{}", &props).is_none());
     }
 
     #[test]
