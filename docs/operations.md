@@ -330,6 +330,27 @@ FROM perf_daily WHERE site_id = 1 AND metric = 'http_duration' GROUP BY target
 
 The migration that creates these tables also copies what the events already stored imply (measurements, the rollups that follow them, `releases`, and `issues_daily` from the errors in `errors`), once: running it again changes nothing. The copy of `issues_daily` only fills an empty table, so it is never doubled; if another node already inserted an error into `errors` while the migration ran, that copy is skipped and the rollup starts from the errors received from then on. When several nodes are upgraded, migrate with ingest stopped on the others. Errors stored before fingerprints existed group under an empty fingerprint.
 
+## Performance sampling
+
+A site that sends more performance data than it needs can keep a share of it. The share applies to the four built-in performance events only (`app_start`, `screen_load`, `http_request`, `web_vital`). Errors, crashes, identify calls and every event a site declared are never sampled.
+
+```
+dionaea sampling set --site 1 --rate 0.25    # keep a quarter
+dionaea sampling list                        # site, share kept
+dionaea sampling unset --site 1              # keep everything again
+```
+
+or `GET`, `PUT`, `DELETE /sites/{site}/sampling` (`{"performance": 0.25}`; an admin changes it). The rate is above 0 and up to 1, with at most six decimals. Servers apply a change at their next refresh (`refresh_secs`), like keys and schemas.
+
+How it works:
+
+- The choice depends on the event id alone, so an event sent again (a retry, a replay of the spool) is kept or dropped the same way, and no node remembers anything. A lower rate keeps a subset of what a higher one keeps.
+- An event that is not kept is counted in `drops_daily` with the reason `sampled` (and in the drop metrics), under its event name. Sent minus stored is therefore always recoverable.
+- A kept event is stored with a number `sample_rate`, the share kept. `measurements.sample_rate` reads it (1 when there is none), and `perf_daily.weight` sums 1 over the rate, so a count of kept events times their weight estimates how many were sent. Percentiles need no correction: the events are chosen without regard to their values.
+- Events kept before a change keep the rate they were stored with.
+
+What is not claimed: that the share kept is exact. It follows the rate as a random sample does (about four standard deviations of a binomial count), and tests check that against fixed ids.
+
 ## Sessions
 
 The SDK generates the session id and sends it with every event. A materialized view (`sessions_mv`) summarizes the events that carry one into the `sessions` table as they are inserted: first and last event time, how many events, the entry and exit screen, how many distinct screens, and the platform, app version and country of the first event. Rows of one session that arrive in separate inserts are merged in the background and, until then, read with `GROUP BY`:

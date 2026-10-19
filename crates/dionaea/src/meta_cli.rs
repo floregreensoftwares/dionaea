@@ -621,6 +621,55 @@ pub(crate) fn erase_retry(
     }
 }
 
+/// Sets the share of a site's performance events that are kept (`rate` in
+/// `(0, 1]`, at most six decimals); `None` goes back to keeping all. Errors
+/// and crashes are never sampled. Servers apply it at their next refresh.
+pub(crate) fn sampling_set(
+    store: &dyn MetaStore,
+    site_id: u32,
+    rate: Option<f64>,
+    err: &mut impl Write,
+) -> u8 {
+    let ppm = match rate {
+        None => dionaea_meta::SAMPLE_FULL_PPM,
+        Some(rate) => match dionaea_meta::ppm_from_rate(rate) {
+            Some(ppm) => ppm,
+            None => {
+                let _ = writeln!(
+                    err,
+                    "error: the rate is a number above 0 and up to 1, with at most six decimals"
+                );
+                return REFUSED;
+            }
+        },
+    };
+    match store.set_performance_sampling(site_id, ppm) {
+        Ok(()) => OK,
+        Err(error) => report(&error, "", err),
+    }
+}
+
+/// One line per site: id and the share of performance events kept.
+pub(crate) fn sampling_list(
+    store: &dyn MetaStore,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    let sites = match store.sites() {
+        Ok(sites) => sites,
+        Err(error) => return report(&error, "", err),
+    };
+    for site in sites {
+        match store.performance_sampling(site.id) {
+            Ok(ppm) => {
+                let _ = writeln!(out, "{}\t{}", site.id, f64::from(ppm) / 1_000_000.0);
+            }
+            Err(error) => return report(&error, "", err),
+        }
+    }
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use dionaea_meta::SqliteMeta;

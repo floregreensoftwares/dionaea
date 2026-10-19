@@ -1726,3 +1726,74 @@ fn issue_states_follow_the_token_that_asks_and_come_in_pages() {
         assert_eq!(page(bad).status, 400, "{bad}");
     }
 }
+
+#[test]
+fn performance_sampling_is_read_set_and_unset_within_the_site() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let viewer = login(&w, "viewer@example.com", &[(w.acme, Role::Viewer)]);
+    let path = format!("sites/{}/sampling", w.shop);
+
+    let before = w.call("GET", &path, &viewer, None);
+    assert_eq!(
+        (
+            before.status,
+            before.body["performance"].as_f64(),
+            before.body["own"].as_bool()
+        ),
+        (200, Some(1.0), Some(false))
+    );
+    // A viewer reads and cannot change.
+    assert_eq!(
+        w.status("PUT", &path, &viewer, Some(json!({ "performance": 0.5 }))),
+        403
+    );
+    let set = w.call("PUT", &path, &admin, Some(json!({ "performance": 0.25 })));
+    assert_eq!(set.status, 200, "{:?}", set.body);
+    assert_eq!(
+        (set.body["performance"].as_f64(), set.body["own"].as_bool()),
+        (Some(0.25), Some(true))
+    );
+    assert_eq!(
+        w.call("GET", &path, &viewer, None).body["performance"],
+        0.25
+    );
+    // The change is part of what the ingest cache loads.
+    assert_eq!(
+        w.meta.snapshot().expect("snapshot").sampling,
+        [(w.shop, 250_000)]
+    );
+    // Another site is untouched.
+    assert_eq!(
+        w.call("GET", &format!("sites/{}/sampling", w.blog), &admin, None)
+            .body["own"],
+        false
+    );
+    for bad in [
+        json!({ "performance": 0 }),
+        json!({ "performance": 1.5 }),
+        json!({ "performance": -1 }),
+        json!({ "performance": 0.1234567 }),
+        json!({ "performance": "half" }),
+        json!({ "errors": 0.5 }),
+        json!({ "performance": 0.5, "errors": 0.5 }),
+    ] {
+        assert_eq!(
+            w.status("PUT", &path, &admin, Some(bad.clone())),
+            400,
+            "{bad}"
+        );
+    }
+    assert_eq!(w.call("GET", &path, &admin, None).body["performance"], 0.25);
+    assert_eq!(w.status("DELETE", &path, &admin, None), 204);
+    assert_eq!(w.call("GET", &path, &admin, None).body["performance"], 1.0);
+    assert_eq!(
+        w.status(
+            "PUT",
+            &format!("sites/{}/sampling", w.elsewhere),
+            &admin,
+            Some(json!({ "performance": 0.5 }))
+        ),
+        404
+    );
+}
