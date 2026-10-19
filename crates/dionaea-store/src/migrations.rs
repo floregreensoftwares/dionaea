@@ -257,6 +257,16 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             WHERE name = 'app_error'",
         ],
     },
+    Migration {
+        version: 7,
+        name: "sessions deduplication",
+        statements: &[
+            // The table was created without a window, so a retried batch
+            // (same token) was summed twice into `events`. Setting the
+            // window is the same when run again.
+            "ALTER TABLE sessions MODIFY SETTING non_replicated_deduplication_window = 1000",
+        ],
+    },
 ];
 
 #[cfg(test)]
@@ -279,7 +289,9 @@ mod tests {
                 // A statement that sets a table property is the same when run
                 // again; the others must not fail when the object exists.
                 assert!(
-                    statement.contains("IF NOT EXISTS") || statement.contains(" MODIFY TTL "),
+                    statement.contains("IF NOT EXISTS")
+                        || statement.contains(" MODIFY TTL ")
+                        || statement.contains(" MODIFY SETTING "),
                     "{statement}"
                 );
                 assert!(!statement.contains(';'), "one statement per entry");

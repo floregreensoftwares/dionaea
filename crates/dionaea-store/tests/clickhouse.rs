@@ -1772,3 +1772,17 @@ fn the_ingest_user_fills_the_errors_by_inserting_events_and_cannot_read_them() {
     let query = user_store(&scratch.database, &roles.query_user, &roles.query_password);
     assert_eq!(count(&query, "errors"), 1, "the query user reads them");
 }
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retried_batch_does_not_count_its_events_twice_in_sessions() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let batch = [session_event(1, "s1", "a1", "/home", T0)];
+    store.insert_events(&batch, "same").expect("first");
+    store.insert_events(&batch, "same").expect("retry");
+    let events = store
+        .raw_query("SELECT sum(events) FROM sessions FORMAT TabSeparated")
+        .expect("sessions");
+    assert_eq!(events.trim(), "1");
+}
