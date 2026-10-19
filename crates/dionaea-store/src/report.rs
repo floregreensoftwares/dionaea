@@ -108,25 +108,25 @@ pub struct Statement {
 }
 
 #[derive(Default)]
-struct Builder {
+pub(crate) struct Builder {
     params: Vec<(String, String)>,
 }
 
 impl Builder {
-    fn param(&mut self, kind: &str, value: impl ToString) -> String {
+    pub(crate) fn param(&mut self, kind: &str, value: impl ToString) -> String {
         let name = format!("p{}", self.params.len());
         self.params.push((name.clone(), value.to_string()));
         format!("{{{name}:{kind}}}")
     }
 
-    fn finish(self, sql: String) -> Statement {
+    pub(crate) fn finish(self, sql: String) -> Statement {
         Statement {
             sql,
             params: self.params,
         }
     }
 
-    fn time(&mut self, ms: i64) -> String {
+    pub(crate) fn time(&mut self, ms: i64) -> String {
         let p = self.param("Int64", ms);
         format!("fromUnixTimestamp64Milli({p}, 'UTC')")
     }
