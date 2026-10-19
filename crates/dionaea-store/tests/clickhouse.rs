@@ -128,6 +128,8 @@ fn migrate_creates_the_tables_and_is_idempotent() {
             "_migrations",
             "derived_sessions",
             "drops_daily",
+            "errors",
+            "errors_mv",
             "event_ids",
             "events",
             "identity_alias",
@@ -175,7 +177,7 @@ fn two_nodes_migrating_at_once_both_succeed() {
             ))
             .expect("count")
             .trim(),
-        "9"
+        "11"
     );
     let _ = scratch
         .admin
@@ -567,7 +569,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 5);
+    assert_eq!(count(&scratch.store, "_migrations"), 6);
 }
 
 #[test]
@@ -971,7 +973,8 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
             ("events", 3),
             ("identity_alias", 3),
             ("user_traits", 1),
-            ("sessions", 2)
+            ("sessions", 2),
+            ("errors", 0)
         ],
         "a1 twice and a2 once; both links of a2 and the link of a1; the traits"
     );
@@ -989,7 +992,8 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
             ("events", 0),
             ("identity_alias", 0),
             ("user_traits", 0),
-            ("sessions", 0)
+            ("sessions", 0),
+            ("errors", 0)
         ],
         "queries no longer see the rows"
     );
@@ -1023,7 +1027,8 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
             ("events", 0),
             ("identity_alias", 0),
             ("user_traits", 0),
-            ("sessions", 0)
+            ("sessions", 0),
+            ("errors", 0)
         ],
         "now it is gone from disk"
     );
@@ -1079,7 +1084,8 @@ fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
             ("events", 0),
             ("identity_alias", 0),
             ("user_traits", 0),
-            ("sessions", 0)
+            ("sessions", 0),
+            ("errors", 0)
         ]
     );
 }
@@ -1189,7 +1195,8 @@ fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
             ("events", 0),
             ("identity_alias", 0),
             ("user_traits", 0),
-            ("sessions", 0)
+            ("sessions", 0),
+            ("errors", 0)
         ]
     );
     assert_eq!(count(store, "events"), 2, "the other person's two events");
@@ -1224,7 +1231,8 @@ fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits()
             ("events", 1),
             ("identity_alias", 2),
             ("user_traits", 0),
-            ("sessions", 1)
+            ("sessions", 1),
+            ("errors", 0)
         ],
         "the event of a2 and both links to it; no user, so no traits"
     );
@@ -1237,7 +1245,8 @@ fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits()
             ("events", 0),
             ("identity_alias", 0),
             ("user_traits", 0),
-            ("sessions", 0)
+            ("sessions", 0),
+            ("errors", 0)
         ]
     );
     // Everything else stays: the other events, the other links, all traits.
@@ -1489,6 +1498,10 @@ fn each_site_loses_only_what_is_older_than_its_own_cutoff() {
             Expired {
                 table: "sessions",
                 rows: 2
+            },
+            Expired {
+                table: "errors",
+                rows: 0
             }
         ]
     );
@@ -1607,4 +1620,155 @@ fn events_no_longer_expire_by_a_rule_of_the_table_itself() {
         .raw_query("OPTIMIZE TABLE events FINAL")
         .expect("merge");
     assert_eq!(count(&scratch.store, "events"), 1);
+}
+
+// Errors.
+
+fn error_event(n: u64, anon: &str, fingerprint: &str, ts: u64) -> EventRow {
+    let mut row = event(n);
+    row.name = "app_error".to_owned();
+    row.anon_id = anon.to_owned();
+    row.ts_ms = ts;
+    row.props_str = [
+        ("kind", "unhandled"),
+        ("type", "TypeError"),
+        ("message", "bad quantity"),
+        ("frames", "src/util.js|parseQuantity|4|11|1"),
+        ("symbols", "ok"),
+        ("fingerprint", fingerprint),
+    ]
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .to_vec();
+    row
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn error_events_are_copied_into_the_errors_table_and_other_events_are_not() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                event(1),
+                error_event(2, "a1", "f1", T0),
+                error_event(3, "a2", "f2", T0),
+            ],
+            "errors-1",
+        )
+        .expect("insert");
+    assert_eq!(count(store, "events"), 3);
+    assert_eq!(count(store, "errors"), 2);
+    let rows = store
+        .raw_query(
+            "SELECT anon_id, fingerprint, symbols, kind, error_type, message, frames \
+             FROM errors ORDER BY anon_id FORMAT TabSeparated",
+        )
+        .expect("errors");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        vec![
+            "a1\tf1\tok\tunhandled\tTypeError\tbad quantity\tsrc/util.js|parseQuantity|4|11|1",
+            "a2\tf2\tok\tunhandled\tTypeError\tbad quantity\tsrc/util.js|parseQuantity|4|11|1",
+        ]
+    );
+    // Another insert of the same error is another row: only a retried batch is dropped.
+    store
+        .insert_events(&[error_event(2, "a1", "f1", T0)], "errors-2")
+        .expect("insert");
+    assert_eq!(count(store, "errors"), 3, "a new token stores a new row");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retried_batch_does_not_repeat_its_errors() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let batch = [error_event(1, "a1", "f1", T0)];
+    store.insert_events(&batch, "same").expect("first");
+    store.insert_events(&batch, "same").expect("retry");
+    assert_eq!(count(store, "events"), 1);
+    assert_eq!(count(store, "errors"), 1);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn erasing_a_device_removes_its_errors_too() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                error_event(1, "a1", "f1", T0),
+                error_event(2, "a2", "f1", T0),
+            ],
+            "erase-errors",
+        )
+        .expect("insert");
+    assert_eq!(count(store, "errors"), 2);
+    let devices = vec!["a1".to_owned()];
+    store.delete_user_rows(7, None, &devices).expect("delete");
+    let needed = store.rewrites_needed(7, None, &devices).expect("needed");
+    store.apply_rewrites(&needed).expect("rewrite");
+    assert_eq!(count(store, "errors"), 1);
+    assert_eq!(
+        store
+            .raw_query("SELECT anon_id FROM errors SETTINGS apply_deleted_mask = 0")
+            .expect("left")
+            .trim(),
+        "a2",
+        "and nothing of a1 is left on disk"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_sites_retention_reaches_its_errors() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let mut old = error_event(1, "a1", "f1", at("08-01"));
+    let mut recent = error_event(2, "a1", "f1", at("10-20"));
+    for row in [&mut old, &mut recent] {
+        row.received_ms = now_ms();
+    }
+    store
+        .insert_events(&[old, recent], "retention-errors")
+        .expect("insert");
+    assert_eq!(count(store, "errors"), 2);
+    let expired = store.expire_analytics(7, at("10-15")).expect("expire");
+    assert!(
+        expired.contains(&Expired {
+            table: "errors",
+            rows: 1
+        }),
+        "{expired:?}"
+    );
+    assert_eq!(count(store, "errors"), 1);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_ingest_user_fills_the_errors_by_inserting_events_and_cannot_read_them() {
+    let scratch = Scratch::new();
+    let roles = roles("errors");
+    let _cleanup = UsersGuard(
+        &scratch.admin,
+        vec![roles.ingest_user.clone(), roles.query_user.clone()],
+    );
+    scratch.store.provision_roles(&roles).expect("provision");
+    let ingest = user_store(
+        &scratch.database,
+        &roles.ingest_user,
+        &roles.ingest_password,
+    );
+    ingest
+        .insert_events(&[error_event(1, "a1", "f1", T0)], "ingest-errors")
+        .expect("the ingest user inserts events");
+    assert_eq!(count(&scratch.store, "errors"), 1, "and the view followed");
+    let error = ingest
+        .raw_query("SELECT count() FROM errors")
+        .expect_err("denied");
+    assert!(denied(&error), "{error:?}");
+    let query = user_store(&scratch.database, &roles.query_user, &roles.query_password);
+    assert_eq!(count(&query, "errors"), 1, "the query user reads them");
 }
