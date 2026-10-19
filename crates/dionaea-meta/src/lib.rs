@@ -23,7 +23,9 @@ mod accounts;
 mod accounts_tests;
 mod erasure;
 mod erasure_sql;
+mod issues;
 mod migrations;
+mod releases;
 mod retention;
 mod sqlite;
 mod symbols;
@@ -38,6 +40,11 @@ pub use erasure::{
     ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, IdKind,
     MAX_KEY_LEN, MIN_KEY_LEN, TombstoneBatch, Tombstones,
 };
+pub use issues::{
+    FINGERPRINT_CHARS, IssueIndex, IssueRecord, IssueState, MAX_ISSUES_LISTED, MAX_ISSUES_PER_SITE,
+    is_fingerprint,
+};
+pub use releases::compare_versions;
 pub use sqlite::SqliteMeta;
 pub use symbols::{
     MAX_LISTED, MAX_RELEASE_CHARS, MAX_SYMBOL_NAME_CHARS, SymbolFile, SymbolIndex, SymbolKind,
