@@ -569,7 +569,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 6);
+    assert_eq!(count(&scratch.store, "_migrations"), 7);
 }
 
 #[test]
