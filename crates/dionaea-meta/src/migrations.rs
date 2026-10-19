@@ -277,4 +277,14 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         CREATE INDEX issues_to_check ON issues (state, checked_at);
     ",
     },
+    Migration {
+        version: 12,
+        name: "performance_sampling",
+        sql: "
+        -- Millionths of a site's performance events that are kept; errors
+        -- and crashes are never sampled.
+        ALTER TABLE sites ADD COLUMN performance_sample_ppm INTEGER NOT NULL DEFAULT 1000000
+            CHECK (performance_sample_ppm BETWEEN 1 AND 1000000);
+    ",
+    },
 ];
