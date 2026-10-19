@@ -21,7 +21,7 @@ macro_rules! measurement_select {
             site_id, event_id, ts, received_at, anon_id, session_id,
             measure.1 AS metric,
             measure.2 AS value,
-            1.0 AS sample_rate,
+            if(mapContains(props_num, 'sample_rate'), props_num['sample_rate'], 1.0) AS sample_rate,
             multiIf(
                 name = 'app_start', props_str['start'],
                 name = 'http_request', props_str['method'],
@@ -321,8 +321,9 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             // (first frame, interactive), a screen load (render,
             // interactive), a network call (duration) or a web vital. It
             // holds the device and session ids, so erasure and retention
-            // cover it. `sample_rate` is the share of such events the app
-            // sent; nothing samples yet, so it is 1.
+            // cover it. `sample_rate` is the share of such events the server kept,
+            // read from the `sample_rate` number it stores on a sampled event,
+            // and 1 for an event that carries none.
             "CREATE TABLE IF NOT EXISTS measurements (
                 site_id      UInt32,
                 event_id     UUID,

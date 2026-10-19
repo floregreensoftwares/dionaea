@@ -2251,3 +2251,35 @@ fn the_error_count_of_an_issue_follows_the_time_and_the_site() {
     assert_eq!(store.error_count(8, "f1", 0).expect("site"), 0);
     assert_eq!(store.error_count(7, "x' OR 1=1 --", 0).expect("nasty"), 0);
 }
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_sampled_event_carries_its_rate_into_the_measurement_and_the_weight() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                health_event(
+                    1,
+                    "screen_load",
+                    &[],
+                    &[("render", 100.0), ("sample_rate", 0.25)],
+                ),
+                health_event(2, "screen_load", &[], &[("render", 200.0)]),
+            ],
+            "sampled",
+        )
+        .expect("insert");
+    let rows = store
+        .raw_query(
+            "SELECT anon_id, sample_rate FROM measurements ORDER BY anon_id FORMAT TabSeparated",
+        )
+        .expect("rates");
+    assert_eq!(rows.lines().collect::<Vec<_>>(), ["a1\t0.25", "a2\t1"]);
+    // One event standing for four, and one for itself: five in all.
+    let weight = store
+        .raw_query("SELECT sum(samples), sum(weight) FROM perf_daily FORMAT TabSeparated")
+        .expect("weight");
+    assert_eq!(weight.trim(), "2\t5");
+}
