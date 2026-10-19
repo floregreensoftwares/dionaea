@@ -43,6 +43,15 @@ pub fn reserved_event_names() -> &'static [&'static str] {
     RESERVED
 }
 
+/// The built-in events that measure performance: the only ones a site may
+/// sample. Errors and crashes are never among them.
+pub fn is_performance_event(name: &str) -> bool {
+    matches!(
+        name,
+        "app_start" | "screen_load" | "http_request" | "web_vital"
+    )
+}
+
 pub(crate) fn event(name: &str) -> Option<&'static EventDef> {
     BUILTIN.get(name)
 }
@@ -161,6 +170,26 @@ fn n(value: &str) -> Name {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_four_performance_events_may_be_sampled() {
+        for name in ["app_start", "screen_load", "http_request", "web_vital"] {
+            assert!(is_performance_event(name), "{name}");
+            assert!(event(name).is_some(), "{name} has a built-in shape");
+        }
+        for name in [
+            "app_error",
+            "app_crash",
+            "anr",
+            "screen",
+            "ui_tap",
+            "app_lifecycle",
+            "checkout",
+            "",
+        ] {
+            assert!(!is_performance_event(name), "{name}");
+        }
+    }
 
     #[test]
     fn every_builtin_event_is_reserved() {

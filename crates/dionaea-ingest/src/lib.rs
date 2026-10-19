@@ -14,6 +14,7 @@ mod health;
 mod identify;
 mod limit;
 mod pipeline;
+mod sampling;
 mod sink;
 mod symbolicate;
 

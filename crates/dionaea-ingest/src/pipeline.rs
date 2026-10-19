@@ -9,12 +9,19 @@
 use std::collections::{BTreeMap, HashSet};
 
 use dionaea_core::{
-    DropReason, FieldValue, RequestError, WireEvent, decode_batch, reserved_event_names,
+    DropReason, FieldValue, RequestError, WireEvent, decode_batch, is_performance_event,
+    reserved_event_names,
 };
+use dionaea_meta::SAMPLE_FULL_PPM;
 
 use crate::cache::Admission;
 use crate::dedup::Deduper;
 use crate::enrich::Enrichment;
+
+/// The number a sampled performance event carries: the share of such events
+/// kept. The store reads it into `measurements.sample_rate`. The built-in
+/// shapes of those events have no field of this name, so a client cannot send it.
+const SAMPLE_RATE_FIELD: &str = "sample_rate";
 
 /// The event name counted for a drop whose name the site never declared, so a
 /// sender cannot mint counter keys by inventing names.
@@ -57,6 +64,8 @@ pub enum Reason {
     Bot,
     /// The device belongs to a user whose data is erased.
     Erased,
+    /// A performance event the site keeps only a share of, and not this one.
+    Sampled,
 }
 
 impl Reason {
@@ -68,6 +77,7 @@ impl Reason {
             Self::Duplicate => "duplicate_event",
             Self::Bot => "bot",
             Self::Erased => "erased",
+            Self::Sampled => "sampled",
         }
     }
 }
@@ -211,6 +221,21 @@ pub fn process_with(
         if repeated {
             count_drop(&event.name, Reason::Duplicate);
             continue;
+        }
+        // After the duplicate check and before anything is remembered, so a
+        // dropped event can be sent again and is judged the same way.
+        let sampled = admission.sample_ppm < SAMPLE_FULL_PPM && is_performance_event(&event.name);
+        if sampled && !crate::sampling::keep(key, admission.sample_ppm) {
+            count_drop(&event.name, Reason::Sampled);
+            continue;
+        }
+        let mut numbers = numbers;
+        if sampled {
+            // What the kept event stands for: read back into the measurement.
+            numbers.push((
+                SAMPLE_RATE_FIELD.to_owned(),
+                f64::from(admission.sample_ppm) / f64::from(SAMPLE_FULL_PPM),
+            ));
         }
         accepted.push(Accepted {
             site_id: admission.site_id,

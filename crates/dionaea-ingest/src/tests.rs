@@ -442,6 +442,7 @@ fn an_event_only_an_older_version_accepts_is_admitted_by_it() {
             (1, dionaea_core::parse_schema(V1).expect("v1")),
         ]),
         tombstones: Default::default(),
+        sample_ppm: dionaea_meta::SAMPLE_FULL_PPM,
     };
     let processed = run(
         &mixed,
@@ -749,4 +750,157 @@ fn a_site_cannot_redefine_a_health_event() {
         "[events.app_error.fields.message]\nkind = \"text\"\nmax = 10\n",
     );
     assert!(refused.is_err());
+}
+
+// Performance sampling.
+
+fn load(n: u32) -> serde_json::Value {
+    event(n, NOW, "screen_load", json!({ "render": 120 }))
+}
+
+/// Runs the events in batches of the most a batch holds, and puts the answers
+/// together.
+fn run_many(admission: &Admission, events: &[serde_json::Value]) -> Processed {
+    let mut all = Processed {
+        accepted: Vec::new(),
+        drops: Vec::new(),
+    };
+    for chunk in events.chunks(100) {
+        let part = run(admission, NOW, chunk);
+        all.accepted.extend(part.accepted);
+        for drop in part.drops {
+            match all
+                .drops
+                .iter_mut()
+                .find(|d| d.event_name == drop.event_name && d.reason == drop.reason)
+            {
+                Some(found) => found.count += drop.count,
+                None => all.drops.push(drop),
+            }
+        }
+    }
+    all
+}
+
+fn sampled(admission: Admission, ppm: u32) -> Admission {
+    Admission {
+        sample_ppm: ppm,
+        ..admission
+    }
+}
+
+#[test]
+fn a_site_that_keeps_half_of_its_performance_events_keeps_about_half_and_says_so() {
+    let admission = sampled(admission(&[V1]), 500_000);
+    let loads: Vec<_> = (1..=400).map(load).collect();
+    let result = run_many(&admission, &loads);
+    let kept = result.accepted.len() as u64;
+    let dropped = drop_of(&result, "screen_load", Reason::Sampled);
+    assert_eq!(kept + dropped, 400, "every event is kept or counted");
+    // Four standard deviations of a binomial count of 400 at one half.
+    assert!((160..=240).contains(&kept), "{kept} kept");
+    for event in &result.accepted {
+        let rate = event
+            .numbers
+            .iter()
+            .find(|(name, _)| name == "sample_rate")
+            .map(|(_, value)| *value);
+        assert_eq!(rate, Some(0.5), "a kept event says what it stands for");
+    }
+}
+
+#[test]
+fn errors_crashes_and_declared_events_are_never_sampled() {
+    // The smallest rate there is: nearly every performance event would go.
+    let admission = sampled(admission(&[V1]), 1);
+    let events = vec![
+        event(
+            1,
+            NOW,
+            "app_error",
+            json!({ "kind": "unhandled", "type": "TypeError" }),
+        ),
+        event(2, NOW, "checkout", json!({ "items": 3 })),
+        event(3, NOW, "screen", json!({ "name": "home" })),
+    ];
+    let result = run(&admission, NOW, &events);
+    assert_eq!(result.accepted.len(), 3);
+    assert!(
+        result
+            .accepted
+            .iter()
+            .all(|e| e.numbers.iter().all(|(name, _)| name != "sample_rate"))
+    );
+    assert!(result.drops.is_empty());
+}
+
+#[test]
+fn at_the_full_rate_nothing_is_dropped_and_no_rate_is_written() {
+    let admission = admission(&[V1]);
+    let loads: Vec<_> = (1..=50).map(load).collect();
+    let result = run_many(&admission, &loads);
+    assert_eq!(result.accepted.len(), 50);
+    assert!(
+        result
+            .accepted
+            .iter()
+            .all(|e| e.numbers.iter().all(|(name, _)| name != "sample_rate"))
+    );
+}
+
+#[test]
+fn an_event_is_judged_the_same_when_it_is_sent_again() {
+    let admission = sampled(admission(&[V1]), 300_000);
+    let loads: Vec<_> = (1..=200).map(load).collect();
+    let first = run_many(&admission, &loads);
+    let second = run_many(&admission, &loads);
+    let ids = |p: &Processed| {
+        p.accepted
+            .iter()
+            .map(|e| e.event_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&first), ids(&second));
+    assert!(!first.accepted.is_empty() && first.accepted.len() < 200);
+
+    // Once the kept ones are remembered, a retry counts them as repeated and
+    // the ones that were sampled out are still sampled out, not repeated.
+    let deduper = Deduper::new(1_000, 600_000);
+    deduper.remember(first.accepted.iter().map(|e| e.event_key), NOW);
+    let context = Context {
+        deduper: Some(&deduper),
+        ..Context::default()
+    };
+    let mut third = Processed {
+        accepted: Vec::new(),
+        drops: Vec::new(),
+    };
+    for chunk in loads.chunks(100) {
+        let part = process_with(
+            &admission,
+            &body(NOW, chunk),
+            NOW,
+            &Limits::default(),
+            &context,
+        )
+        .expect("a valid batch");
+        third.accepted.extend(part.accepted);
+        third.drops.extend(part.drops);
+    }
+    let total = |reason| -> u64 {
+        third
+            .drops
+            .iter()
+            .filter(|d| d.event_name == "screen_load" && d.reason == reason)
+            .map(|d| d.count)
+            .sum()
+    };
+    assert!(third.accepted.is_empty());
+    assert_eq!(total(Reason::Duplicate), first.accepted.len() as u64);
+    assert_eq!(total(Reason::Sampled), 200 - first.accepted.len() as u64);
+}
+
+#[test]
+fn the_reason_is_counted_by_name() {
+    assert_eq!(Reason::Sampled.as_str(), "sampled");
 }
