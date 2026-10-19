@@ -87,6 +87,7 @@ refused.
 | `DELETE /sites/{site}/tokens/{id}` | admin | revoke |
 | `GET`, `PUT`, `DELETE /sites/{site}/retention` | admin | days kept (`{days}`); `DELETE` goes back to the default |
 | `GET /sites/{site}/retention/preview` | admin | rows per table the next run would remove at `?days=` (or the days kept now); deletes nothing |
+| `GET`, `PUT`, `DELETE /sites/{site}/sampling` | viewer or its token to read, admin to change | the share of performance events kept (`{performance}`, above 0 and up to 1); `DELETE` goes back to all |
 | `GET`, `POST /sites/{site}/erasures` | admin | list (`?state=`); request `{user_id}` or `{device_id}` |
 | `GET /sites/{site}/erasures/{id}` | admin | one request and what the job reported |
 | `POST /sites/{site}/erasures/{id}/retry` | admin | put a failed request back |

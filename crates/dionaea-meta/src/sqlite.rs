@@ -1076,11 +1076,29 @@ impl MetaStore for SqliteMeta {
                 }
             }
 
+            let sampling = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT id, performance_sample_ppm FROM sites
+                         WHERE performance_sample_ppm < 1000000 ORDER BY id",
+                    )
+                    .map_err(storage)?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                    .map_err(storage)?;
+                let mut sampling = Vec::new();
+                for row in rows {
+                    let (site_id, ppm) = row.map_err(storage)?;
+                    sampling.push((id_of(site_id)?, id_of(ppm)?));
+                }
+                sampling
+            };
             Ok(Snapshot {
                 generation,
                 keys,
                 schemas,
                 settings: settings_of(tx)?,
+                sampling,
             })
         })
     }

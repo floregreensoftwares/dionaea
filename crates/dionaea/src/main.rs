@@ -68,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         command: RetentionCommand,
     },
+    /// How much of each site's performance data is kept
+    Sampling {
+        #[command(subcommand)]
+        command: SamplingCommand,
+    },
     /// Members who log in to the API: create, list, change roles, disable
     Member {
         #[command(subcommand)]
@@ -283,6 +288,33 @@ enum RetentionCommand {
 }
 
 #[derive(Subcommand)]
+enum SamplingCommand {
+    /// Keep this share of a site's performance events (app start, screen
+    /// load, network calls, web vitals): above 0 and up to 1. Errors and
+    /// crashes are never sampled.
+    Set {
+        #[arg(long)]
+        site: u32,
+        #[arg(long)]
+        rate: f64,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Go back to keeping everything
+    Unset {
+        #[arg(long)]
+        site: u32,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// List every site: id and the share kept
+    List {
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+}
+
+#[derive(Subcommand)]
 enum EraseCommand {
     /// Ask for a user of a site to be erased; prints the request. From this
     /// moment the server drops anything of that user.
@@ -428,6 +460,7 @@ fn main() -> ExitCode {
         Command::Settings { command } => settings_command(command),
         Command::Erase { command } => erase(command),
         Command::Retention { command } => retention(command),
+        Command::Sampling { command } => sampling(command),
         Command::Member { command } => member(command),
         Command::Token { command } => token(command),
         Command::Symbols { command } => symbols(command),
@@ -635,6 +668,20 @@ fn retention(command: RetentionCommand) -> ExitCode {
                 out,
                 err,
             )
+        }),
+    }
+}
+
+fn sampling(command: SamplingCommand) -> ExitCode {
+    match command {
+        SamplingCommand::Set { site, rate, store } => with_store(&store, |meta, _, err| {
+            meta_cli::sampling_set(meta, site, Some(rate), err)
+        }),
+        SamplingCommand::Unset { site, store } => with_store(&store, |meta, _, err| {
+            meta_cli::sampling_set(meta, site, None, err)
+        }),
+        SamplingCommand::List { store } => with_store(&store, |meta, out, err| {
+            meta_cli::sampling_list(meta, out, err)
         }),
     }
 }
