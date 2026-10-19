@@ -904,3 +904,39 @@ fn an_event_is_judged_the_same_when_it_is_sent_again() {
 fn the_reason_is_counted_by_name() {
     assert_eq!(Reason::Sampled.as_str(), "sampled");
 }
+
+#[test]
+fn a_client_cannot_send_its_own_sample_rate_to_change_what_an_event_weighs() {
+    // At the full rate nothing is stored for it, and at a lower one the kept
+    // events carry the rate of the site, never the client's.
+    let forged = |n: u32| {
+        event(
+            n,
+            NOW,
+            "screen_load",
+            json!({ "render": 120, "sample_rate": 0.0001 }),
+        )
+    };
+    let events: Vec<_> = (1..=100).map(forged).collect();
+
+    let full = run_many(&admission(&[V1]), &events);
+    assert_eq!(full.accepted.len(), 100);
+    assert!(
+        full.accepted
+            .iter()
+            .all(|e| e.numbers.iter().all(|(name, _)| name != "sample_rate")),
+        "the client's number is not kept"
+    );
+
+    let half = run_many(&sampled(admission(&[V1]), 500_000), &events);
+    assert!(!half.accepted.is_empty());
+    for event in &half.accepted {
+        let rates: Vec<f64> = event
+            .numbers
+            .iter()
+            .filter(|(name, _)| name == "sample_rate")
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(rates, [0.5], "exactly the site's rate");
+    }
+}
