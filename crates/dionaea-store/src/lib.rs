@@ -549,7 +549,7 @@ impl Store {
         // `table` is always one of this crate's constants.
         let query = http::url_encode(&format!("INSERT INTO {table} FORMAT JSONEachRow"));
         let path = format!(
-            "/?database={}&query={query}&insert_deduplication_token={}&async_insert=0",
+            "/?database={}&query={query}&insert_deduplication_token={}&async_insert=0&deduplicate_blocks_in_dependent_materialized_views=1",
             http::url_encode(&self.config.database),
             http::url_encode(token),
         );

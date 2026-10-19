@@ -283,7 +283,7 @@ gauges `_cache_bytes` and `_cache_entries`.
 A materialized view (`errors_mv`) copies every `app_error` event into the `errors` table as it is inserted, with its stack and the `fingerprint` and `symbols` properties in columns of their own (`fingerprint`, `symbols`, `kind`, `error_type`, `message`, `frames`) next to the screen, platform, OS, browser, app version, country and SDK. Errors of one kind share a fingerprint:
 
 ```sql
-SELECT fingerprint, count() AS events, uniqExact(anon_id) AS users, min(ts), max(ts)
+SELECT fingerprint, count() AS events, uniqExact(anon_id) AS devices, min(ts), max(ts)
 FROM errors WHERE site_id = 1 GROUP BY fingerprint ORDER BY events DESC
 ```
 
@@ -307,7 +307,7 @@ Not covered: events stored before the sessions migration ran are not summarized 
 
 ## Retention
 
-Every site keeps its analytics data (events and the sessions summarized from them) for `retention_default_days`, 395 by default (13 months), unless it has a number of its own:
+Every site keeps its analytics data (events, the sessions and the errors summarized from them) for `retention_default_days`, 395 by default (13 months), unless it has a number of its own:
 
 ```
 dionaea retention set --site 1 --days 90
@@ -318,11 +318,11 @@ dionaea retention preview
 
 `list` prints, for each site, the family (`analytics`), the days and whether the number is the site's own or the default. `preview` counts, per site and table, the rows the next run would remove at the retention each site has now, and deletes nothing: use it before lowering a number, because a run cannot be undone. Setting a number deletes nothing by itself: the retention job applies it at its next run, once per `retention_interval_secs` (a day). One server takes each run, whichever finds it unclaimed in the metadata store, so any number of servers can run.
 
-A run works in three steps. Each site's rows older than its cutoff are deleted with a lightweight delete, which hides them from queries at once. A month of `events` or `sessions` that is entirely older than the cutoff of the site that keeps data the longest is dropped whole, which costs nothing. The months older than the newest cutoff that still hold deleted rows are rewritten, so the data leaves the disk. A run that fails (ClickHouse down, a timeout) is tried again 15 minutes later and not after a whole interval; `dionaea_retention_failing` is 1 until one succeeds.
+A run works in three steps. Each site's rows older than its cutoff are deleted with a lightweight delete, which hides them from queries at once. A month of `events`, `sessions` or `errors` that is entirely older than the cutoff of the site that keeps data the longest is dropped whole, which costs nothing. The months older than the newest cutoff that still hold deleted rows are rewritten, so the data leaves the disk. A run that fails (ClickHouse down, a timeout) is tried again 15 minutes later and not after a whole interval; `dionaea_retention_failing` is 1 until one succeeds.
 
 Metrics: `dionaea_retention_runs_total`, `_failures_total`, `_rows_expired_total`, `_partitions_dropped_total`, `_partitions_rewritten_total`, `dionaea_retention_failing` and `dionaea_retention_last_success_timestamp_seconds` (alert when it is older than a few intervals).
 
-The `events` table used to carry a rule of its own, 13 months for every site. A migration replaces it with one that cannot fire in the life of the product (60 years), so a site can keep its data longer than 13 months; it applies to databases made before as well. The links and traits of identified users (`identity_alias`, `user_traits`) have no age: they are removed by erasure. Raw errors and measurements will have a family of their own when they exist.
+The `events` table used to carry a rule of its own, 13 months for every site. A migration replaces it with one that cannot fire in the life of the product (60 years), so a site can keep its data longer than 13 months; it applies to databases made before as well. The links and traits of identified users (`identity_alias`, `user_traits`) have no age: they are removed by erasure. Error events are copied into `errors`, which expires with the same number of days as the events they come from; measurements will have a family of their own when they exist.
 
 Not covered: a site that is deleted from the metadata store keeps its rows until a month holding only them falls out of every remaining site's cutoff; and the data of two sites that share a month is never dropped whole before the site that keeps longer is done with it, only deleted row by row.
 
