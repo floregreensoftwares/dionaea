@@ -396,6 +396,21 @@ fn error_stacks_are_translated_on_their_way_to_clickhouse() {
     assert_eq!(third[0], "ok");
     assert_eq!(third[1], "com.example.Cart|checkout|41||1");
 
+    // The same rows are in the errors table, with their own columns.
+    let errors = store
+        .raw_query(
+            "SELECT symbols, fingerprint = '' FROM errors ORDER BY event_id FORMAT TabSeparated",
+        )
+        .expect("errors");
+    assert_eq!(
+        errors.lines().collect::<Vec<_>>(),
+        ["ok\t0", "missing\t0", "ok\t0"]
+    );
+    let grouped = store
+        .raw_query("SELECT uniqExact(fingerprint) FROM errors")
+        .expect("fingerprints");
+    assert_eq!(grouped.trim(), "3", "raw and translated stacks group apart");
+
     let metrics = http(&server.ops, "GET", "/metrics", &[], "").1;
     for expected in [
         "dionaea_symbolication_events_total{outcome=\"ok\"} 2",

@@ -2347,8 +2347,10 @@ fn the_retention_job_removes_a_sites_old_events_and_keeps_the_others() {
         vec![
             "1	events	1	30",
             "1	sessions	1	30",
+            "1	errors	0	30",
             "2	events	0	395",
-            "2	sessions	0	395"
+            "2	sessions	0	395",
+            "2	errors	0	395"
         ],
         "{preview}"
     );

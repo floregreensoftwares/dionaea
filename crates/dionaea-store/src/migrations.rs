@@ -206,6 +206,57 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE events MODIFY TTL toDateTime(ts) + INTERVAL 60 YEAR",
         ],
     },
+    Migration {
+        version: 6,
+        name: "errors",
+        statements: &[
+            // One row per error event, with the fields of the event that
+            // matter for grouping and listing errors in columns of their own.
+            // It holds the device and session ids, so erasure and retention
+            // cover it.
+            "CREATE TABLE IF NOT EXISTS errors (
+                site_id     UInt32,
+                event_id    UUID,
+                ts          DateTime64(3, 'UTC'),
+                received_at DateTime64(3, 'UTC'),
+                anon_id     String,
+                session_id  String,
+                fingerprint String,
+                symbols     LowCardinality(String),
+                kind        LowCardinality(String),
+                error_type  String,
+                message     String,
+                frames      String,
+                screen      LowCardinality(String),
+                platform    LowCardinality(String),
+                os          LowCardinality(String),
+                browser     LowCardinality(String),
+                app_version LowCardinality(String),
+                country     LowCardinality(String),
+                sdk         LowCardinality(String)
+            )
+            ENGINE = MergeTree
+            PARTITION BY toYYYYMM(ts)
+            ORDER BY (site_id, fingerprint, ts, event_id)
+            SETTINGS non_replicated_deduplication_window = 1000",
+            // Fed by every insert into events, like sessions_mv. Error events
+            // stored before this migration are not copied; they carry no
+            // fingerprint either.
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS errors_mv TO errors
+            DEFINER = CURRENT_USER SQL SECURITY DEFINER AS
+            SELECT
+                site_id, event_id, ts, received_at, anon_id, session_id,
+                props_str['fingerprint'] AS fingerprint,
+                props_str['symbols'] AS symbols,
+                props_str['kind'] AS kind,
+                props_str['type'] AS error_type,
+                props_str['message'] AS message,
+                props_str['frames'] AS frames,
+                screen, platform, os, browser, app_version, country, sdk
+            FROM events
+            WHERE name = 'app_error'",
+        ],
+    },
 ];
 
 #[cfg(test)]

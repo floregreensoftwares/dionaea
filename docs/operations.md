@@ -251,7 +251,7 @@ The job's own metrics: `dionaea_erasure_requests{state}` (requests by state), `d
 
 Requests are for one subject: `--user` or `--anon`, not both.
 
-Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `sessions`, `errors` and `measurements`, which do not exist yet and will join the list of identifier tables a test enforces.
+Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `measurements`, which does not exist yet and will join the list of identifier tables a test enforces (`sessions` and `errors` are on it).
 
 ## Error stacks
 
@@ -277,6 +277,17 @@ Metrics: `dionaea_symbolication_events_total{outcome}` (`ok`, `partial`,
 after a release), `_cache_hits_total`, `_file_loads_total`, `_index_errors_total`,
 `_panics_total` (a bug, contained to one event), `_microseconds_total`, and the
 gauges `_cache_bytes` and `_cache_entries`.
+
+## Errors
+
+A materialized view (`errors_mv`) copies every `app_error` event into the `errors` table as it is inserted, with its stack and the `fingerprint` and `symbols` properties in columns of their own (`fingerprint`, `symbols`, `kind`, `error_type`, `message`, `frames`) next to the screen, platform, OS, browser, app version, country and SDK. Errors of one kind share a fingerprint:
+
+```sql
+SELECT fingerprint, count() AS events, uniqExact(anon_id) AS users, min(ts), max(ts)
+FROM errors WHERE site_id = 1 GROUP BY fingerprint ORDER BY events DESC
+```
+
+The table holds the device and session ids, so it is part of erasure (a device's errors are removed with the rest of its rows) and of each site's retention. Error events stored before the table existed are not copied.
 
 ## Sessions
 

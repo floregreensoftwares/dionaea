@@ -56,6 +56,12 @@ pub const IDENTIFIER_TABLES: &[IdentifierTable] = &[
         user_column: None,
         partition: Some("toYYYYMM(started)"),
     },
+    IdentifierTable {
+        name: "errors",
+        anon_column: Some("anon_id"),
+        user_column: None,
+        partition: Some("toYYYYMM(ts)"),
+    },
 ];
 
 /// Anonymous ids per statement, so a statement stays far below ClickHouse's
