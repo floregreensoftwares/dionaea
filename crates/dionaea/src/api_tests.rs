@@ -1574,3 +1574,155 @@ fn uploads_are_bounded_before_their_bodies_are_read() {
         "the places came back"
     );
 }
+
+#[test]
+fn issue_states_are_read_by_viewers_and_changed_by_admins_within_their_site() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let viewer = login(&w, "viewer@example.com", &[(w.acme, Role::Viewer)]);
+    let fingerprint = "0123456789abcdef0123456789abcdef";
+    let path = format!("sites/{}/issues/{fingerprint}", w.shop);
+
+    // Nobody touched it: unresolved, with no row behind it.
+    let fresh = w.call("GET", &path, &viewer, None);
+    assert_eq!(
+        (
+            fresh.status,
+            fresh.body["state"].as_str(),
+            fresh.body["regressions"].as_u64()
+        ),
+        (200, Some("unresolved"), Some(0))
+    );
+    assert!(
+        w.call("GET", &format!("sites/{}/issues", w.shop), &viewer, None)
+            .body["issues"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    // A viewer reads and cannot change.
+    let resolve = json!({ "state": "resolved", "release": "1.2.0" });
+    assert_eq!(w.status("PUT", &path, &viewer, Some(resolve.clone())), 403);
+    let done = w.call("PUT", &path, &admin, Some(resolve));
+    assert_eq!(done.status, 200, "{:?}", done.body);
+    assert_eq!(
+        (
+            done.body["state"].as_str(),
+            done.body["resolved_release"].as_str()
+        ),
+        (Some("resolved"), Some("1.2.0"))
+    );
+    let listed = ApiRequest {
+        query: Some("state=resolved".to_owned()),
+        ..request("GET", &format!("sites/{}/issues", w.shop), &viewer, None)
+    };
+    assert_eq!(
+        w.api.respond(&listed).body["issues"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // Bad input is refused, not stored.
+    for body in [
+        json!({ "state": "resolved" }),
+        json!({ "state": "resolved", "release": "not a release" }),
+        json!({ "state": "ignored", "release": "1.0" }),
+        json!({ "state": "fixed" }),
+        json!({ "state": "ignored", "extra": 1 }),
+    ] {
+        assert_eq!(
+            w.status("PUT", &path, &admin, Some(body.clone())),
+            400,
+            "{body}"
+        );
+    }
+    for bad in ["nope", "0123456789ABCDEF0123456789ABCDEF"] {
+        assert_eq!(
+            w.status(
+                "GET",
+                &format!("sites/{}/issues/{bad}", w.shop),
+                &admin,
+                None
+            ),
+            400
+        );
+    }
+    // The first resolution is untouched by the refusals.
+    assert_eq!(
+        w.call("GET", &path, &viewer, None).body["state"],
+        "resolved"
+    );
+
+    // Another organization's site is not reachable, and not revealed.
+    let foreign = format!("sites/{}/issues/{fingerprint}", w.elsewhere);
+    assert_eq!(w.status("GET", &foreign, &admin, None), 404);
+    assert_eq!(
+        w.status("PUT", &foreign, &admin, Some(json!({ "state": "ignored" }))),
+        404
+    );
+    assert_eq!(w.status("GET", &path, &Caller::nobody(), None), 401);
+}
+
+#[test]
+fn issue_states_follow_the_token_that_asks_and_come_in_pages() {
+    let w = world();
+    let admin = login(&w, "admin@example.com", &[(w.acme, Role::Admin)]);
+    let reader = token_for(&w, &admin, w.shop);
+    let other_site = token_for(&w, &admin, w.blog);
+    let uploader = upload_token_for(&w, &admin, w.shop);
+    let fingerprint = |n: u32| format!("{n:032x}");
+    let path = |n: u32| format!("sites/{}/issues/{}", w.shop, fingerprint(n));
+    let list = format!("sites/{}/issues", w.shop);
+
+    // A read token reads its site's issues and changes nothing.
+    assert_eq!(w.status("GET", &path(1), &reader, None), 200);
+    assert_eq!(w.status("GET", &list, &reader, None), 200);
+    assert_eq!(
+        w.status(
+            "PUT",
+            &path(1),
+            &reader,
+            Some(json!({ "state": "ignored" }))
+        ),
+        403
+    );
+    // Another site's token and an upload token do not read these.
+    // The site is not revealed to another site's token (404); an upload token
+    // of the site is known but may only upload (403).
+    for (name, caller, status) in [("other site", &other_site, 404), ("upload", &uploader, 403)] {
+        let put = w.status("PUT", &path(1), caller, Some(json!({ "state": "ignored" })));
+        let got = (
+            w.status("GET", &path(1), caller, None),
+            w.status("GET", &list, caller, None),
+            put,
+        );
+        assert_eq!(got, (status, status, status), "{name}");
+    }
+
+    for n in 1..=5 {
+        assert_eq!(
+            w.status("PUT", &path(n), &admin, Some(json!({ "state": "ignored" }))),
+            200
+        );
+    }
+    let page = |query: &str| {
+        let request = ApiRequest {
+            query: Some(query.to_owned()),
+            ..request("GET", &list, &reader, None)
+        };
+        w.api.respond(&request)
+    };
+    let first = page("limit=2");
+    assert_eq!(first.body["issues"].as_array().map(Vec::len), Some(2));
+    let next = first.body["next"].as_str().expect("a cursor").to_owned();
+    assert_eq!(next, fingerprint(2));
+    let second = page(&format!("limit=2&after={next}"));
+    assert_eq!(second.body["issues"][0]["fingerprint"], fingerprint(3));
+    let last = page(&format!("limit=2&after={}", fingerprint(4)));
+    assert_eq!(last.body["issues"].as_array().map(Vec::len), Some(1));
+    assert!(last.body["next"].is_null(), "a short page is the last");
+    for bad in ["limit=0", "limit=1001", "limit=x", "after=nope"] {
+        assert_eq!(page(bad).status, 400, "{bad}");
+    }
+}

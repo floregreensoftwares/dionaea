@@ -572,6 +572,13 @@ impl Api {
             ("GET", ["sites", site, "symbols"]) => self.symbols(req, p, id_of(site)?),
             ("POST", ["sites", site, "symbols"]) => self.upload_symbol(req, p, id_of(site)?),
             ("DELETE", ["sites", site, "symbols"]) => self.delete_symbols(req, p, id_of(site)?),
+            ("GET", ["sites", site, "issues"]) => self.issues(req, p, id_of(site)?),
+            ("GET", ["sites", site, "issues", fingerprint]) => {
+                self.issue(p, id_of(site)?, fingerprint)
+            }
+            ("PUT", ["sites", site, "issues", fingerprint]) => {
+                self.set_issue(req, p, id_of(site)?, fingerprint)
+            }
             ("GET", ["sites", site, "upload-tokens"]) => self.upload_tokens(p, id_of(site)?),
             ("POST", ["sites", site, "upload-tokens"]) => {
                 self.issue_upload_token(req, p, id_of(site)?)
@@ -1176,6 +1183,9 @@ fn same_origin(req: &ApiRequest) -> bool {
         (Some(_), None) => false,
     }
 }
+
+#[path = "api_issues.rs"]
+mod issues;
 
 #[path = "api_symbols.rs"]
 mod symbols;

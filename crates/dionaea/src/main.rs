@@ -7,6 +7,7 @@ mod erasure;
 mod meta_cli;
 mod net;
 mod ops;
+mod regressions;
 mod retention;
 mod schema_cli;
 mod server;

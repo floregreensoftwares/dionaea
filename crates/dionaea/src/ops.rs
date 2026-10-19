@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::collect::Collect;
 use crate::erasure::JobStats;
 use crate::net::NetCounters;
+use crate::regressions::RegressionStats;
 use crate::retention::RetentionStats;
 
 /// What the background threads tell the operator endpoints.
@@ -39,6 +40,8 @@ pub(crate) struct Status {
     pub(crate) erasure: Arc<JobStats>,
     /// What the retention job did.
     pub(crate) retention: Arc<RetentionStats>,
+    /// What the regression job did.
+    pub(crate) regressions: Arc<RegressionStats>,
     pub(crate) spool_quota_bytes: u64,
 }
 
@@ -57,6 +60,7 @@ impl Status {
             symbols: std::sync::OnceLock::new(),
             erasure: Arc::default(),
             retention: Arc::default(),
+            regressions: Arc::default(),
             spool_quota_bytes,
         }
     }
@@ -146,6 +150,50 @@ fn render_retention(out: &mut String, job: &RetentionStats) {
         ),
         (
             "dionaea_retention_last_success_timestamp_seconds",
+            "gauge",
+            "When the last run that succeeded finished (0: none yet).",
+            u64::try_from(job.last_success.load(Ordering::Relaxed)).unwrap_or(0),
+        ),
+    ] {
+        metric(out, name, kind, help);
+        let _ = writeln!(out, "{name} {value}");
+    }
+}
+
+fn render_regressions(out: &mut String, job: &RegressionStats) {
+    for (name, kind, help, value) in [
+        (
+            "dionaea_regression_runs_total",
+            "counter",
+            "Runs of the regression job by this server.",
+            job.runs.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_regression_failures_total",
+            "counter",
+            "Runs of the regression job that failed.",
+            job.failures.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_regression_failing",
+            "gauge",
+            "1 while the last run of the regression job failed.",
+            u64::from(job.failing.load(Ordering::Relaxed)),
+        ),
+        (
+            "dionaea_regression_issues_checked_total",
+            "counter",
+            "Resolved issues looked at for an error that came back.",
+            job.issues_checked.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_regression_issues_reopened_total",
+            "counter",
+            "Resolved issues reopened because their error came back in a later release.",
+            job.issues_reopened.load(Ordering::Relaxed),
+        ),
+        (
+            "dionaea_regression_last_success_timestamp_seconds",
             "gauge",
             "When the last run that succeeded finished (0: none yet).",
             u64::try_from(job.last_success.load(Ordering::Relaxed)).unwrap_or(0),
@@ -559,6 +607,7 @@ fn render(ops: &Ops) -> String {
 
     render_erasure(&mut out, &ops.status.erasure);
     render_retention(&mut out, &ops.status.retention);
+    render_regressions(&mut out, &ops.status.regressions);
 
     metric(
         &mut out,

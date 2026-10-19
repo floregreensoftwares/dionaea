@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::erasure::{Eraser, Job, Timing};
 use crate::net::{self, NetControl, NetCounters};
 use crate::ops::{self, Ops, Status};
+use crate::regressions::{ErrorLookup, Job as RegressionJob};
 use crate::retention::{Expirer, Job as RetentionJob};
 use crate::settings::{self, Origin, Tuning};
 
@@ -248,6 +249,7 @@ impl Node {
         let eraser = config.clickhouse_store(Some(ERASE_TIMEOUT))?;
         // Removing old data is as slow as erasing: the same long timeout.
         let expirer = eraser.clone();
+        let lookup = eraser.clone();
         let store = config.clickhouse_store(None)?;
 
         // The user agent dataset compiles its patterns on first use; do it now
@@ -432,6 +434,37 @@ impl Node {
                 .map_err(|e| format!("cannot start the retention thread: {e}"))?
         };
         threads.push(retention);
+
+        // Resolved issues whose error came back in a later release are
+        // reopened, by whichever server finds the run unclaimed.
+        let regressions = {
+            let (stop, status, live) = (Arc::clone(&stop), Arc::clone(status), live.clone());
+            let meta = Arc::new(config.open_meta()?);
+            let job = RegressionJob::new(
+                Arc::clone(&meta) as Arc<dyn dionaea_meta::MetaStore>,
+                meta as Arc<dyn dionaea_meta::IssueIndex>,
+                Arc::new(lookup) as Arc<dyn ErrorLookup>,
+                Arc::clone(&status.regressions),
+            );
+            thread::Builder::new()
+                .name("dionaea-regressions".to_owned())
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        nap(RETENTION_TICK, &stop);
+                        if !status.clickhouse_ready.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let tuning = live.tuning();
+                        job.run_if_due(
+                            tuning.regression_interval,
+                            tuning.regression_batch as usize,
+                            collect::system_clock(),
+                        );
+                    }
+                })
+                .map_err(|e| format!("cannot start the regression thread: {e}"))?
+        };
+        threads.push(regressions);
 
         // The tables must exist before anything is inserted: a missing table
         // is an error the batcher would keep retrying, so it starts only once

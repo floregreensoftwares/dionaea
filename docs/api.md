@@ -95,6 +95,9 @@ refused.
 | `GET /sites/{site}/symbols` | admin | the symbol files, `?release=` for one release, with the bytes kept and the limit |
 | `POST /sites/{site}/symbols` | admin or its upload token | `?release=&kind=&name=` and the file as the body (below) |
 | `DELETE /sites/{site}/symbols` | admin | `?release=&kind=&name=` for one file, `?release=` alone for all of a release |
+| `GET /sites/{site}/issues` | viewer or its token | the issues somebody gave a state, `?state=unresolved|resolved|ignored`, in pages by fingerprint: `?limit=` (1 to 1000, 100 by default) and `?after=` a fingerprint; `next` in the answer is the `after` of the next page, `null` on the last; issues nobody touched have no row ||resolved\|ignored`; issues nobody touched have no row |
+| `GET /sites/{site}/issues/{fingerprint}` | viewer or its token | one issue's state (`unresolved` when nobody touched it), the release it was resolved in, and when and where it last came back |
+| `PUT /sites/{site}/issues/{fingerprint}` | admin | `{state, release}`: `resolved` needs the release it was fixed in, the other states take none; a site keeps at most 100000 issues with a state (`409` after that); a resolved issue whose error returns in a later release is reopened by the server |
 | `POST /sites/{site}/query` | viewer or its token | a report |
 
 Adding a member answers `409` when the address already has an account, so an
