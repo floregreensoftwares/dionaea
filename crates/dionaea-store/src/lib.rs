@@ -18,6 +18,7 @@
 
 mod erase;
 mod http;
+mod issues;
 mod migrations;
 pub mod report;
 mod retention;
@@ -31,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use erase::{IDENTIFIER_TABLES, IdentifierTable, Rewrite, TableCount};
+pub use issues::{RELEASES_PER_PAGE, Sighting};
 pub use retention::Expired;
 pub use rows::{AliasRow, DropRow, EventRow, TraitsRow, event_key, with_props_str};
 

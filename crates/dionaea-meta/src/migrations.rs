@@ -252,4 +252,39 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         );
     ",
     },
+    Migration {
+        version: 11,
+        name: "issues",
+        sql: "
+        -- The state a person gave an issue (one per fingerprint). An issue
+        -- with no row is unresolved. Counts and timelines are in ClickHouse;
+        -- no row holds a user, device or session id.
+        CREATE TABLE issues (
+            site_id           INTEGER NOT NULL REFERENCES sites(id),
+            fingerprint       TEXT NOT NULL,
+            state             TEXT NOT NULL CHECK (state IN ('unresolved', 'resolved', 'ignored')),
+            resolved_release  TEXT,
+            resolved_at       INTEGER,
+            regressed_release TEXT,
+            regressed_at      INTEGER,
+            regressions       INTEGER NOT NULL DEFAULT 0,
+            revision          INTEGER NOT NULL DEFAULT 1,
+            errors_seen       INTEGER NOT NULL DEFAULT -1,
+            checked_at        INTEGER NOT NULL DEFAULT 0,
+            updated_at        INTEGER NOT NULL,
+            PRIMARY KEY (site_id, fingerprint)
+        );
+        CREATE INDEX issues_to_check ON issues (state, checked_at);
+    ",
+    },
+    Migration {
+        version: 12,
+        name: "performance_sampling",
+        sql: "
+        -- Millionths of a site's performance events that are kept; errors
+        -- and crashes are never sampled.
+        ALTER TABLE sites ADD COLUMN performance_sample_ppm INTEGER NOT NULL DEFAULT 1000000
+            CHECK (performance_sample_ppm BETWEEN 1 AND 1000000);
+    ",
+    },
 ];

@@ -133,6 +133,14 @@ fn migrate_creates_the_tables_and_is_idempotent() {
             "event_ids",
             "events",
             "identity_alias",
+            "issues_daily",
+            "issues_daily_mv",
+            "measurements",
+            "measurements_mv",
+            "perf_daily",
+            "perf_daily_mv",
+            "releases",
+            "releases_mv",
             "sessions",
             "sessions_mv",
             "user_traits"
@@ -177,7 +185,7 @@ fn two_nodes_migrating_at_once_both_succeed() {
             ))
             .expect("count")
             .trim(),
-        "11"
+        "19"
     );
     let _ = scratch
         .admin
@@ -569,7 +577,7 @@ fn the_ingest_user_can_only_insert_and_the_query_user_can_only_read() {
 
     // Neither user could change anything: the data is as the ingest user left it.
     assert_eq!(count(&scratch.store, "events"), 4);
-    assert_eq!(count(&scratch.store, "_migrations"), 6);
+    assert_eq!(count(&scratch.store, "_migrations"), 8);
 }
 
 #[test]
@@ -974,7 +982,8 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
             ("identity_alias", 3),
             ("user_traits", 1),
             ("sessions", 2),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ],
         "a1 twice and a2 once; both links of a2 and the link of a1; the traits"
     );
@@ -993,7 +1002,8 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
             ("identity_alias", 0),
             ("user_traits", 0),
             ("sessions", 0),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ],
         "queries no longer see the rows"
     );
@@ -1028,7 +1038,8 @@ fn erasing_a_user_hides_the_rows_at_once_and_removes_them_when_the_mask_is_appli
             ("identity_alias", 0),
             ("user_traits", 0),
             ("sessions", 0),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ],
         "now it is gone from disk"
     );
@@ -1085,7 +1096,8 @@ fn erasing_a_user_with_no_data_and_erasing_twice_are_harmless() {
             ("identity_alias", 0),
             ("user_traits", 0),
             ("sessions", 0),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ]
     );
 }
@@ -1196,7 +1208,8 @@ fn only_the_partitions_that_hold_the_erased_rows_are_rewritten() {
             ("identity_alias", 0),
             ("user_traits", 0),
             ("sessions", 0),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ]
     );
     assert_eq!(count(store, "events"), 2, "the other person's two events");
@@ -1232,7 +1245,8 @@ fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits()
             ("identity_alias", 2),
             ("user_traits", 0),
             ("sessions", 1),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ],
         "the event of a2 and both links to it; no user, so no traits"
     );
@@ -1246,7 +1260,8 @@ fn erasing_a_device_alone_removes_what_is_under_it_and_leaves_the_users_traits()
             ("identity_alias", 0),
             ("user_traits", 0),
             ("sessions", 0),
-            ("errors", 0)
+            ("errors", 0),
+            ("measurements", 0)
         ]
     );
     // Everything else stays: the other events, the other links, all traits.
@@ -1501,6 +1516,10 @@ fn each_site_loses_only_what_is_older_than_its_own_cutoff() {
             },
             Expired {
                 table: "errors",
+                rows: 0
+            },
+            Expired {
+                table: "measurements",
                 rows: 0
             }
         ]
@@ -1771,4 +1790,496 @@ fn the_ingest_user_fills_the_errors_by_inserting_events_and_cannot_read_them() {
     assert!(denied(&error), "{error:?}");
     let query = user_store(&scratch.database, &roles.query_user, &roles.query_password);
     assert_eq!(count(&query, "errors"), 1, "the query user reads them");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retried_batch_does_not_count_its_events_twice_in_sessions() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let batch = [session_event(1, "s1", "a1", "/home", T0)];
+    store.insert_events(&batch, "same").expect("first");
+    store.insert_events(&batch, "same").expect("retry");
+    let events = store
+        .raw_query("SELECT sum(events) FROM sessions FORMAT TabSeparated")
+        .expect("sessions");
+    assert_eq!(events.trim(), "1");
+}
+
+// Measurements and the health rollups.
+
+fn health_event(n: u64, name: &str, strs: &[(&str, &str)], nums: &[(&str, f64)]) -> EventRow {
+    let mut row = event(n);
+    row.name = name.to_owned();
+    row.props_str = strs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    row.props_num = nums.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect();
+    row
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn health_events_become_one_measurement_per_value() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                event(1),
+                health_event(
+                    2,
+                    "app_start",
+                    &[("start", "cold")],
+                    &[("first_frame", 800.0), ("interactive", 1500.0)],
+                ),
+                // Optional value absent: one row, not two.
+                health_event(
+                    3,
+                    "app_start",
+                    &[("start", "warm")],
+                    &[("first_frame", 300.0)],
+                ),
+                health_event(4, "screen_load", &[], &[("render", 120.0)]),
+                health_event(
+                    5,
+                    "http_request",
+                    &[
+                        ("method", "post"),
+                        ("host", "api.example.com"),
+                        ("route", "/orders/:id"),
+                        ("connection", "wifi"),
+                    ],
+                    &[("status", 503.0), ("duration", 250.0)],
+                ),
+                health_event(
+                    6,
+                    "web_vital",
+                    &[("name", "lcp"), ("rating", "good"), ("route", "/home")],
+                    &[("value", 1900.0)],
+                ),
+            ],
+            "measure-1",
+        )
+        .expect("insert");
+    assert_eq!(count(store, "events"), 6);
+    let rows = store
+        .raw_query(
+            "SELECT anon_id, metric, value, sample_rate, detail, route, host, status, connection \
+             FROM measurements ORDER BY anon_id, metric FORMAT TabSeparated",
+        )
+        .expect("measurements");
+    assert_eq!(
+        rows.lines().collect::<Vec<_>>(),
+        vec![
+            "a2\tapp_start_first_frame\t800\t1\tcold\t\t\t0\t",
+            "a2\tapp_start_interactive\t1500\t1\tcold\t\t\t0\t",
+            "a3\tapp_start_first_frame\t300\t1\twarm\t\t\t0\t",
+            "a4\tscreen_load_render\t120\t1\t\t\t\t0\t",
+            "a5\thttp_duration\t250\t1\tpost\t/orders/:id\tapi.example.com\t503\twifi",
+            "a6\tweb_vital_lcp\t1900\t1\tgood\t/home\t\t0\t",
+        ]
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retried_batch_does_not_repeat_its_measurements() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let batch = [health_event(
+        1,
+        "app_start",
+        &[("start", "cold")],
+        &[("first_frame", 800.0), ("interactive", 1500.0)],
+    )];
+    store.insert_events(&batch, "same").expect("first");
+    store.insert_events(&batch, "same").expect("retry");
+    assert_eq!(count(store, "measurements"), 2);
+    let samples = store
+        .raw_query("SELECT sum(samples) FROM perf_daily")
+        .expect("perf");
+    assert_eq!(samples.trim(), "2");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn perf_daily_keeps_percentiles_by_target_release_and_day() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let request = |n: u64| {
+        health_event(
+            n,
+            "http_request",
+            &[("method", "get"), ("host", "h"), ("route", "/a")],
+            &[("status", 200.0), ("duration", n as f64 * 10.0)],
+        )
+    };
+    let rows: Vec<EventRow> = (1..=100).map(request).collect();
+    store.insert_events(&rows, "perf-1").expect("insert");
+    // Two blocks, one key: the states merge at read time.
+    store
+        .insert_events(&[request(101)], "perf-2")
+        .expect("insert");
+    let line = store
+        .raw_query(
+            "SELECT target, sum(samples), \
+                    arrayMap(x -> round(x / 10), quantilesTDigestMerge(0.5, 0.75, 0.9, 0.95, 0.99)(quantiles)) \
+             FROM perf_daily WHERE metric = 'http_duration' GROUP BY target FORMAT TabSeparated",
+        )
+        .expect("percentiles");
+    let fields: Vec<&str> = line.trim().split('\t').collect();
+    assert_eq!(fields[..2], ["/a", "101"], "{line}");
+    // Values 10 to 1010 in steps of 10: the median is 510 (51 in tens).
+    assert!(fields[2].starts_with("[51,"), "{line}");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn issues_daily_counts_errors_per_fingerprint_release_and_day() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let mut other_release = error_event(3, "a3", "f1", T0 + 5_000);
+    other_release.app_version = "1.5.0".to_owned();
+    store
+        .insert_events(
+            &[
+                error_event(1, "a1", "f1", T0),
+                error_event(2, "a2", "f1", T0 + 1_000),
+                other_release,
+                error_event(4, "a4", "f2", T0),
+            ],
+            "issues-1",
+        )
+        .expect("insert");
+    store
+        .insert_events(&[error_event(5, "a5", "f1", T0 + 2_000)], "issues-2")
+        .expect("insert");
+    let rows = store
+        .raw_query(
+            "SELECT fingerprint, app_version, sum(events), toUnixTimestamp64Milli(min(first_ts)), \
+                    toUnixTimestamp64Milli(max(last_ts)) \
+             FROM issues_daily GROUP BY fingerprint, app_version ORDER BY fingerprint, app_version \
+             FORMAT TabSeparated",
+        )
+        .expect("issues");
+    assert_eq!(
+        rows.lines().map(str::to_owned).collect::<Vec<_>>(),
+        vec![
+            format!("f1\t1.4.2+57\t3\t{}\t{}", T0, T0 + 2_000),
+            format!("f1\t1.5.0\t1\t{}\t{}", T0 + 5_000, T0 + 5_000),
+            format!("f2\t1.4.2+57\t1\t{}\t{}", T0, T0),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn erasing_a_device_removes_its_measurements_and_leaves_the_rollups() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                health_event(1, "screen_load", &[], &[("render", 100.0)]),
+                health_event(2, "screen_load", &[], &[("render", 200.0)]),
+            ],
+            "erase-measure",
+        )
+        .expect("insert");
+    assert_eq!(count(store, "measurements"), 2);
+    let devices = vec!["a1".to_owned()];
+    store.delete_user_rows(7, None, &devices).expect("delete");
+    let needed = store.rewrites_needed(7, None, &devices).expect("needed");
+    store.apply_rewrites(&needed).expect("rewrite");
+    assert_eq!(count(store, "measurements"), 1);
+    assert_eq!(
+        store
+            .raw_query("SELECT anon_id FROM measurements SETTINGS apply_deleted_mask = 0")
+            .expect("left")
+            .trim(),
+        "a2"
+    );
+    // The rollup keeps the aggregate, with no way back to the device.
+    assert_eq!(
+        store
+            .raw_query("SELECT sum(samples) FROM perf_daily")
+            .expect("perf")
+            .trim(),
+        "2"
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn release_lookups_find_the_releases_of_an_error_and_when_a_release_began() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let mut old = error_event(1, "a1", "f1", T0);
+    old.received_ms = T0 + 1_000;
+    let mut late = error_event(2, "a2", "f1", T0 + 10_000);
+    late.app_version = "1.5.0".to_owned();
+    late.received_ms = T0 + 20_000;
+    let mut none = error_event(3, "a3", "f1", T0 + 11_000);
+    none.app_version = String::new();
+    none.received_ms = T0 + 21_000;
+    store
+        .insert_events(&[old, late, none], "lookups")
+        .expect("insert");
+    let names = |sightings: Vec<dionaea_store::Sighting>| {
+        sightings
+            .into_iter()
+            .map(|s| (s.release, s.first_ms))
+            .collect::<Vec<_>>()
+    };
+    let all = names(store.error_releases(7, "f1", 0, "").expect("releases"));
+    assert_eq!(
+        all,
+        [
+            ("1.4.2+57".to_owned(), Some((T0 + 1_000) as i64)),
+            ("1.5.0".to_owned(), Some((T0 + 20_000) as i64)),
+        ],
+        "the empty label is left out, and each release says when it began"
+    );
+    let since = names(
+        store
+            .error_releases(7, "f1", (T0 + 15_000) as i64, "")
+            .expect("since"),
+    );
+    assert_eq!(since.len(), 1);
+    assert_eq!(since[0].0, "1.5.0");
+    let after = names(store.error_releases(7, "f1", 0, "1.4.2+57").expect("after"));
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].0, "1.5.0");
+    assert!(
+        store
+            .error_releases(7, "nope", 0, "")
+            .expect("none")
+            .is_empty()
+    );
+    assert!(
+        store
+            .error_releases(8, "f1", 0, "")
+            .expect("site")
+            .is_empty()
+    );
+    assert_eq!(
+        store.release_first_seen(7, "1.5.0").expect("first"),
+        Some((T0 + 20_000) as i64)
+    );
+    assert_eq!(store.release_first_seen(7, "9.9").expect("none"), None);
+    assert_eq!(
+        store.release_first_seen(8, "1.5.0").expect("other site"),
+        None
+    );
+    // A value that looks like SQL is only a value.
+    assert_eq!(
+        store.release_first_seen(7, "x' OR 1=1 --").expect("nasty"),
+        None
+    );
+    assert!(
+        store
+            .error_releases(7, "x' OR 1=1 --", 0, "x' OR 1=1 --")
+            .expect("nasty")
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_release_keeps_its_first_sight_across_inserts_and_after_its_events_expire() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let mut first = event(1);
+    first.received_ms = T0;
+    let mut second = event(2);
+    second.received_ms = T0 + 60_000;
+    store.insert_events(&[second], "first-b").expect("insert");
+    store.insert_events(&[first], "first-a").expect("insert");
+    assert_eq!(
+        store.release_first_seen(7, "1.4.2+57").expect("first"),
+        Some(T0 as i64),
+        "the earliest wins whatever the order of arrival"
+    );
+    // The events go (retention); the release remembers when it began.
+    store
+        .expire_analytics(7, T0 + 10 * 86_400_000)
+        .expect("expire");
+    store
+        .raw_query("OPTIMIZE TABLE releases FINAL")
+        .expect("merge");
+    assert_eq!(
+        store.release_first_seen(7, "1.4.2+57").expect("kept"),
+        Some(T0 as i64)
+    );
+    assert_eq!(count(store, "events"), 0);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn error_releases_come_in_pages_in_name_order_without_leaving_any_out() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let total = dionaea_store::RELEASES_PER_PAGE as u64 + 20;
+    let rows: Vec<EventRow> = (0..total)
+        .map(|n| {
+            let mut row = error_event(n + 1, "a1", "f1", T0 + n);
+            row.app_version = format!("1.0.{n:05}");
+            row
+        })
+        .collect();
+    store.insert_events(&rows, "pages").expect("insert");
+    let mut seen = Vec::new();
+    let mut after = String::new();
+    loop {
+        let page = store.error_releases(7, "f1", 0, &after).expect("page");
+        let last = page.len() < dionaea_store::RELEASES_PER_PAGE as usize;
+        if let Some(end) = page.last() {
+            after = end.release.clone();
+        }
+        seen.extend(page.into_iter().map(|s| s.release));
+        if last {
+            break;
+        }
+    }
+    assert_eq!(seen.len() as u64, total);
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, seen, "in name order and once each");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn running_the_migration_again_copies_older_events_once() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                health_event(1, "screen_load", &[], &[("render", 100.0)]),
+                health_event(
+                    2,
+                    "app_start",
+                    &[("start", "cold")],
+                    &[("first_frame", 800.0), ("interactive", 1500.0)],
+                ),
+                error_event(3, "a3", "f1", T0),
+                error_event(4, "a4", "f1", T0 + 1_000),
+            ],
+            "backfill",
+        )
+        .expect("insert");
+    let snapshot = || {
+        store
+            .raw_query(
+                "SELECT
+                   (SELECT count() FROM measurements),
+                   (SELECT sum(samples) FROM perf_daily),
+                   (SELECT sum(events) FROM issues_daily),
+                   (SELECT uniqExact(app_version) FROM releases),
+                   (SELECT toString(min(first_seen)) FROM releases)
+                 FORMAT TabSeparated",
+            )
+            .expect("snapshot")
+    };
+    let live = snapshot();
+    assert!(live.starts_with("3\t3\t2\t1\t"), "{live}");
+
+    // As if the tables were new and the events older: empty the copies and
+    // run the migration again.
+    for table in ["measurements", "perf_daily", "issues_daily", "releases"] {
+        scratch
+            .store
+            .raw_query(&format!("TRUNCATE TABLE {table}"))
+            .expect("truncate");
+    }
+    scratch
+        .store
+        .raw_query("ALTER TABLE _migrations DELETE WHERE version = 8 SETTINGS mutations_sync = 2")
+        .expect("forget the migration");
+    scratch.store.migrate().expect("migrate again");
+    assert_eq!(snapshot(), live, "everything the events imply is back");
+
+    // And again: nothing is counted twice.
+    scratch
+        .store
+        .raw_query("ALTER TABLE _migrations DELETE WHERE version = 8 SETTINGS mutations_sync = 2")
+        .expect("forget the migration");
+    scratch.store.migrate().expect("migrate a third time");
+    assert_eq!(snapshot(), live, "a second run changes nothing");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_retried_batch_does_not_repeat_its_errors_in_issues_daily() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let batch = [
+        error_event(1, "a1", "f1", T0),
+        error_event(2, "a2", "f1", T0),
+    ];
+    store.insert_events(&batch, "same").expect("first");
+    store.insert_events(&batch, "same").expect("retry");
+    let events = store
+        .raw_query("SELECT sum(events) FROM issues_daily FORMAT TabSeparated")
+        .expect("issues");
+    assert_eq!(events.trim(), "2");
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn the_error_count_of_an_issue_follows_the_time_and_the_site() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    let mut early = error_event(1, "a1", "f1", T0);
+    early.received_ms = T0;
+    let mut late = error_event(2, "a2", "f1", T0 + 10_000);
+    late.received_ms = T0 + 10_000;
+    store
+        .insert_events(&[early, late, error_event(3, "a3", "f2", T0)], "counts")
+        .expect("insert");
+    assert_eq!(store.error_count(7, "f1", 0).expect("all"), 2);
+    assert_eq!(
+        store
+            .error_count(7, "f1", (T0 + 5_000) as i64)
+            .expect("since"),
+        1
+    );
+    assert_eq!(store.error_count(7, "nope", 0).expect("none"), 0);
+    assert_eq!(store.error_count(8, "f1", 0).expect("site"), 0);
+    assert_eq!(store.error_count(7, "x' OR 1=1 --", 0).expect("nasty"), 0);
+}
+
+#[test]
+#[ignore = "needs ClickHouse"]
+fn a_sampled_event_carries_its_rate_into_the_measurement_and_the_weight() {
+    let scratch = Scratch::new();
+    let store = &scratch.store;
+    store
+        .insert_events(
+            &[
+                health_event(
+                    1,
+                    "screen_load",
+                    &[],
+                    &[("render", 100.0), ("sample_rate", 0.25)],
+                ),
+                health_event(2, "screen_load", &[], &[("render", 200.0)]),
+            ],
+            "sampled",
+        )
+        .expect("insert");
+    let rows = store
+        .raw_query(
+            "SELECT anon_id, sample_rate FROM measurements ORDER BY anon_id FORMAT TabSeparated",
+        )
+        .expect("rates");
+    assert_eq!(rows.lines().collect::<Vec<_>>(), ["a1\t0.25", "a2\t1"]);
+    // One event standing for four, and one for itself: five in all.
+    let weight = store
+        .raw_query("SELECT sum(samples), sum(weight) FROM perf_daily FORMAT TabSeparated")
+        .expect("weight");
+    assert_eq!(weight.trim(), "2\t5");
 }

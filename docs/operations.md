@@ -79,6 +79,7 @@ the status listed in `wire-format.md`.
 | `erase_failed_keep_days` | 30 | 1 to 3650 | How long a failed erasure request keeps the user id and devices in the clear so that it can be retried; after that they are forgotten |
 | `retention_default_days` | 395 | 1 to 3650 | How long a site keeps its analytics data unless it has its own number |
 | `retention_interval_secs` | 86400 | 60 to 604800 | How often old data is removed |
+| `regression_interval_secs`, `regression_batch` | 300, 200 | 30 to 86400, 1 to 5000 | How often resolved issues are checked for an error that came back in a later release, and how many each check looks at |
 
 ## Changing limits while the server runs
 
@@ -251,7 +252,7 @@ The job's own metrics: `dionaea_erasure_requests{state}` (requests by state), `d
 
 Requests are for one subject: `--user` or `--anon`, not both.
 
-Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and `measurements`, which does not exist yet and will join the list of identifier tables a test enforces (`sessions` and `errors` are on it).
+Tested on ClickHouse 26.8 and on 25.8 (the previous long-term-support release). Not covered: erasing rows that are still only in a server that is down, until it starts again and reloads the metadata; and nothing else is known to be missing from the list of identifier tables a test enforces (`sessions`, `errors` and `measurements` are on it).
 
 ## Error stacks
 
@@ -289,6 +290,67 @@ FROM errors WHERE site_id = 1 GROUP BY fingerprint ORDER BY events DESC
 
 The table holds the device and session ids, so it is part of erasure (a device's errors are removed with the rest of its rows) and of each site's retention. Error events stored before the table existed are not copied.
 
+## Issues
+
+An issue is an error group: every error with the same fingerprint. Counts and timelines come from the `errors` table and from `issues_daily`, a rollup of the number of errors with the first and last time, per fingerprint, release and day (it keeps no device or session id, so erasure does not touch it, and it expires after two years):
+
+```sql
+SELECT fingerprint, app_version, sum(events) AS events, min(first_ts), max(last_ts)
+FROM issues_daily WHERE site_id = 1 GROUP BY fingerprint, app_version
+```
+
+What a person decided about an issue is kept in the metadata store (`GET`, `PUT /sites/{site}/issues/{fingerprint}`, see the API reference): `unresolved` (the state of every issue nobody touched), `resolved` in a release, or `ignored`. Resolving takes the release it was fixed in. A site keeps at most 100000 issues with a state.
+
+A resolved issue is reopened, and marked as a regression, when its error comes back **in a later release**. The regression job does this once per `regression_interval_secs`, whichever server finds the run unclaimed, and looks at up to `regression_batch` resolved issues per run, the one checked longest ago first. The rules:
+
+- **Which release is later.** When both labels are versions, the higher version is later: dotted numbers compared as numbers (`1.10.0` is after `1.9.0`; `1.2` equals `1.2.0`), an optional pre-release after `-` that starts with a letter and sorts before the release (`3.0.0-rc.1` before `3.0.0`, `rc.2` before `rc.10`), and an optional numeric build after `+` that breaks a tie (`1.4.2+58` after `1.4.2+57`). So a hotfix `1.2.1` shipped after `1.3.0` is not later than it. When either label is not a version (a commit hash, a date, a name), the release first received later is the later one. A release with no event in the store is placed at the moment the issue was resolved.
+- Only errors received after the issue was resolved count, and an error in the release it was resolved in does not reopen it.
+- The releases an error was seen in are read page by page, 500 at a time, so none is left out however many there are; the first-received time of each comes from the `releases` table, one row per site and release.
+- An issue is looked at in depth only when the number of its errors received since the resolution changed since the last check of the same decision; otherwise one count of one fingerprint is all a check costs. A new decision by a person starts the counting again.
+- If a person changes the state while a run is looking, the person wins, even within the same second: every decision has a revision and a finding made for an older one is dropped.
+- A reopened issue keeps the release it had been resolved in, and records the release it came back in, when, and how many times it has come back. Resolving it again clears the mark.
+
+The `releases` table (filled by `releases_mv` from every insert into `events`) holds when each release was first and last received. It has no identifier, survives the retention of the events, and expires two years after a release was last seen. A release whose row has expired is treated as never received.
+
+Metrics of the job: `dionaea_regression_runs_total`, `_failures_total`, `_failing`, `_issues_checked_total`, `_issues_reopened_total` and `_last_success_timestamp_seconds`.
+
+## Measurements
+
+A materialized view (`measurements_mv`) turns each `app_start`, `screen_load`, `http_request` and `web_vital` event into one row per measured value in the `measurements` table: `app_start_first_frame`, `app_start_interactive`, `screen_load_render`, `screen_load_interactive`, `http_duration` and `web_vital_<name>` (an optional value that was not sent makes no row). Next to the value are `detail` (cold or warm for a start, the method for a request, the rating for a web vital), `route`, `host`, `status`, `connection`, the screen and the device and release columns. `sample_rate` is the rate stored with a sampled event (the share of such events kept) and 1 for an event that carries none; `perf_daily.weight` sums 1 over the rate, so a count can be extrapolated.
+
+`perf_daily` keeps, per metric, place (the route, or the screen when there is none), detail, release, device class and day, how many samples there were and a t-digest state of the values. The levels are 0.5, 0.75, 0.9, 0.95 and 0.99, read with `quantilesTDigestMerge`:
+
+```sql
+SELECT target, sum(samples) AS samples,
+       quantilesTDigestMerge(0.5, 0.75, 0.9, 0.95, 0.99)(quantiles) AS q
+FROM perf_daily WHERE site_id = 1 AND metric = 'http_duration' GROUP BY target
+```
+
+`measurements` holds the device and session ids, so it is part of erasure and of each site's retention. `perf_daily` keeps no identifier, is not touched by erasure, and expires after two years. A t-digest is approximate: the answer is not exact, and no error bound is claimed here.
+
+The migration that creates these tables also copies what the events already stored imply (measurements, the rollups that follow them, `releases`, and `issues_daily` from the errors in `errors`), once: running it again changes nothing. The copy of `issues_daily` only fills an empty table, so it is never doubled; if another node already inserted an error into `errors` while the migration ran, that copy is skipped and the rollup starts from the errors received from then on. When several nodes are upgraded, migrate with ingest stopped on the others. Errors stored before fingerprints existed group under an empty fingerprint.
+
+## Performance sampling
+
+A site that sends more performance data than it needs can keep a share of it. The share applies to the four built-in performance events only (`app_start`, `screen_load`, `http_request`, `web_vital`). Errors, crashes, identify calls and every event a site declared are never sampled.
+
+```
+dionaea sampling set --site 1 --rate 0.25    # keep a quarter
+dionaea sampling list                        # site, share kept
+dionaea sampling unset --site 1              # keep everything again
+```
+
+or `GET`, `PUT`, `DELETE /sites/{site}/sampling` (`{"performance": 0.25}`; an admin changes it). The rate is above 0 and up to 1, with at most six decimals. Servers apply a change at their next refresh (`refresh_secs`), like keys and schemas.
+
+How it works:
+
+- The choice depends on the event id alone, so an event sent again (a retry, a replay of the spool) is kept or dropped the same way, and no node remembers anything. A lower rate keeps a subset of what a higher one keeps.
+- An event that is not kept is counted in `drops_daily` with the reason `sampled` (and in the drop metrics), under its event name. Sent minus stored is therefore always recoverable.
+- A kept event is stored with a number `sample_rate`, the share kept. `measurements.sample_rate` reads it (1 when there is none), and `perf_daily.weight` sums 1 over the rate, so a count of kept events times their weight estimates how many were sent. Percentiles need no correction: the events are chosen without regard to their values.
+- Events kept before a change keep the rate they were stored with.
+
+What is not claimed: that the share kept is exact. It follows the rate as a random sample does (about four standard deviations of a binomial count), and tests check that against fixed ids.
+
 ## Sessions
 
 The SDK generates the session id and sends it with every event. A materialized view (`sessions_mv`) summarizes the events that carry one into the `sessions` table as they are inserted: first and last event time, how many events, the entry and exit screen, how many distinct screens, and the platform, app version and country of the first event. Rows of one session that arrive in separate inserts are merged in the background and, until then, read with `GROUP BY`:
@@ -318,11 +380,11 @@ dionaea retention preview
 
 `list` prints, for each site, the family (`analytics`), the days and whether the number is the site's own or the default. `preview` counts, per site and table, the rows the next run would remove at the retention each site has now, and deletes nothing: use it before lowering a number, because a run cannot be undone. Setting a number deletes nothing by itself: the retention job applies it at its next run, once per `retention_interval_secs` (a day). One server takes each run, whichever finds it unclaimed in the metadata store, so any number of servers can run.
 
-A run works in three steps. Each site's rows older than its cutoff are deleted with a lightweight delete, which hides them from queries at once. A month of `events`, `sessions` or `errors` that is entirely older than the cutoff of the site that keeps data the longest is dropped whole, which costs nothing. The months older than the newest cutoff that still hold deleted rows are rewritten, so the data leaves the disk. A run that fails (ClickHouse down, a timeout) is tried again 15 minutes later and not after a whole interval; `dionaea_retention_failing` is 1 until one succeeds.
+A run works in three steps. Each site's rows older than its cutoff are deleted with a lightweight delete, which hides them from queries at once. A month of `events`, `sessions`, `errors` or `measurements` that is entirely older than the cutoff of the site that keeps data the longest is dropped whole, which costs nothing. The months older than the newest cutoff that still hold deleted rows are rewritten, so the data leaves the disk. A run that fails (ClickHouse down, a timeout) is tried again 15 minutes later and not after a whole interval; `dionaea_retention_failing` is 1 until one succeeds.
 
 Metrics: `dionaea_retention_runs_total`, `_failures_total`, `_rows_expired_total`, `_partitions_dropped_total`, `_partitions_rewritten_total`, `dionaea_retention_failing` and `dionaea_retention_last_success_timestamp_seconds` (alert when it is older than a few intervals).
 
-The `events` table used to carry a rule of its own, 13 months for every site. A migration replaces it with one that cannot fire in the life of the product (60 years), so a site can keep its data longer than 13 months; it applies to databases made before as well. The links and traits of identified users (`identity_alias`, `user_traits`) have no age: they are removed by erasure. Error events are copied into `errors`, which expires with the same number of days as the events they come from; measurements will have a family of their own when they exist.
+The `events` table used to carry a rule of its own, 13 months for every site. A migration replaces it with one that cannot fire in the life of the product (60 years), so a site can keep its data longer than 13 months; it applies to databases made before as well. The links and traits of identified users (`identity_alias`, `user_traits`) have no age: they are removed by erasure. Error events are copied into `errors`, which expires with the same number of days as the events they come from; measurements expire the same way, and the two rollups (`issues_daily`, `perf_daily`) keep no identifier and expire after two years.
 
 Not covered: a site that is deleted from the metadata store keeps its rows until a month holding only them falls out of every remaining site's cutoff; and the data of two sites that share a month is never dropped whole before the site that keeps longer is done with it, only deleted row by row.
 

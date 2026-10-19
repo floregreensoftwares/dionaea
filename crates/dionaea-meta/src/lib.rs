@@ -23,8 +23,11 @@ mod accounts;
 mod accounts_tests;
 mod erasure;
 mod erasure_sql;
+mod issues;
 mod migrations;
+mod releases;
 mod retention;
+mod sampling;
 mod sqlite;
 mod symbols;
 #[cfg(test)]
@@ -38,6 +41,12 @@ pub use erasure::{
     ErasureRequest, ErasureState, ErasureSubject, ErasureSummary, HashKey, HashKeys, IdKind,
     MAX_KEY_LEN, MIN_KEY_LEN, TombstoneBatch, Tombstones,
 };
+pub use issues::{
+    FINGERPRINT_CHARS, IssueIndex, IssueRecord, IssueState, MAX_ISSUES_LISTED, MAX_ISSUES_PER_SITE,
+    is_fingerprint,
+};
+pub use releases::compare_versions;
+pub use sampling::{SAMPLE_FULL_PPM, SiteSampling, ppm_from_rate, rate_from_ppm};
 pub use sqlite::SqliteMeta;
 pub use symbols::{
     MAX_LISTED, MAX_RELEASE_CHARS, MAX_SYMBOL_NAME_CHARS, SymbolFile, SymbolIndex, SymbolKind,
@@ -179,6 +188,9 @@ pub struct Snapshot {
     /// Operational settings stored by an operator, by name. The meaning of a
     /// name and its range belong to whoever reads it.
     pub settings: BTreeMap<String, StoredSetting>,
+    /// The sites that keep less than all their performance events, with the
+    /// millionths they keep.
+    pub sampling: Vec<(u32, u32)>,
 }
 
 #[derive(Debug)]
@@ -226,7 +238,7 @@ impl std::error::Error for MetaError {}
 
 /// Where metadata lives. Every method is synchronous; callers on an async
 /// runtime run them on a blocking thread.
-pub trait MetaStore: Send + Sync {
+pub trait MetaStore: Send + Sync + SiteSampling {
     /// Checks the store answers.
     fn ping(&self) -> Result<(), MetaError>;
 

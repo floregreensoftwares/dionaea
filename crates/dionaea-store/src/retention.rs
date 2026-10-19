@@ -39,6 +39,11 @@ const ANALYTICS: &[Expiring] = &[
         older: "ts < toDateTime64('{ts}', 3, 'UTC')",
         partition: "toYYYYMM(ts)",
     },
+    Expiring {
+        name: "measurements",
+        older: "ts < toDateTime64('{ts}', 3, 'UTC')",
+        partition: "toYYYYMM(ts)",
+    },
 ];
 
 fn older(table: &Expiring, cutoff_ms: u64) -> String {

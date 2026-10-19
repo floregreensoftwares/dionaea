@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use dionaea_core::Schema;
-use dionaea_meta::{MetaError, MetaStore, StoredSetting, Tombstones};
+use dionaea_meta::{MetaError, MetaStore, SAMPLE_FULL_PPM, StoredSetting, Tombstones};
 
 /// Why a write key was not admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,8 @@ pub struct Admission {
     pub schemas: Arc<[(u32, Schema)]>,
     /// Users and devices whose data is being or has been erased.
     pub tombstones: Arc<Tombstones>,
+    /// Millionths of the site's performance events that are kept.
+    pub sample_ppm: u32,
 }
 
 #[derive(Debug)]
@@ -51,6 +53,7 @@ struct Table {
     generation: u64,
     keys: HashMap<String, KeyEntry>,
     schemas: HashMap<u32, Arc<[(u32, Schema)]>>,
+    sampling: HashMap<u32, u32>,
     settings: BTreeMap<String, StoredSetting>,
 }
 
@@ -107,6 +110,7 @@ impl Cache {
             keys: HashMap::with_capacity(snapshot.keys.len()),
             schemas: HashMap::with_capacity(snapshot.schemas.len()),
             settings: snapshot.settings,
+            sampling: snapshot.sampling.into_iter().collect(),
         };
         for key in snapshot.keys {
             table.keys.insert(
@@ -166,6 +170,11 @@ impl Cache {
             site_id: entry.site_id,
             schemas,
             tombstones: Arc::clone(&self.tombstones),
+            sample_ppm: table
+                .sampling
+                .get(&entry.site_id)
+                .copied()
+                .unwrap_or(SAMPLE_FULL_PPM),
         })
     }
 }

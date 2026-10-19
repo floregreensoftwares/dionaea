@@ -84,6 +84,10 @@ pub(crate) struct Tuning {
     /// number, and how often the retention job runs.
     pub(crate) retention_default_days: u32,
     pub(crate) retention_interval: Duration,
+    /// How often resolved issues are checked for a return, and how many each
+    /// run looks at.
+    pub(crate) regression_interval: Duration,
+    pub(crate) regression_batch: u32,
 }
 
 /// Where a setting's value came from.
@@ -474,6 +478,26 @@ pub(crate) static SPECS: &[Spec] = &[
         |t, v| t.retention_interval = Duration::from_secs(v),
         |t| secs(t.retention_interval)
     ),
+    spec!(
+        "regression_interval_secs",
+        "300",
+        "from 30 to 86400 seconds",
+        "how often resolved issues are checked for an error that came back in a later release",
+        u64,
+        |v| (30..=86_400).contains(v),
+        |t, v| t.regression_interval = Duration::from_secs(v),
+        |t| secs(t.regression_interval)
+    ),
+    spec!(
+        "regression_batch",
+        "200",
+        "from 1 to 5000",
+        "how many resolved issues one regression check looks at, the one checked longest ago first",
+        u32,
+        |v| (1..=5000).contains(v),
+        |t, v| t.regression_batch = v,
+        |t| t.regression_batch.to_string()
+    ),
 ];
 
 /// The setting called `name`.
@@ -539,6 +563,8 @@ impl Tuning {
             erase_failed_keep: Duration::ZERO,
             retention_default_days: 1,
             retention_interval: Duration::ZERO,
+            regression_interval: Duration::ZERO,
+            regression_batch: 1,
         }
     }
 

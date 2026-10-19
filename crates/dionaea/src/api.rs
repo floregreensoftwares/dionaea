@@ -28,8 +28,8 @@ use dionaea_auth::{Auth, AuthError, Denied, Permission, Principal, Scope, cookie
 use dionaea_core::Schema;
 use dionaea_meta::{
     AccountStore, ErasureRequest, ErasureState, ErasureSubject, MAX_RETENTION_DAYS,
-    MIN_RETENTION_DAYS, MetaError, MetaStore, RetentionFamily, Role, Site, SqliteMeta,
-    WriteKeyInfo,
+    MIN_RETENTION_DAYS, MetaError, MetaStore, RetentionFamily, Role, SAMPLE_FULL_PPM, Site,
+    SiteSampling, SqliteMeta, WriteKeyInfo, ppm_from_rate, rate_from_ppm,
 };
 use dionaea_query::{Limits, Query, QueryError, is_time_zone_shape};
 use dionaea_store::Store;
@@ -359,6 +359,13 @@ struct NewTokenBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SamplingBody {
+    /// The share of performance events kept: above 0, up to 1.
+    performance: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RetentionBody {
     days: u32,
 }
@@ -563,6 +570,9 @@ impl Api {
             }
             ("PUT", ["sites", site, "retention"]) => self.set_retention(req, p, id_of(site)?),
             ("DELETE", ["sites", site, "retention"]) => self.unset_retention(p, id_of(site)?),
+            ("GET", ["sites", site, "sampling"]) => self.sampling(p, id_of(site)?),
+            ("PUT", ["sites", site, "sampling"]) => self.set_sampling(req, p, id_of(site)?),
+            ("DELETE", ["sites", site, "sampling"]) => self.unset_sampling(p, id_of(site)?),
             ("GET", ["sites", site, "erasures"]) => self.erasures(req, p, id_of(site)?),
             ("POST", ["sites", site, "erasures"]) => self.request_erasure(req, p, id_of(site)?),
             ("GET", ["sites", site, "erasures", id]) => self.erasure(p, id_of(site)?, id),
@@ -572,6 +582,13 @@ impl Api {
             ("GET", ["sites", site, "symbols"]) => self.symbols(req, p, id_of(site)?),
             ("POST", ["sites", site, "symbols"]) => self.upload_symbol(req, p, id_of(site)?),
             ("DELETE", ["sites", site, "symbols"]) => self.delete_symbols(req, p, id_of(site)?),
+            ("GET", ["sites", site, "issues"]) => self.issues(req, p, id_of(site)?),
+            ("GET", ["sites", site, "issues", fingerprint]) => {
+                self.issue(p, id_of(site)?, fingerprint)
+            }
+            ("PUT", ["sites", site, "issues", fingerprint]) => {
+                self.set_issue(req, p, id_of(site)?, fingerprint)
+            }
             ("GET", ["sites", site, "upload-tokens"]) => self.upload_tokens(p, id_of(site)?),
             ("POST", ["sites", site, "upload-tokens"]) => {
                 self.issue_upload_token(req, p, id_of(site)?)
@@ -1058,6 +1075,41 @@ impl Api {
         Ok(ApiResponse::with(204, Value::Null))
     }
 
+    fn sampling_json(ppm: u32) -> Value {
+        json!({
+            "performance": rate_from_ppm(ppm),
+            "own": ppm < SAMPLE_FULL_PPM,
+        })
+    }
+
+    fn sampling(&self, principal: &Principal, site: u32) -> ApiResult {
+        let site = self.site_access(principal, site, Permission::Read)?;
+        Ok(ApiResponse::ok(Self::sampling_json(
+            self.meta.performance_sampling(site.id)?,
+        )))
+    }
+
+    fn set_sampling(&self, req: &ApiRequest, principal: &Principal, site: u32) -> ApiResult {
+        let site = self.site_access(principal, site, Permission::Manage)?;
+        let body: SamplingBody = Self::json(req)?;
+        let ppm = ppm_from_rate(body.performance).ok_or_else(|| {
+            ApiError::bad(
+                "`performance` is a number above 0 and up to 1, with at most six decimals",
+            )
+        })?;
+        self.meta.set_performance_sampling(site.id, ppm)?;
+        Self::audit(principal, "set_sampling", Some(site.id));
+        Ok(ApiResponse::ok(Self::sampling_json(ppm)))
+    }
+
+    fn unset_sampling(&self, principal: &Principal, site: u32) -> ApiResult {
+        let site = self.site_access(principal, site, Permission::Manage)?;
+        self.meta
+            .set_performance_sampling(site.id, SAMPLE_FULL_PPM)?;
+        Self::audit(principal, "unset_sampling", Some(site.id));
+        Ok(ApiResponse::with(204, Value::Null))
+    }
+
     fn erasures(&self, req: &ApiRequest, principal: &Principal, site: u32) -> ApiResult {
         let site = self.site_access(principal, site, Permission::Manage)?;
         let state = match value_of(req.query.as_deref(), "state") {
@@ -1176,6 +1228,9 @@ fn same_origin(req: &ApiRequest) -> bool {
         (Some(_), None) => false,
     }
 }
+
+#[path = "api_issues.rs"]
+mod issues;
 
 #[path = "api_symbols.rs"]
 mod symbols;
