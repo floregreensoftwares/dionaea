@@ -46,7 +46,7 @@ pub use issues::{
     is_fingerprint,
 };
 pub use releases::compare_versions;
-pub use sampling::{SAMPLE_FULL_PPM, SiteSampling, ppm_from_rate};
+pub use sampling::{SAMPLE_FULL_PPM, SiteSampling, ppm_from_rate, rate_from_ppm};
 pub use sqlite::SqliteMeta;
 pub use symbols::{
     MAX_LISTED, MAX_RELEASE_CHARS, MAX_SYMBOL_NAME_CHARS, SymbolFile, SymbolIndex, SymbolKind,

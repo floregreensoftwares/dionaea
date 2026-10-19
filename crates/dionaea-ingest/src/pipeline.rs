@@ -12,7 +12,7 @@ use dionaea_core::{
     DropReason, FieldValue, RequestError, WireEvent, decode_batch, is_performance_event,
     reserved_event_names,
 };
-use dionaea_meta::SAMPLE_FULL_PPM;
+use dionaea_meta::{SAMPLE_FULL_PPM, rate_from_ppm};
 
 use crate::cache::Admission;
 use crate::dedup::Deduper;
@@ -234,7 +234,7 @@ pub fn process_with(
             // What the kept event stands for: read back into the measurement.
             numbers.push((
                 SAMPLE_RATE_FIELD.to_owned(),
-                f64::from(admission.sample_ppm) / f64::from(SAMPLE_FULL_PPM),
+                rate_from_ppm(admission.sample_ppm),
             ));
         }
         accepted.push(Accepted {

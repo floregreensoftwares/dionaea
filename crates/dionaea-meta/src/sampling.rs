@@ -28,6 +28,11 @@ pub fn ppm_from_rate(rate: f64) -> Option<u32> {
     (1..=SAMPLE_FULL_PPM).contains(&ppm).then_some(ppm)
 }
 
+/// The rate (a share from 0 to 1) that `ppm` millionths are.
+pub fn rate_from_ppm(ppm: u32) -> f64 {
+    f64::from(ppm) / f64::from(SAMPLE_FULL_PPM)
+}
+
 pub trait SiteSampling: Send + Sync {
     /// Keeps `ppm` millionths of the site's performance events (see
     /// [`SAMPLE_FULL_PPM`]); errors and crashes are never sampled.

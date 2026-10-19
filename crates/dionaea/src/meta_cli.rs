@@ -662,7 +662,7 @@ pub(crate) fn sampling_list(
     for site in sites {
         match store.performance_sampling(site.id) {
             Ok(ppm) => {
-                let _ = writeln!(out, "{}\t{}", site.id, f64::from(ppm) / 1_000_000.0);
+                let _ = writeln!(out, "{}\t{}", site.id, dionaea_meta::rate_from_ppm(ppm));
             }
             Err(error) => return report(&error, "", err),
         }

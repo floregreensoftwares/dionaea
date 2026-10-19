@@ -29,7 +29,7 @@ use dionaea_core::Schema;
 use dionaea_meta::{
     AccountStore, ErasureRequest, ErasureState, ErasureSubject, MAX_RETENTION_DAYS,
     MIN_RETENTION_DAYS, MetaError, MetaStore, RetentionFamily, Role, SAMPLE_FULL_PPM, Site,
-    SiteSampling, SqliteMeta, WriteKeyInfo, ppm_from_rate,
+    SiteSampling, SqliteMeta, WriteKeyInfo, ppm_from_rate, rate_from_ppm,
 };
 use dionaea_query::{Limits, Query, QueryError, is_time_zone_shape};
 use dionaea_store::Store;
@@ -1077,7 +1077,7 @@ impl Api {
 
     fn sampling_json(ppm: u32) -> Value {
         json!({
-            "performance": f64::from(ppm) / f64::from(SAMPLE_FULL_PPM),
+            "performance": rate_from_ppm(ppm),
             "own": ppm < SAMPLE_FULL_PPM,
         })
     }
